@@ -434,8 +434,10 @@ mod tests {
 
     #[test]
     fn pid_check_requires_mount_in_command_line() {
+        // `sleep 30; :` (not a lone `sleep 30`) so the shell can't exec into
+        // `sleep` and drop the marker argument from its command line.
         let mut c = Command::new("sh")
-            .args(["-c", "sleep 30", "/some/vault/mnt/xyz"])
+            .args(["-c", "sleep 30; :", "/some/vault/mnt/xyz"])
             .spawn()
             .unwrap();
         let pid = c.id() as i32;
