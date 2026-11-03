@@ -26,7 +26,7 @@ cargo test -p vault-core --test e2e_macos -- --ignored --nocapture --test-thread
 
 ## M3: TOTP + Secure Enclave
 
-Статус: `totp.rs` и `se.rs` са реализирани; unit тестовете (с `MockSecureEnclave` и инжектиран `now`) минават. Реалният SE се тества ръчно на Mac:
+Статус: `totp.rs` и `se.rs` са реализирани; unit тестовете (с `MockSecureEnclave` и инжектиран `now`) минават. Реалният SE работи и на GitHub runner-а `macos-14` (Apple Silicon VM, неподписан binary): ключ, `toid` blob 314 байта, ECIES round trip, повторно отваряне от blob-а и пълен TOTP сейф минават. CI го пуска; ръчно на Mac:
 ```
 cargo test -p vault-core --test e2e_se -- --ignored --nocapture --test-threads=1
 ```

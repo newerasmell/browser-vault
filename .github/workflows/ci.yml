@@ -36,9 +36,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
-      # TEMPORARY probe (M3): does the runner VM have a usable Secure Enclave?
-      - name: Probe Secure Enclave (e2e_se, may fail in a VM)
-        continue-on-error: true
+      # The macos-14 (Apple Silicon) runner has a working Secure Enclave for
+      # non-permanent keys, unsigned binary included.
+      - name: E2E Secure Enclave (TOTP)
         run: cargo test -p vault-core --all-features --test e2e_se -- --ignored --nocapture --test-threads=1
       - name: Install browsers
         run: brew install --cask brave-browser firefox
