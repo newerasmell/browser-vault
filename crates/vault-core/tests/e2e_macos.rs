@@ -1,0 +1,152 @@
+//! End-to-end tests that need a real Mac (hdiutil) and, for M1, Brave.
+//!
+//! Run manually on macOS:
+//!   cargo test -p vault-core --test e2e_macos -- --ignored --nocapture --test-threads=1
+//!
+//! `m1_brave_acceptance` additionally needs Brave in /Applications and opens a
+//! real browser window for ~10 s; do not touch it while the test runs.
+#![cfg(target_os = "macos")]
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime};
+
+use vault_core::store::Credential;
+use vault_core::{browser, hdiutil, Browser, Error, KdfCost, Store};
+
+const PW: &str = "correct horse battery";
+
+fn store() -> (tempfile::TempDir, Store) {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::new(d.path().join("BrowserVault"));
+    (d, s)
+}
+
+/// Create → unlock (mount) → write → lock → unmounted, data not readable,
+/// wrong password refused, recovery phrase mounts too.
+#[test]
+#[ignore = "needs macOS hdiutil; run manually (see file header)"]
+fn container_roundtrip() {
+    let (_d, s) = store();
+    let c = s
+        .create("E2E", Browser::Brave, PW, 1, KdfCost::FAST)
+        .unwrap();
+    let id = c.header.vault_id.clone();
+    assert!(s.image_path(&id).is_dir(), "sparsebundle is a directory");
+
+    let u = s.unlock(&id, Credential::Password(PW)).unwrap();
+    assert!(u.header_intact);
+    assert!(hdiutil::is_mounted(&u.mountpoint));
+    let secret_file = u.mountpoint.join("profile/secret.txt");
+    fs::write(&secret_file, b"top secret session cookie").unwrap();
+    drop(u);
+
+    s.lock(&id).unwrap();
+    assert!(!hdiutil::is_mounted(&s.mountpoint(&id)));
+    assert!(!secret_file.exists());
+    // The plaintext must not appear anywhere in the image bands.
+    assert!(!dir_contains(
+        &s.image_path(&id),
+        b"top secret session cookie"
+    ));
+
+    assert!(matches!(
+        s.unlock(&id, Credential::Password("wrong password!!")),
+        Err(Error::UnlockFailed)
+    ));
+    assert!(!hdiutil::is_mounted(&s.mountpoint(&id)));
+
+    let u = s
+        .unlock(&id, Credential::Recovery(&c.recovery_phrase))
+        .unwrap();
+    assert_eq!(
+        fs::read(u.mountpoint.join("profile/secret.txt")).unwrap(),
+        b"top secret session cookie"
+    );
+    drop(u);
+    s.lock(&id).unwrap();
+    assert!(!hdiutil::is_mounted(&s.mountpoint(&id)));
+}
+
+/// SPEC §9 M1 acceptance: create → unlock → Brave writes into <mnt> → lock →
+/// volume not mounted, and ~/Library has no new profile data.
+#[test]
+#[ignore = "needs macOS + Brave; opens a browser window (see file header)"]
+fn m1_brave_acceptance() {
+    let brave = browser::detect(Browser::Brave).expect("Brave must be installed");
+    let (_d, s) = store();
+    let c = s
+        .create("M1", Browser::Brave, PW, 1, KdfCost::FAST)
+        .unwrap();
+    let id = c.header.vault_id.clone();
+
+    let marker = SystemTime::now();
+    std::thread::sleep(Duration::from_secs(1));
+
+    let u = s.unlock(&id, Credential::Password(PW)).unwrap();
+    let mut child = s.launch(&u, Some(&brave)).unwrap();
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(
+        u.mountpoint.join("profile/Default").is_dir(),
+        "Brave wrote its profile inside the vault"
+    );
+    assert!(fs::read_dir(u.mountpoint.join("cache")).is_ok());
+    let mnt = u.mountpoint.clone();
+    drop(u);
+
+    s.lock(&id).unwrap();
+    let _ = child.wait();
+    assert!(!hdiutil::is_mounted(&mnt));
+    assert!(!browser::is_alive(child.id() as i32));
+
+    // Nothing new from the vault profile under the regular Brave locations.
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let watched = [
+        home.join("Library/Application Support/BraveSoftware"),
+        home.join("Library/Caches/BraveSoftware"),
+    ];
+    let mut leaked = vec![];
+    for w in &watched {
+        newer_files(w, marker, &mut leaked);
+    }
+    // Saved Application State cleanup is milestone M7; listed for manual review only.
+    let mut saved_state = vec![];
+    newer_files(
+        &home.join("Library/Saved Application State/com.brave.Browser.savedState"),
+        marker,
+        &mut saved_state,
+    );
+    if !saved_state.is_empty() {
+        eprintln!("note (M7 cleanup): {saved_state:#?}");
+    }
+    assert!(
+        leaked.is_empty(),
+        "files modified outside the vault (close regular Brave and retry): {leaked:#?}"
+    );
+}
+
+fn newer_files(dir: &Path, since: SystemTime, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(md) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if md.is_dir() {
+            newer_files(&p, since, out);
+        } else if md.modified().map(|m| m > since).unwrap_or(false) {
+            out.push(p);
+        }
+    }
+}
+
+fn dir_contains(dir: &Path, needle: &[u8]) -> bool {
+    let out = Command::new("grep")
+        .args(["-r", "-l", "-a", "-F"])
+        .arg(std::str::from_utf8(needle).unwrap())
+        .arg(dir)
+        .output()
+        .unwrap();
+    !out.stdout.is_empty()
+}

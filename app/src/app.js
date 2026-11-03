@@ -1,0 +1,730 @@
+import { t, setLang, getLang, languages } from './i18n.js';
+import { api, on, isTauri } from './api.js';
+
+const root = document.getElementById('app');
+let cleanup = [];
+
+// ---------- helpers ----------
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'value') el.value = v;
+    else if (k === 'checked') el.checked = !!v;
+    else if (k === 'svg') el.innerHTML = v; // trusted, app-generated SVG only
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid == null || kid === false) continue;
+    el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+
+const ICONS = {
+  shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
+  lock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  unlock: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.6-1.8"/>',
+  key: '<rect x="9" y="2.5" width="6" height="7" rx="1"/><rect x="7" y="9.5" width="10" height="12" rx="2.5"/><circle cx="12" cy="15.5" r="2"/>',
+  phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18h2"/>',
+  sliders: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7"/>',
+  alert: '<path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17.5v.01"/>',
+  power: '<path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.2 3 14.8 0 18M12 3c-3 3.2-3 14.8 0 18"/>',
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>'
+};
+const icon = (name, cls = '') =>
+  h('span', { class: 'ico ' + cls, svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
+
+const BROWSERS = { brave: 'Brave', firefox: 'Firefox' };
+const fmtSize = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB');
+const badge = (b) => h('span', { class: 'badge badge-' + b, 'aria-label': BROWSERS[b] }, BROWSERS[b][0]);
+
+function toast(msg, kind = '') {
+  const el = h('div', { class: 'toast ' + kind, role: 'status' }, msg);
+  document.body.append(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, 2200);
+}
+
+function toggle(label, checked, onchange, hint) {
+  return h('label', { class: 'toggle-row' },
+    h('span', { class: 'toggle-text' }, label, hint && h('small', {}, hint)),
+    h('input', { type: 'checkbox', role: 'switch', class: 'switch', checked, onchange: (e) => onchange(e.target.checked) })
+  );
+}
+
+function idleSelect(value, onchange) {
+  return h('select', { class: 'input select', onchange: (e) => onchange(+e.target.value) },
+    [0, 5, 10, 15, 30, 60].map((n) =>
+      h('option', { value: n, selected: n === value }, n ? t('minutes', { n }) : t('never'))));
+}
+
+// Six-box one-time code input with paste support.
+function otpInput(onComplete) {
+  const boxes = [];
+  const wrap = h('div', { class: 'otp' });
+  const value = () => boxes.map((b) => b.value).join('');
+  for (let i = 0; i < 6; i++) {
+    const b = h('input', {
+      class: 'otp-box', inputmode: 'numeric', maxlength: 1, autocomplete: 'one-time-code',
+      'aria-label': `${i + 1}`,
+      oninput: (e) => {
+        e.target.value = e.target.value.replace(/\D/g, '').slice(-1);
+        if (e.target.value && boxes[i + 1]) boxes[i + 1].focus();
+        if (value().length === 6) onComplete?.(value());
+      },
+      onkeydown: (e) => { if (e.key === 'Backspace' && !e.target.value && boxes[i - 1]) boxes[i - 1].focus(); },
+      onpaste: (e) => {
+        const d = (e.clipboardData.getData('text') || '').replace(/\D/g, '').slice(0, 6);
+        if (!d) return;
+        e.preventDefault();
+        d.split('').forEach((c, j) => (boxes[j].value = c));
+        boxes[Math.min(d.length, 5)].focus();
+        if (d.length === 6) onComplete?.(d);
+      }
+    });
+    boxes.push(b); wrap.append(b);
+  }
+  wrap.getValue = value;
+  wrap.clear = () => { boxes.forEach((b) => (b.value = '')); boxes[0].focus(); };
+  wrap.focusFirst = () => boxes[0].focus();
+  return wrap;
+}
+
+function touchPrompt() {
+  return h('div', { class: 'touch' },
+    h('div', { class: 'touch-key' }, icon('key', 'xl'), h('span', { class: 'pulse' })),
+    h('strong', {}, t('touch_key')),
+    h('p', { class: 'muted' }, t('touch_key_hint')));
+}
+
+function strength(p) {
+  let s = 0;
+  if (p.length >= 12) s++;
+  if (p.length >= 16) s++;
+  if (p.length >= 22) s++;
+  if (/[a-z]/.test(p) && /[A-Z]/.test(p)) s += 0.5;
+  if (/\d/.test(p)) s += 0.5;
+  if (/[^\w\s]/.test(p)) s += 0.5;
+  if (p.length < 12) s = Math.min(s, 1);
+  return Math.min(4, Math.floor(s));
+}
+
+// ---------- TRAY ----------
+async function viewTray() {
+  const vaults = await api('list_vaults');
+  const openCount = vaults.filter((v) => v.status === 'unlocked').length;
+
+  const row = (v) => {
+    const unlocked = v.status === 'unlocked';
+    const busy = h('span', { class: 'spinner hidden' });
+    const btn = h('button', {
+      class: 'btn sm ' + (unlocked ? 'ghost' : 'primary'),
+      onclick: async (e) => {
+        e.stopPropagation();
+        if (unlocked) { busy.classList.remove('hidden'); btn.disabled = true; await api('lock_vault', { id: v.id }); }
+        else api('open_window', { view: 'unlock', params: { id: v.id } });
+      }
+    }, unlocked ? t('lock') : t('open'));
+    return h('li', { class: 'vault-row' + (unlocked ? ' is-open' : ''), onclick: () => unlocked && api('focus_browser', { id: v.id }) },
+      badge(v.browser),
+      h('div', { class: 'vault-meta' },
+        h('strong', {}, v.name),
+        h('small', {}, `${BROWSERS[v.browser]} · ${t('mode_' + v.mode)}`)),
+      h('span', { class: 'status status-' + v.status }, icon(unlocked ? 'unlock' : 'lock', 'sm'), t('status_' + v.status)),
+      busy, btn);
+  };
+
+  return h('div', { class: 'tray' },
+    h('header', { class: 'tray-head' },
+      h('div', { class: 'brand ' + (openCount ? 'on' : '') }, icon('shield')),
+      h('div', {}, h('strong', {}, t('app_name')),
+        h('small', {}, openCount ? t('unlocked_count', { n: openCount }) : t('all_locked'))),
+      openCount ? h('button', { class: 'btn sm ghost push', onclick: () => api('lock_all') }, icon('lock', 'sm'), t('lock_all')) : null),
+    (() => {
+      const pv = vaults.find((v) => v.original?.state === 'pending');
+      return pv && h('div', { class: 'banner' }, icon('alert', 'sm'),
+        h('span', {}, h('strong', {}, t('original_pending')), h('small', {}, pv.name)),
+        h('button', { class: 'btn sm ghost push', onclick: () => api('open_window', { view: 'settings', params: { tab: 'vaults' } }) }, t('review')));
+    })(),
+    vaults.length
+      ? h('ul', { class: 'vault-list' }, vaults.map(row))
+      : h('div', { class: 'empty' }, icon('shield', 'xl'), h('strong', {}, t('empty_title')), h('p', { class: 'muted' }, t('empty_body'))),
+    h('footer', { class: 'tray-foot' },
+      h('button', { class: 'link', onclick: () => api('open_window', { view: 'wizard' }) }, icon('plus', 'sm'), t('new_vault')),
+      h('button', { class: 'link', onclick: () => api('open_window', { view: 'settings' }) }, icon('sliders', 'sm'), t('settings')),
+      h('button', { class: 'link push', onclick: () => api('quit_app') }, icon('power', 'sm'), t('quit')))
+  );
+}
+
+// ---------- UNLOCK ----------
+async function viewUnlock(params) {
+  const vaults = await api('list_vaults');
+  const v = vaults.find((x) => x.id === params.get('id')) || vaults[0];
+  const el = h('div', { class: 'pane unlock' });
+  let mode = 'normal';
+
+  const render = () => {
+    el.replaceChildren(
+      h('div', { class: 'unlock-head' },
+        h('div', { class: 'lock-art' }, icon('lock', 'lg')),
+        h('h1', {}, mode === 'recovery' ? t('recovery_title') : t('unlock_title')),
+        h('p', { class: 'vault-chip' }, badge(v.browser), v.name)),
+      mode === 'recovery' ? recoveryForm() : mainForm());
+  };
+
+  const errBox = () => h('p', { class: 'error', role: 'alert', 'aria-live': 'assertive' });
+
+  function mainForm() {
+    const pw = h('input', { class: 'input', type: 'password', id: 'pw', autocomplete: 'current-password', autofocus: true });
+    const pin = v.mode === 'fido2' ? h('input', { class: 'input', type: 'password', id: 'pin', inputmode: 'numeric', autocomplete: 'off' }) : null;
+    const otp = v.mode === 'totp' ? otpInput(() => submit()) : null;
+    const err = errBox();
+    const submitBtn = h('button', { class: 'btn primary block', type: 'submit' }, t('unlock'));
+    const form = h('form', { class: 'form', onsubmit: (e) => { e.preventDefault(); submit(); } },
+      h('label', { class: 'field' }, h('span', {}, t('password')), pw),
+      pin && h('label', { class: 'field' }, h('span', {}, t('yubikey_pin')), pin),
+      otp && h('div', { class: 'field' }, h('span', {}, t('auth_code')), otp),
+      err, submitBtn,
+      h('button', { class: 'link center', type: 'button', onclick: () => { mode = 'recovery'; render(); } }, t('use_recovery')));
+
+    let overlay;
+    const offA = on('fido_touch_needed', () => { overlay = h('div', { class: 'overlay' }, touchPrompt()); el.append(overlay); });
+    const offB = on('fido_touch_done', () => overlay?.remove());
+    cleanup.push(offA, offB);
+
+    async function submit() {
+      if (submitBtn.disabled) return;
+      err.textContent = '';
+      submitBtn.disabled = true; submitBtn.textContent = t('unlocking');
+      try {
+        await api('unlock_vault', { id: v.id, password: pw.value, pin: pin?.value, code: otp?.getValue() });
+        pw.value = ''; if (pin) pin.value = '';
+        api('close_window');
+      } catch (e) {
+        overlay?.remove();
+        if (e.code === 'rate_limited') {
+          let s = e.retryAfter || 30;
+          err.textContent = t('rate_limited', { s });
+          const iv = setInterval(() => {
+            s--; err.textContent = t('rate_limited', { s });
+            if (s <= 0) { clearInterval(iv); err.textContent = ''; submitBtn.disabled = false; submitBtn.textContent = t('unlock'); }
+          }, 1000);
+          cleanup.push(() => clearInterval(iv));
+          return;
+        }
+        err.textContent = t('unlock_failed');
+        el.querySelector('.unlock-head').classList.add('shake');
+        setTimeout(() => el.querySelector('.unlock-head')?.classList.remove('shake'), 500);
+        otp?.clear();
+      }
+      submitBtn.disabled = false; submitBtn.textContent = t('unlock');
+    }
+    setTimeout(() => pw.focus(), 0);
+    return form;
+  }
+
+  function recoveryForm() {
+    const count = h('small', { class: 'muted' }, t('words_count', { n: 0 }));
+    const ta = h('textarea', {
+      class: 'input mono', rows: 5, spellcheck: 'false', autocomplete: 'off',
+      oninput: () => { count.textContent = t('words_count', { n: ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0 }); }
+    });
+    const err = errBox();
+    const btn = h('button', { class: 'btn primary block', type: 'submit' }, t('unlock'));
+    return h('form', { class: 'form', onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = ''; btn.disabled = true; btn.textContent = t('unlocking');
+      try { await api('unlock_with_recovery', { id: v.id, phrase: ta.value }); ta.value = ''; api('close_window'); }
+      catch { err.textContent = t('unlock_failed'); }
+      btn.disabled = false; btn.textContent = t('unlock');
+    } },
+      h('p', { class: 'muted' }, t('recovery_hint')), ta, count, err, btn,
+      h('button', { class: 'link center', type: 'button', onclick: () => { mode = 'normal'; render(); } }, t('back')));
+  }
+
+  render();
+  return el;
+}
+
+// ---------- WIZARD ----------
+const STEPS = ['basics', 'password', 'factor', 'recovery', 'options', 'create'];
+
+async function viewWizard() {
+  const browsers = await api('detect_browsers');
+  const profiles = {
+    brave: browsers.brave.found ? await api('detect_profiles', { browser: 'brave' }) : [],
+    firefox: browsers.firefox.found ? await api('detect_profiles', { browser: 'firefox' }) : []
+  };
+  const w = {
+    step: 0, draftId: null, name: '', browser: browsers.brave.found ? 'brave' : 'firefox',
+    mode: null, keys: [], totpOk: false, words: null, ack: false, verifyIdx: null,
+    sizeGb: 20, idleMinutes: 15, lockOnScreenLock: true, lockOnKeyRemoval: true,
+    disableFxa: false, importProfile: false, importProfileId: null, progress: null, vaultId: null
+  };
+  const el = h('div', { class: 'pane wizard' });
+
+  const go = (n) => { w.step = n; render(); };
+  const nav = (canNext, onNext, label = t('continue')) =>
+    h('div', { class: 'wiz-nav' },
+      w.step > 0 && w.step < 5 ? h('button', { class: 'btn ghost', type: 'button', onclick: () => go(w.step - 1) }, t('back'))
+        : h('button', { class: 'btn ghost', type: 'button', onclick: async () => { await api('wizard_cancel', { draftId: w.draftId }); api('close_window'); } }, t('cancel')),
+      h('button', { class: 'btn primary', type: 'submit', disabled: !canNext, onclick: onNext }, label));
+
+  const stepper = () => h('ol', { class: 'stepper' }, STEPS.map((s, i) =>
+    h('li', { class: i < w.step ? 'done' : i === w.step ? 'cur' : '' },
+      h('span', { class: 'dot' }, i < w.step ? icon('check', 'xs') : i + 1), h('em', {}, t('step_' + s)))));
+
+  function render() {
+    el.replaceChildren(h('header', { class: 'wiz-head' }, h('h1', {}, t('wiz_title')), stepper()),
+      h('section', { class: 'wiz-body' }, [basics, password, factor, recovery, options, create][w.step]()));
+  }
+
+  // 1. basics
+  function basics() {
+    const name = h('input', { class: 'input', value: w.name, placeholder: t('vault_name_ph'), maxlength: 60,
+      oninput: (e) => { w.name = e.target.value; next.disabled = !w.name.trim(); } });
+    const choice = (b) => h('label', { class: 'choice' + (browsers[b].found ? '' : ' disabled') },
+      h('input', { type: 'radio', name: 'browser', value: b, checked: w.browser === b, disabled: !browsers[b].found, onchange: () => (w.browser = b) }),
+      badge(b), h('span', {}, h('strong', {}, BROWSERS[b]), h('small', {}, browsers[b].found ? browsers[b].path : t('not_installed'))));
+    const navEl = nav(!!w.name.trim(), async (e) => {
+      e.preventDefault();
+      if (!w.draftId) w.draftId = (await api('wizard_begin', { name: w.name.trim(), browser: w.browser })).draftId;
+      go(1);
+    });
+    const next = navEl.querySelector('.primary');
+    setTimeout(() => name.focus(), 0);
+    return h('form', { class: 'form' },
+      h('label', { class: 'field' }, h('span', {}, t('vault_name')), name),
+      h('div', { class: 'field' }, h('span', {}, t('browser')), h('div', { class: 'choices two' }, choice('brave'), choice('firefox'))),
+      navEl);
+  }
+
+  // 2. password
+  function password() {
+    const meter = h('div', { class: 'meter' }, h('i'), h('i'), h('i'), h('i'));
+    const label = h('small', { class: 'muted' }, ' ');
+    const mismatch = h('small', { class: 'error' });
+    const p1 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: upd });
+    const p2 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: upd });
+    const navEl = nav(false, async (e) => {
+      e.preventDefault();
+      await api('wizard_set_password', { draftId: w.draftId, password: p1.value });
+      p1.value = p2.value = '';
+      go(2);
+    });
+    const next = navEl.querySelector('.primary');
+    function upd() {
+      const s = strength(p1.value);
+      meter.dataset.s = p1.value ? s : '';
+      label.textContent = p1.value ? t('pw_strength')[s] : ' ';
+      mismatch.textContent = p2.value && p1.value !== p2.value ? t('pw_mismatch') : '';
+      next.disabled = !(p1.value.length >= 12 && s >= 2 && p1.value === p2.value);
+    }
+    setTimeout(() => p1.focus(), 0);
+    return h('form', { class: 'form' },
+      h('label', { class: 'field' }, h('span', {}, t('password')), p1, meter, label),
+      h('p', { class: 'muted' }, t('pw_hint')),
+      h('label', { class: 'field' }, h('span', {}, t('pw_confirm')), p2, mismatch),
+      h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', {}, t('pw_warning'))),
+      navEl);
+  }
+
+  // 3. second factor
+  function factor() {
+    const card = (m, ic, title, desc, rec) => h('button', {
+      type: 'button', class: 'factor-card' + (w.mode === m ? ' sel' : ''),
+      onclick: () => { if (w.mode !== m) { w.mode = m; w.keys = []; w.totpOk = false; w.totp = null; } render(); }
+    }, icon(ic, 'lg'), h('strong', {}, title, rec && h('span', { class: 'tag' }, t('recommended'))), h('small', {}, desc));
+
+    const body = h('div', { class: 'form' },
+      h('p', { class: 'q' }, t('factor_q')),
+      h('div', { class: 'choices two' },
+        card('fido2', 'key', t('yubikey_title'), t('yubikey_desc'), true),
+        card('totp', 'phone', t('totp_title'), t('totp_desc'))));
+
+    if (w.mode === 'fido2') body.append(enrollFido());
+    if (w.mode === 'totp') body.append(enrollTotp());
+    body.append(nav(w.mode === 'fido2' ? w.keys.length > 0 : w.totpOk, async (e) => {
+      e.preventDefault();
+      if (!w.words) w.words = (await api('recovery_generate', { draftId: w.draftId })).words;
+      go(3);
+    }));
+    return body;
+  }
+
+  function enrollFido() {
+    const box = h('div', { class: 'enroll' });
+    const pin = h('input', { class: 'input', type: 'password', inputmode: 'numeric', autocomplete: 'off' });
+    const label = h('input', { class: 'input', value: w.keys.length ? 'YubiKey backup' : 'YubiKey main', maxlength: 40 });
+    const err = h('p', { class: 'error', role: 'alert' });
+    const btn = h('button', { class: 'btn ' + (w.keys.length ? 'ghost' : 'primary'), type: 'button', onclick: async () => {
+      err.textContent = '';
+      const overlay = h('div', { class: 'overlay' }, touchPrompt());
+      el.append(overlay);
+      try {
+        const r = await api('fido_register', { draftId: w.draftId, pin: pin.value, label: label.value.trim() || 'YubiKey' });
+        w.keys.push(r.label); pin.value = ''; render();
+      } catch { err.textContent = t('unlock_failed'); }
+      finally { overlay.remove(); }
+    } }, icon(w.keys.length ? 'plus' : 'key', 'sm'), w.keys.length ? t('add_backup_key') : t('register_key'));
+
+    if (w.keys.length) box.append(h('div', { class: 'keys' }, h('small', { class: 'muted' }, t('registered_keys')),
+      w.keys.map((k) => h('div', { class: 'key-item' }, icon('check', 'sm ok'), k))));
+    if (w.keys.length < 5) box.append(h('div', { class: 'grid2' },
+      h('label', { class: 'field' }, h('span', {}, t('key_label')), label),
+      h('label', { class: 'field' }, h('span', {}, t('yubikey_pin')), pin)), err, btn);
+    if (w.keys.length === 1) box.append(h('p', { class: 'muted' }, t('backup_hint')));
+    return box;
+  }
+
+  function enrollTotp() {
+    const box = h('div', { class: 'enroll totp' });
+    if (w.totpOk) {
+      box.append(h('div', { class: 'callout ok' }, icon('check', 'sm'), h('p', {}, t('code_ok'))),
+        h('p', { class: 'muted' }, t('totp_note')));
+      return box;
+    }
+    const qr = h('div', { class: 'qr' });
+    const secret = h('code', { class: 'secret' });
+    const err = h('p', { class: 'error', role: 'alert' });
+    const otp = otpInput(async (code) => {
+      const r = await api('totp_confirm', { draftId: w.draftId, code });
+      if (r.ok) { w.totpOk = true; render(); } else { err.textContent = t('code_wrong'); otp.clear(); }
+    });
+    const load = async () => {
+      w.totp ||= await api('totp_begin', { draftId: w.draftId });
+      qr.innerHTML = w.totp.qrSvg;
+      secret.textContent = w.totp.secret.match(/.{1,4}/g).join(' ');
+    };
+    load();
+    box.append(
+      h('div', { class: 'totp-grid' }, qr,
+        h('div', {},
+          h('strong', {}, t('scan_qr')),
+          h('small', { class: 'muted block' }, t('manual_key')),
+          h('div', { class: 'secret-row' }, secret,
+            h('button', { class: 'btn sm ghost', type: 'button', onclick: async () => {
+              try { await navigator.clipboard.writeText(w.totp.secret); toast(t('copied')); } catch {}
+            } }, icon('copy', 'sm'), t('copy'))))),
+      h('div', { class: 'field' }, h('span', {}, t('enter_code')), otp), err,
+      h('p', { class: 'muted' }, t('totp_note')));
+    return box;
+  }
+
+  // 4. recovery
+  function recovery() {
+    if (w.verifyIdx) return recoveryVerify();
+    const navEl = nav(w.ack, (e) => {
+      e.preventDefault();
+      const set = new Set();
+      while (set.size < 3) set.add(1 + Math.floor(Math.random() * 24));
+      w.verifyIdx = [...set].sort((a, b) => a - b);
+      render();
+    });
+    return h('form', { class: 'form' },
+      h('h2', {}, t('recovery_show_title')),
+      h('p', { class: 'muted' }, t('recovery_show_body')),
+      h('ol', { class: 'words' }, w.words.map((wd) => h('li', {}, h('span', {}, wd)))),
+      toggle(t('recovery_ack'), w.ack, (v) => { w.ack = v; navEl.querySelector('.primary').disabled = !v; }),
+      navEl);
+  }
+
+  function recoveryVerify() {
+    const inputs = w.verifyIdx.map((i) => [i, h('input', { class: 'input mono', autocomplete: 'off', spellcheck: 'false' })]);
+    const err = h('p', { class: 'error', role: 'alert' });
+    const form = h('form', { class: 'form' },
+      h('h2', {}, t('recovery_verify_title')),
+      h('p', { class: 'muted' }, t('recovery_verify_body')),
+      h('div', { class: 'grid3' }, inputs.map(([i, inp]) => h('label', { class: 'field' }, h('span', {}, t('word_n', { n: i })), inp))),
+      err,
+      h('div', { class: 'wiz-nav' },
+        h('button', { class: 'btn ghost', type: 'button', onclick: () => { w.verifyIdx = null; render(); } }, t('back')),
+        h('button', { class: 'btn primary', type: 'submit' }, t('verify'))));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const answers = Object.fromEntries(inputs.map(([i, inp]) => [i, inp.value]));
+      const r = await api('recovery_verify', { draftId: w.draftId, answers });
+      if (r.ok) { w.words = null; go(4); } else err.textContent = t('verify_failed');
+    });
+    setTimeout(() => inputs[0][1].focus(), 0);
+    return form;
+  }
+
+  // 5. options
+  function options() {
+    const sizeVal = h('output', {}, w.sizeGb + ' GB');
+    return h('form', { class: 'form' },
+      h('div', { class: 'field' },
+        h('span', {}, t('size'), sizeVal),
+        h('input', { type: 'range', min: 5, max: 200, step: 5, value: w.sizeGb, class: 'range',
+          oninput: (e) => { w.sizeGb = +e.target.value; sizeVal.textContent = w.sizeGb + ' GB'; } }),
+        h('small', { class: 'muted' }, t('size_hint'))),
+      h('div', { class: 'group' },
+        h('div', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, t('idle_lock')), idleSelect(w.idleMinutes, (v) => (w.idleMinutes = v))),
+        toggle(t('lock_screen'), w.lockOnScreenLock, (v) => (w.lockOnScreenLock = v)),
+        w.mode === 'fido2' && toggle(t('lock_key_removal'), w.lockOnKeyRemoval, (v) => (w.lockOnKeyRemoval = v)),
+        w.browser === 'firefox' && toggle(t('disable_fxa'), w.disableFxa, (v) => (w.disableFxa = v)),
+        toggle(t('import_profile', { browser: BROWSERS[w.browser] }), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_hint')),
+        w.importProfile && profiles[w.browser].length && h('div', { class: 'toggle-row' },
+          h('span', { class: 'toggle-text' }, t('import_which')),
+          h('select', { class: 'input select', onchange: (e) => (w.importProfileId = e.target.value) },
+            profiles[w.browser].map((pr) => h('option', { value: pr.id, selected: pr.id === (w.importProfileId ||= profiles[w.browser][0].id) },
+              `${pr.name} · ${fmtSize(pr.sizeMb)}`))))),
+      h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('sync_warn_title')), ' ', t('sync_warn_body'))),
+      nav(true, (e) => { e.preventDefault(); go(5); }, t('create_vault')));
+  }
+
+  // 6. create
+  function create() {
+    if (w.vaultId) {
+      return h('div', { class: 'finish' },
+        h('div', { class: 'finish-art' }, icon('check', 'xl')),
+        h('h2', {}, t('done_title')),
+        h('p', { class: 'muted' }, t('done_body', { name: w.name })),
+        w.importProfile && h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, t('done_import_note'))),
+        h('div', { class: 'wiz-nav center' },
+          h('button', { class: 'btn ghost', onclick: () => api('close_window') }, t('close')),
+          h('button', { class: 'btn primary', onclick: () => api('open_window', { view: 'unlock', params: { id: w.vaultId } }) }, t('open_now'))));
+    }
+    const bar = h('div', { class: 'progress' }, h('i'));
+    const stage = h('p', { class: 'muted' }, t('stage_disk'));
+    const off = on('create_progress', ({ stage: s, pct }) => {
+      bar.firstChild.style.width = pct + '%';
+      if (s !== 'done') stage.textContent = t('stage_' + s);
+    });
+    cleanup.push(off);
+    if (!w.started) {
+      w.started = true;
+      api('wizard_finish', {
+        draftId: w.draftId, name: w.name.trim(), browser: w.browser, mode: w.mode, sizeGb: w.sizeGb,
+        options: { idleMinutes: w.idleMinutes, lockOnScreenLock: w.lockOnScreenLock, lockOnKeyRemoval: w.lockOnKeyRemoval,
+          disableFxa: w.disableFxa, importProfile: w.importProfile, importProfileId: w.importProfile ? w.importProfileId : null }
+      }).then((r) => { w.vaultId = r.vaultId; render(); })
+        .catch(() => { w.started = false; toast(t('status_error'), 'bad'); go(4); });
+    }
+    return h('div', { class: 'creating' }, h('div', { class: 'lock-art spin-slow' }, icon('shield', 'lg')),
+      h('h2', {}, t('creating')), bar, stage);
+  }
+
+  render();
+  return el;
+}
+
+// ---------- SETTINGS ----------
+async function viewSettings(params) {
+  const [s, vaults, browsers, info] = await Promise.all([
+    api('get_settings'), api('list_vaults'), api('detect_browsers'), api('app_info')]);
+  let tab = params.get('tab') || 'general';
+  const el = h('div', { class: 'pane settings' });
+  const save = async (patch) => { Object.assign(s, patch); await api('save_settings', patch); toast(t('saved')); };
+
+  const tabs = [['general', 'sliders'], ['vaults', 'shield'], ['browsers', 'globe'], ['about', 'alert']];
+  const render = async () => {
+    const content = h('section', { class: 'set-body' });
+    el.replaceChildren(
+      h('nav', { class: 'side' }, tabs.map(([id, ic]) =>
+        h('button', { class: 'side-item' + (tab === id ? ' cur' : ''), onclick: () => { tab = id; render(); } }, icon(ic, 'sm'), t('tab_' + id)))),
+      content);
+    content.append(await ({ general, vaultsTab, browsersTab, about })[tab === 'vaults' ? 'vaultsTab' : tab === 'browsers' ? 'browsersTab' : tab]());
+  };
+
+  function general() {
+    const hk = h('kbd', {}, s.panicHotkey);
+    const rec = h('button', { class: 'btn sm ghost', onclick: () => {
+      hk.textContent = t('press_keys'); rec.disabled = true;
+      const handler = (e) => {
+        if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) return;
+        e.preventDefault();
+        const combo = (e.ctrlKey ? '⌃' : '') + (e.altKey ? '⌥' : '') + (e.shiftKey ? '⇧' : '') + (e.metaKey ? '⌘' : '') + e.key.toUpperCase();
+        window.removeEventListener('keydown', handler, true);
+        rec.disabled = false;
+        if (combo.length < 3) { hk.textContent = s.panicHotkey; return; } // require a modifier
+        hk.textContent = combo; save({ panicHotkey: combo });
+      };
+      window.addEventListener('keydown', handler, true);
+      cleanup.push(() => window.removeEventListener('keydown', handler, true));
+    } }, t('change'));
+
+    return h('div', { class: 'form' },
+      h('h2', {}, t('tab_general')),
+      h('div', { class: 'group' },
+        h('div', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, t('language')),
+          h('select', { class: 'input select', onchange: (e) => { setLang(e.target.value); save({ language: e.target.value }); route(); } },
+            languages.map(([v, n]) => h('option', { value: v, selected: v === getLang() }, n)))),
+        toggle(t('launch_login'), s.launchAtLogin, (v) => save({ launchAtLogin: v })),
+        h('div', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, t('panic_hotkey')), h('span', { class: 'row' }, hk, rec))),
+      h('h3', {}, t('lock_triggers')),
+      h('div', { class: 'group' },
+        h('div', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, t('idle_lock')), idleSelect(s.idleMinutes, (v) => save({ idleMinutes: v }))),
+        toggle(t('lock_screen'), s.lockOnScreenLock, (v) => save({ lockOnScreenLock: v })),
+        toggle(t('lock_key_removal'), s.lockOnKeyRemoval, (v) => save({ lockOnKeyRemoval: v }))));
+  }
+
+  function originalBlock(v) {
+    const o = v.original;
+    if (!o || o.state === 'deleted') return null;
+    const del = h('button', { class: 'btn sm danger-solid', disabled: !o.reviewed,
+      onclick: () => api('open_window', { view: 'cleanup', params: { id: v.id } }) }, t('delete_original'));
+    if (o.state === 'kept') {
+      return h('div', { class: 'callout' }, icon('alert', 'sm'),
+        h('div', { class: 'grow' }, h('p', {}, t('original_kept'))), del);
+    }
+    return h('div', { class: 'callout warn col' },
+      h('div', { class: 'row' }, icon('alert', 'sm'), h('strong', {}, t('original_pending'))),
+      h('p', {}, t('original_pending_body', { browser: BROWSERS[v.browser], profile: o.profileName, size: fmtSize(o.sizeMb) })),
+      !o.reviewed && h('p', { class: 'muted' }, t('not_reviewed_hint')),
+      h('div', { class: 'row' }, del,
+        h('button', { class: 'btn sm ghost', onclick: async () => { await api('keep_original', { id: v.id }); route(); } }, t('keep_original'))));
+  }
+
+  async function vaultsTab() {
+    const cards = await Promise.all(vaults.map(async (v) => {
+      const factors = await api('list_factors', { id: v.id });
+      const act = (action, label, cls = 'ghost') => h('button', { class: 'btn sm ' + cls, onclick: async () => {
+        await api('request_vault_action', { id: v.id, action });
+        if (!isTauri) toast(t('auth_required'));
+      } }, label);
+      return h('article', { class: 'vault-card' },
+        h('header', {}, badge(v.browser), h('div', {}, h('strong', {}, v.name), h('small', {}, `${BROWSERS[v.browser]} · ${v.sizeGb} GB`)),
+          h('span', { class: 'status status-' + v.status + ' push' }, t('status_' + v.status))),
+        originalBlock(v),
+        h('div', { class: 'factors' }, h('small', { class: 'muted' }, t('factors')),
+          factors.map((f) => h('span', { class: 'chip' }, icon(f.type === 'fido2' ? 'key' : f.type === 'totp' ? 'phone' : 'shield', 'xs'), f.label))),
+        h('div', { class: 'row wrap' },
+          act('change_password', t('change_password')),
+          v.mode === 'fido2' ? act('add_fido2', t('add_yubikey')) : act('replace_totp', t('replace_authenticator')),
+          act('new_recovery', t('new_recovery')),
+          act('delete', t('delete_vault'), 'danger push')));
+    }));
+    return h('div', { class: 'form' },
+      h('div', { class: 'row' }, h('h2', {}, t('tab_vaults')),
+        h('button', { class: 'btn sm primary push', onclick: () => api('open_window', { view: 'wizard' }) }, icon('plus', 'sm'), t('new_vault'))),
+      h('p', { class: 'muted' }, t('auth_required')),
+      cards);
+  }
+
+  function browsersTab() {
+    return h('div', { class: 'form' }, h('h2', {}, t('tab_browsers')),
+      h('div', { class: 'group' }, Object.keys(BROWSERS).map((b) =>
+        h('div', { class: 'toggle-row' },
+          h('span', { class: 'row' }, badge(b), h('span', { class: 'toggle-text' }, BROWSERS[b],
+            h('small', {}, browsers[b].found ? browsers[b].path : t('not_installed')))),
+          h('span', { class: 'row' },
+            browsers[b].found && h('span', { class: 'status status-unlocked' }, icon('check', 'xs'), t('found')),
+            h('button', { class: 'btn sm ghost', onclick: async () => {
+              const p = await api('pick_browser_path', { browser: b });
+              if (p) { browsers[b] = { found: true, path: p }; render(); }
+            } }, t('choose')))))));
+  }
+
+  function about() {
+    return h('div', { class: 'form' },
+      h('div', { class: 'about-head' }, h('div', { class: 'brand on lg' }, icon('shield', 'lg')),
+        h('div', {}, h('h2', {}, t('app_name')), h('small', { class: 'muted' }, `${t('version')} ${info.version}`))),
+      h('h3', {}, t('limits_title')),
+      h('ul', { class: 'limits' }, t('limits').map((l, i) => h('li', { class: i === 0 ? 'good' : '' }, icon(i === 0 ? 'check' : 'alert', 'sm'), l))));
+  }
+
+  await render();
+  return el;
+}
+
+// ---------- CLEANUP (delete original profile, spec 5.1) ----------
+async function viewCleanup(params) {
+  const id = params.get('id');
+  const vaults = await api('list_vaults');
+  const v = vaults.find((x) => x.id === id);
+  const el = h('div', { class: 'pane cleanup' });
+  let info = await api('cleanup_preview', { id });
+  let running = (await api('browser_running', { browser: v.browser })).running;
+  const B = BROWSERS[v.browser];
+  let ack = false;
+
+  const render = () => {
+    const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password', oninput: upd });
+    const err = h('p', { class: 'error', role: 'alert' });
+    const btn = h('button', { class: 'btn danger-solid block', type: 'submit', disabled: true }, t('delete_forever'));
+    const req = (ok, label, extra) => h('li', { class: ok ? 'ok' : 'no' }, icon(ok ? 'check' : 'alert', 'sm'), h('span', {}, label), extra);
+    function upd() { btn.disabled = !(info.reviewed && !running && ack && pw.value); }
+
+    const form = h('form', { class: 'form', onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = ''; btn.disabled = true; btn.textContent = t('deleting');
+      const bar = h('div', { class: 'progress' }, h('i'));
+      btn.after(bar);
+      const off = on('cleanup_progress', ({ pct }) => (bar.firstChild.style.width = pct + '%'));
+      try {
+        await api('cleanup_original', { id, password: pw.value });
+        pw.value = ''; off();
+        el.replaceChildren(h('div', { class: 'finish' },
+          h('div', { class: 'finish-art' }, icon('check', 'xl')),
+          h('h2', {}, t('cleanup_done')), h('p', { class: 'muted' }, t('cleanup_done_body')),
+          h('button', { class: 'btn primary', onclick: () => api('close_window') }, t('close'))));
+      } catch (e2) {
+        off(); bar.remove(); err.textContent = t(e2.code === 'not_reviewed' ? 'not_reviewed_hint' : 'unlock_failed');
+        btn.textContent = t('delete_forever'); upd();
+      }
+    } },
+      h('div', { class: 'row' }, h('div', { class: 'lock-art danger' }, icon('alert', 'lg')),
+        h('div', {}, h('h1', {}, t('cleanup_title')), h('p', { class: 'vault-chip' }, badge(v.browser), `${B} · ${info.profileName}`))),
+      h('p', {}, t('cleanup_intro')),
+      h('div', { class: 'field' }, h('span', {}, t('will_delete', { size: fmtSize(info.sizeMb) })),
+        h('ul', { class: 'paths' }, info.items.map((p) => h('li', {}, p))),
+        h('small', { class: 'muted' }, t('other_profiles_safe', { browser: B }))),
+      h('ul', { class: 'checklist' },
+        req(info.reviewed, t('req_reviewed'), !info.reviewed && h('small', { class: 'muted block' }, t('not_reviewed_hint'))),
+        req(!running, t('req_closed', { browser: B }), running && h('button', { class: 'btn sm ghost', type: 'button', onclick: async () => {
+          running = (await api('browser_running', { browser: v.browser })).running; render();
+        } }, t('recheck')))),
+      !info.fileVault && h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, t('fv_warn'))),
+      toggle(t('req_ack'), ack, (val) => { ack = val; upd(); }),
+      h('label', { class: 'field' }, h('span', {}, t('confirm_pw')), pw),
+      err, btn,
+      h('button', { class: 'link center', type: 'button', onclick: () => api('close_window') }, t('cancel')));
+    el.replaceChildren(form);
+  };
+  render();
+  return el;
+}
+
+// ---------- router ----------
+const VIEWS = { tray: viewTray, unlock: viewUnlock, wizard: viewWizard, settings: viewSettings, cleanup: viewCleanup };
+let routeSeq = 0;
+
+async function route() {
+  cleanup.forEach((f) => { try { f(); } catch {} });
+  cleanup = [];
+  const [name, qs] = (location.hash.slice(1) || 'tray').split('?');
+  const view = VIEWS[name] ? name : 'tray';
+  const seq = ++routeSeq;
+  document.body.dataset.view = view;
+  document.documentElement.lang = getLang();
+  const node = await VIEWS[view](new URLSearchParams(qs));
+  if (seq !== routeSeq) return; // a newer navigation won
+  root.replaceChildren(node);
+  document.title = t('app_name');
+  if (view === 'tray') cleanup.push(on('vaults_changed', () => route()));
+}
+
+window.addEventListener('hashchange', route);
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && document.body.dataset.view !== 'tray' && isTauri) api('close_window');
+});
+
+// Dev bar (only outside Tauri) for previewing all views.
+if (!isTauri) {
+  const bar = h('div', { class: 'devbar' },
+    h('strong', {}, 'Preview'),
+    ['tray', 'unlock?id=v2', 'unlock?id=v1', 'wizard', 'settings', 'cleanup?id=v1'].map((v) => h('a', { href: '#' + v }, v)),
+    h('button', { onclick: () => document.documentElement.classList.toggle('dark') }, 'theme'),
+    h('button', { onclick: () => { setLang(getLang() === 'bg' ? 'en' : 'bg'); route(); } }, 'BG/EN'),
+    h('small', {}, 'demo code: 123456'));
+  document.body.prepend(bar);
+  document.body.classList.add('preview');
+}
+
+route();
