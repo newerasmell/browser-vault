@@ -88,11 +88,111 @@ pub fn launch_args(browser: Browser, mnt: &Path) -> Result<Vec<OsString>> {
                 disk_cache,
                 "--no-first-run".into(),
                 "--no-default-browser-check".into(),
+                // A crash dump holds browser memory (cookies, page content):
+                // keep Crashpad from writing dumps under ~/Library.
+                "--disable-crash-reporter".into(),
+                "--disable-breakpad".into(),
             ])
         }
-        // Firefox needs user.js (cache dir etc.) written at creation: milestone M5.
-        Browser::Firefox => Err(Error::Unsupported("Firefox vaults arrive in milestone M5")),
+        // Cache location etc. come from the managed block in `user.js`
+        // (see [`write_firefox_user_js`]).
+        Browser::Firefox => {
+            let mut profile = OsString::new();
+            profile.push(profile_dir(mnt));
+            Ok(vec!["--new-instance".into(), "-profile".into(), profile])
+        }
     }
+}
+
+/// Environment for a vault instance (paths/flags only, never secrets).
+/// Firefox: no crash reporter, so no minidumps under
+/// `~/Library/Application Support/Firefox/Crash Reports`.
+pub fn launch_env(browser: Browser) -> Vec<(&'static str, &'static str)> {
+    match browser {
+        Browser::Brave => vec![],
+        Browser::Firefox => vec![("MOZ_CRASHREPORTER_DISABLE", "1")],
+    }
+}
+
+const USER_JS_BEGIN: &str = "// BEGIN Browser Vault (managed, rewritten on every unlock)";
+const USER_JS_END: &str = "// END Browser Vault";
+const FXA_OFF: &str = "user_pref(\"identity.fxaccounts.enabled\", false);";
+
+fn js_string(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Split `user.js` into (text outside our managed block, the block if any).
+fn split_user_js(text: &str) -> (String, Option<String>) {
+    match (text.find(USER_JS_BEGIN), text.find(USER_JS_END)) {
+        (Some(b), Some(e)) if e > b => {
+            let end = e + USER_JS_END.len();
+            let mut outside = String::from(&text[..b]);
+            outside.push_str(text[end..].trim_start_matches(['\r', '\n']));
+            (outside, Some(text[b..end].to_string()))
+        }
+        _ => (text.to_string(), None),
+    }
+}
+
+/// SPEC §5: write the vault's prefs into `<mnt>/profile/user.js`.
+///
+/// Called at creation and again on every unlock: the mountpoint is stable
+/// (`mnt/<id>`), but rewriting keeps the cache path right even if the store
+/// moved (other home, restored backup) and repairs a user.js the user edited.
+/// Only a marked block is managed; anything else in user.js (e.g. from an
+/// imported profile) is kept. `disable_fxa`: `None` keeps the current choice.
+pub fn write_firefox_user_js(mnt: &Path, disable_fxa: Option<bool>) -> Result<()> {
+    let path = profile_dir(mnt).join("user.js");
+    let current = match std::fs::read(&path) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let (outside, block) = split_user_js(&current);
+    let fxa_off = disable_fxa.unwrap_or_else(|| block.is_some_and(|b| b.contains(FXA_OFF)));
+    let mut out = outside.trim_end().to_string();
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(USER_JS_BEGIN);
+    out.push('\n');
+    out.push_str(&format!(
+        "user_pref(\"browser.cache.disk.parent_directory\", {});\n",
+        js_string(&cache_dir(mnt))
+    ));
+    out.push_str("user_pref(\"browser.shell.checkDefaultBrowser\", false);\n");
+    out.push_str("user_pref(\"browser.sessionstore.resume_from_crash\", true);\n");
+    if fxa_off {
+        out.push_str(FXA_OFF);
+        out.push('\n');
+    }
+    out.push_str(USER_JS_END);
+    out.push('\n');
+    if out == current {
+        return Ok(());
+    }
+    let tmp = path.with_extension("js.bvtmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(out.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Start the browser binary directly (not `open -a`) so we own the PID and get
@@ -104,6 +204,7 @@ pub fn launch(browser: Browser, binary: &Path, mnt: &Path) -> Result<Child> {
     let args = launch_args(browser, mnt)?;
     Command::new(binary)
         .args(args)
+        .envs(launch_env(browser))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -171,17 +272,55 @@ mod tests {
                 "--user-data-dir=/mnt/x/profile",
                 "--disk-cache-dir=/mnt/x/cache",
                 "--no-first-run",
-                "--no-default-browser-check"
+                "--no-default-browser-check",
+                "--disable-crash-reporter",
+                "--disable-breakpad"
             ]
         );
     }
 
     #[test]
-    fn firefox_not_yet() {
-        assert!(matches!(
-            launch_args(Browser::Firefox, Path::new("/m")),
-            Err(Error::Unsupported(_))
-        ));
+    fn firefox_args_point_inside_mount() {
+        let args = launch_args(Browser::Firefox, Path::new("/mnt/x")).unwrap();
+        assert_eq!(args, ["--new-instance", "-profile", "/mnt/x/profile"]);
+        assert_eq!(
+            launch_env(Browser::Firefox),
+            [("MOZ_CRASHREPORTER_DISABLE", "1")]
+        );
+    }
+
+    #[test]
+    fn user_js_written_and_rewritten() {
+        let d = tempfile::tempdir().unwrap();
+        let mnt = d.path().join("m \"q\"");
+        std::fs::create_dir_all(profile_dir(&mnt)).unwrap();
+        let uj = profile_dir(&mnt).join("user.js");
+        // Imported profile's own prefs stay.
+        std::fs::write(&uj, "user_pref(\"mine\", 1);\n").unwrap();
+        write_firefox_user_js(&mnt, Some(true)).unwrap();
+        let t = std::fs::read_to_string(&uj).unwrap();
+        assert!(t.starts_with("user_pref(\"mine\", 1);\n"));
+        let want_cache = format!(
+            "user_pref(\"browser.cache.disk.parent_directory\", \"{}/m \\\"q\\\"/cache\");",
+            d.path().display()
+        );
+        assert!(t.contains(&want_cache), "{t}");
+        assert!(t.contains("\"browser.shell.checkDefaultBrowser\", false"));
+        assert!(t.contains("\"browser.sessionstore.resume_from_crash\", true"));
+        assert!(t.contains(FXA_OFF));
+
+        // Unlock path: same choice kept, block not duplicated, idempotent.
+        write_firefox_user_js(&mnt, None).unwrap();
+        let t2 = std::fs::read_to_string(&uj).unwrap();
+        assert_eq!(t, t2);
+        assert_eq!(t2.matches(USER_JS_BEGIN).count(), 1);
+
+        write_firefox_user_js(&mnt, Some(false)).unwrap();
+        let t3 = std::fs::read_to_string(&uj).unwrap();
+        assert!(!t3.contains(FXA_OFF));
+        write_firefox_user_js(&mnt, None).unwrap();
+        assert!(!std::fs::read_to_string(&uj).unwrap().contains(FXA_OFF));
+        assert!(!profile_dir(&mnt).join("user.js.bvtmp").exists());
     }
 
     #[test]

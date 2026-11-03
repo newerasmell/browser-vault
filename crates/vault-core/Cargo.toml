@@ -51,5 +51,9 @@ test-mocks = []
 name = "e2e_macos"
 required-features = ["test-password-slot"]
 
+[[test]]
+name = "e2e_import_macos"
+required-features = ["test-password-slot"]
+
 [dev-dependencies]
 tempfile = "3"
