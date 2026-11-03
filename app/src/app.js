@@ -369,7 +369,11 @@ async function viewWizard() {
       try {
         const r = await api('fido_register', { draftId: w.draftId, pin: pin.value, label: label.value.trim() || 'YubiKey' });
         w.keys.push(r.label); pin.value = ''; render();
-      } catch { err.textContent = t('unlock_failed'); }
+      } catch (e) {
+        // Setup errors are specific (no PIN set, wrong key…); unknown codes stay generic.
+        const k = 'err_' + (e && e.code);
+        err.textContent = t(k) !== k ? t(k) : t('unlock_failed');
+      }
       finally { overlay.remove(); }
     } }, icon(w.keys.length ? 'plus' : 'key', 'sm'), w.keys.length ? t('add_backup_key') : t('register_key'));
 

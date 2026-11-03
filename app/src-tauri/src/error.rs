@@ -61,6 +61,31 @@ impl From<tauri::Error> for CmdError {
     }
 }
 
+/// Key *setup* errors (wizard / add key) are specific, so the user can fix
+/// them (set a PIN, insert one key, …). Unlock errors stay generic.
+pub fn fido_setup_error(e: vault_core::Error) -> CmdError {
+    use vault_core::fido2::*;
+    use vault_core::Error::{Invalid, Unsupported};
+    let code = match &e {
+        Invalid(m) | Unsupported(m) => match *m {
+            ERR_PIN_NOT_SET => "fido_pin_not_set",
+            ERR_UNSUPPORTED_KEY => "fido_unsupported_key",
+            ERR_NO_KEY => "fido_no_key",
+            ERR_MULTIPLE_KEYS => "fido_multiple_keys",
+            ERR_ALREADY_REGISTERED => "fido_already_registered",
+            ERR_WRONG_PIN => "fido_wrong_pin",
+            ERR_PIN_BLOCKED => "fido_pin_blocked",
+            ERR_PIN_FORMAT => "fido_pin_format",
+            ERR_NO_TOUCH => "fido_no_touch",
+            ERR_LABEL => "fido_label",
+            ERR_LABEL_TAKEN => "fido_label_taken",
+            _ => return e.into(),
+        },
+        _ => return e.into(),
+    };
+    CmdError::new(code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +109,24 @@ mod tests {
         assert_eq!(e.code, "unsupported");
         let e: CmdError = Error::BrowserMissing.into();
         assert_eq!(e.code, "browser_missing");
+    }
+
+    #[test]
+    fn fido_setup_codes() {
+        use vault_core::fido2::*;
+        assert_eq!(
+            fido_setup_error(Error::Invalid(ERR_PIN_NOT_SET)).code,
+            "fido_pin_not_set"
+        );
+        assert_eq!(
+            fido_setup_error(Error::Unsupported(ERR_UNSUPPORTED_KEY)).code,
+            "fido_unsupported_key"
+        );
+        assert_eq!(
+            fido_setup_error(Error::Invalid(ERR_NO_TOUCH)).code,
+            "fido_no_touch"
+        );
+        assert_eq!(fido_setup_error(Error::UnlockFailed).code, "unlock_failed");
+        assert_eq!(fido_setup_error(Error::Invalid("other")).code, "invalid");
     }
 }

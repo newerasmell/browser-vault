@@ -2,17 +2,18 @@
 //! 1. browser exit — a watcher thread per session waits on the `Child`;
 //! 2. idle — `vault_core::lock::idle_seconds()` polled every 10 s;
 //! 3. screen lock / sleep — macOS notifications (see `macos` below);
-//! 4. YubiKey removal — FIDO2 presence polled every 2 s, only a
-//!    present → absent transition locks (a missing backend never does);
+//! 4. YubiKey removal — `fido2::key_present` polled every 2 s per fido2
+//!    vault; only a present → absent transition locks;
 //! 5. manual / panic hotkey — tray menu, `lock_all`, global shortcut.
 
+use std::collections::HashMap;
 use std::process::Child;
 use std::thread;
 use std::time::Duration;
 
 use tauri::AppHandle;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
-use vault_core::header::Slot;
+use vault_core::header::{Header, Slot};
 use vault_core::store::Unlocked;
 
 use crate::hotkey;
@@ -75,22 +76,37 @@ fn idle_loop(app: AppHandle) {
 }
 
 fn key_loop(app: AppHandle) {
-    let mut previous: Option<bool> = None;
+    // Last observed presence per (vault id, session generation).
+    let mut previous: HashMap<(String, u64), bool> = HashMap::new();
     loop {
         thread::sleep(KEY_POLL);
         let st = state::get(&app);
-        let any_fido = lock(&st.sessions).values().any(|s| is_fido2(&s.unlocked));
-        if !any_fido {
-            previous = None;
-            continue;
+        // Snapshot the fido2 sessions' headers; probe without holding the lock.
+        let open: Vec<(String, u64, Header, bool)> = lock(&st.sessions)
+            .iter()
+            .filter(|(_, s)| is_fido2(&s.unlocked))
+            .map(|(id, s)| {
+                let h = &s.unlocked.header;
+                (
+                    id.clone(),
+                    s.generation,
+                    h.clone(),
+                    h.settings.lock_on_key_removal,
+                )
+            })
+            .collect();
+        previous.retain(|(id, g), _| open.iter().any(|(i, gg, ..)| i == id && gg == g));
+        let global = lock(&st.settings).lock_on_key_removal;
+        for (id, generation, header, vault_enabled) in open {
+            let now = vault_core::fido2::key_present(&header, st.fido.as_ref());
+            let prev = previous.insert((id.clone(), generation), now);
+            if key_removed(prev, now) && global && vault_enabled {
+                let app = app.clone();
+                thread::spawn(move || {
+                    let _ = lockctl::lock_one(&app, &id, Reason::KeyRemoved);
+                });
+            }
         }
-        let now = st.fido.present();
-        if key_removed(previous, now) && lock(&st.settings).lock_on_key_removal {
-            let _ = lockctl::lock_matching(&app, Reason::KeyRemoved, |s| {
-                is_fido2(&s.unlocked) && s.unlocked.header.settings.lock_on_key_removal
-            });
-        }
-        previous = Some(now);
     }
 }
 

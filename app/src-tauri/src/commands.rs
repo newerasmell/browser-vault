@@ -480,13 +480,8 @@ pub async fn fido_register(
         let app2 = app.clone();
         let notify = move |e: Event| emit_touch(&app2, None, e);
         let label = with_draft(&st, &draft_id, |d| {
-            Ok(vault_core::fido2::register(
-                d,
-                st.fido.as_ref(),
-                &pin,
-                label.trim(),
-                &notify,
-            )?)
+            vault_core::fido2::register(d, st.fido.as_ref(), &pin, label.trim(), &notify)
+                .map_err(crate::error::fido_setup_error)
         });
         // Make sure the overlay goes away whatever happened.
         emit_touch(&app, None, Event::FidoTouchDone);
@@ -760,10 +755,15 @@ fn delete_vault(app: &AppHandle, id: &str) -> CmdResult<Value> {
     lockctl::lock_one(app, id, Reason::Manual)?;
     // Best effort: the TOTP Secure Enclave key is useless without the vault.
     for s in &header.slots {
-        if let Slot::Totp { se_key_tag, .. } = s {
+        if let Slot::Totp {
+            se_key_tag,
+            se_key_blob,
+            ..
+        } = s
+        {
             let _ = st.se.delete_key(&vault_core::se::SeKeyRef {
                 tag: se_key_tag.clone(),
-                blob: None,
+                blob: se_key_blob.as_ref().map(|b| b.0.clone()),
             });
         }
     }
