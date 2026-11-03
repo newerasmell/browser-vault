@@ -67,7 +67,31 @@ fn run_for(bin: &Path, args: &[&std::ffi::OsStr], env: &[(&str, &str)], b: Brows
     );
     browser::terminate(pid, Duration::from_secs(10));
     let _ = c.wait();
+    // Firefox may relaunch itself on a fresh profile (new PID); stop every
+    // process started against this test's profile path too.
+    let needle = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .find(|a| a.contains("/home/Library/"))
+        .expect("profile path argument under the fake home");
+    let needle = needle.trim_start_matches("--user-data-dir=");
+    for other in pids_with(needle) {
+        eprintln!("note: stopping relaunched {b:?} pid {other}");
+        browser::terminate(other, Duration::from_secs(10));
+    }
     wait_regular_gone(b);
+}
+
+fn pids_with(needle: &str) -> Vec<i32> {
+    let out = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(needle))
+        .filter_map(|l| l.trim().split_once(' ')?.0.parse().ok())
+        .collect()
 }
 
 fn create_with_import(s: &Store, roots: &Roots, b: Browser, profile_id: &str) -> String {
