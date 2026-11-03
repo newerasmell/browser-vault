@@ -96,12 +96,29 @@ pub enum Slot {
         nonce: B64,
         wrapped_vmk: B64,
     },
-    /// KEK = HKDF(PW ‖ SE_secret). Implemented in M3.
+    /// KEK = HKDF(PW ‖ SE_secret) (SPEC §4.1, see `totp`).
+    ///
+    /// `last_counter`, `failures`, `locked_until` and `state_mac` are the
+    /// mutable anti-replay / rate-limit state. They change on every attempt,
+    /// including failed ones where the VMK is unknown, so they are excluded
+    /// from the VMK header MAC and protected by `state_mac` instead (keyed
+    /// from the TOTP seed, which the Secure Enclave unwraps without a code).
     Totp {
         se_key_tag: String,
+        /// Opaque Secure Enclave token object id used to re-open the key
+        /// (see `se`). Absent only for a keychain-resident key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        se_key_blob: Option<B64>,
         wrapped_se_secret: B64,
         wrapped_seed: B64,
         last_counter: u64,
+        #[serde(default)]
+        failures: u32,
+        /// Unix time (s) before which no attempt is evaluated; 0 = none.
+        #[serde(default)]
+        locked_until: u64,
+        #[serde(default)]
+        state_mac: B64,
         nonce: B64,
         wrapped_vmk: B64,
     },
@@ -198,10 +215,27 @@ impl Header {
         Ok(v)
     }
 
-    /// The bytes the MAC covers: the whole header with `mac` emptied.
+    /// The bytes the MAC covers: the whole header with `mac` emptied and the
+    /// TOTP slot's mutable counter state zeroed (that state has its own MAC,
+    /// see [`Slot::Totp`]), so failed unlock attempts keep the header intact.
     fn mac_input(&self) -> Result<Vec<u8>> {
         let mut h = self.clone();
         h.mac = B64::default();
+        for slot in &mut h.slots {
+            if let Slot::Totp {
+                last_counter,
+                failures,
+                locked_until,
+                state_mac,
+                ..
+            } = slot
+            {
+                *last_counter = 0;
+                *failures = 0;
+                *locked_until = 0;
+                *state_mac = B64::default();
+            }
+        }
         Ok(serde_json::to_vec(&h)?)
     }
 
@@ -313,8 +347,12 @@ mod tests {
                 Slot::Totp {
                     se_key_tag: "com.browservault.x".into(),
                     wrapped_se_secret: B64(vec![6; 80]),
+                    se_key_blob: Some(B64(vec![13; 40])),
                     wrapped_seed: B64(vec![7; 80]),
                     last_counter: 0,
+                    failures: 0,
+                    locked_until: 0,
+                    state_mac: B64(vec![14; 32]),
                     nonce: B64(vec![8; 24]),
                     wrapped_vmk: B64(vec![9; 48]),
                 },
@@ -411,8 +449,13 @@ mod tests {
                 h.slots.pop();
             }),
             Box::new(|h| {
-                if let Slot::Totp { last_counter, .. } = &mut h.slots[1] {
-                    *last_counter = 99;
+                if let Slot::Totp { wrapped_seed, .. } = &mut h.slots[1] {
+                    wrapped_seed.0[0] ^= 1;
+                }
+            }),
+            Box::new(|h| {
+                if let Slot::Totp { se_key_blob, .. } = &mut h.slots[1] {
+                    *se_key_blob = None;
                 }
             }),
             Box::new(|h| h.mac.0[0] ^= 1),
@@ -422,6 +465,63 @@ mod tests {
             m(&mut t);
             assert!(!t.verify_mac(&vmk), "mutation not detected");
         }
+    }
+
+    #[test]
+    fn mac_ignores_totp_counter_state() {
+        let vmk = crypto::random_key();
+        let mut h = sample();
+        h.seal_mac(&vmk).unwrap();
+        if let Slot::Totp {
+            last_counter,
+            failures,
+            locked_until,
+            state_mac,
+            ..
+        } = &mut h.slots[1]
+        {
+            *last_counter = 99;
+            *failures = 7;
+            *locked_until = 12345;
+            state_mac.0[0] ^= 1;
+        }
+        assert!(h.verify_mac(&vmk));
+    }
+
+    #[test]
+    fn totp_slot_fields() {
+        let json = sample().to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let t = &v["slots"][1];
+        for f in [
+            "se_key_tag",
+            "se_key_blob",
+            "wrapped_se_secret",
+            "wrapped_seed",
+            "last_counter",
+            "failures",
+            "locked_until",
+            "state_mac",
+            "nonce",
+            "wrapped_vmk",
+        ] {
+            assert!(t.get(f).is_some(), "missing {f}");
+        }
+        // The added fields default when absent.
+        let mut t = t.clone();
+        for f in ["se_key_blob", "failures", "locked_until", "state_mac"] {
+            t.as_object_mut().unwrap().remove(f);
+        }
+        let s: Slot = serde_json::from_value(t).unwrap();
+        assert!(matches!(
+            s,
+            Slot::Totp {
+                se_key_blob: None,
+                failures: 0,
+                locked_until: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
