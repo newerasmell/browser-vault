@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use crate::browser::{self, Browser};
 use crate::error::{Error, Result};
 use crate::hdiutil;
-use crate::store::Store;
+use crate::store::{Store, Unlocked};
 
 /// Seconds since the last user input (`CGEventSourceSecondsSinceLastEventType`).
 /// `None` when unavailable (non-macOS).
@@ -89,7 +89,19 @@ pub fn cleanup_traces(browser: Browser) -> Result<()> {
     cleanup_traces_in(Path::new(&home), browser, running).map(|_| ())
 }
 
-/// Full lock procedure: stop browser, detach (with retries), clean traces.
+/// Lock procedure for an open session: [`Store::close`] (stop browser,
+/// detach, then `profiles::mark_reviewed` so SPEC §5.1 `reviewed` can flip),
+/// then clean traces. Keys are wiped when `session` is dropped inside.
+pub fn close_vault(store: &Store, session: Unlocked) -> Result<()> {
+    let browser = session.header.browser;
+    store.close(session)?;
+    let _ = cleanup_traces(browser);
+    Ok(())
+}
+
+/// Full lock procedure when no session is held (crash leftovers, CLI
+/// mounts): stop browser, detach (with retries), clean traces. Prefer
+/// [`close_vault`] whenever the `Unlocked` session is available.
 /// Trace cleanup is best effort and never fails the lock.
 pub fn lock_vault(store: &Store, id: &str) -> Result<()> {
     let browser = store.load(id).ok().map(|h| h.browser);

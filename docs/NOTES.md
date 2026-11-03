@@ -6,6 +6,8 @@
 |---|---|
 | M1 | `vault-core` + `bvault` CLI: create / unlock (парола) / mount / launch Brave / lock. Unit тестовете минават на Linux; E2E (`tests/e2e_macos.rs`) чака ръчно пускане на Mac |
 | M2 | Keyslots, recovery фраза (BIP39, 24 думи), Argon2id, MAC на header-а, атомарен запис + `.bak`. Unit тестове: wrap/unwrap, грешна парола, подправен header |
+| M5 | Firefox: `-profile <mnt>/profile`, `user.js` (кеш в `<mnt>/cache`). E2E `m5_firefox_acceptance` |
+| M7b | Откриване, импорт с проверка, преглед, изтриване на оригинала (`profiles.rs`). Unit тестове с фалшив home; E2E `tests/e2e_import_macos.rs` |
 
 E2E на Mac:
 ```
@@ -21,7 +23,7 @@ cargo test -p vault-core --test e2e_macos -- --ignored --nocapture --test-thread
 5. **Таван на Argon2 параметрите** от header-а (m ≤ 4 GiB, t ≤ 64, p ≤ 16), за да не може подправен header да направи DoS.
 6. **Header-ът отхвърля непознати полета** (`deny_unknown_fields`) и версии ≠ 1.
 7. **`BVAULT_HOME`** (само път, не секрет) сменя базовата папка; ползва се от тестовете.
-8. Firefox сейф се отказва с `Unsupported` до M5.
+8. ~~Firefox сейф се отказва с `Unsupported` до M5.~~ Махнато в M5.
 9. `bvault create` пита за 3 случайни думи от фразата само в интерактивен режим (TTY).
 
 ## M4: YubiKey (FIDO2 hmac-secret) — решения
@@ -64,6 +66,25 @@ cargo test -p vault-core --test e2e_se -- --ignored --nocapture --test-threads=1
 13. `totp-rs` 6 (`otpauth`, `zeroize`, без `gen_secret`: seed-ът идва от `OsRng`). URI-то и base32 ключът минават през временни `String`-ове в `totp-rs`, които не се zeroize-ват.
 14. **Feature `test-mocks`** прави `se::MockSecureEnclave` достъпен извън crate-а (за CLI/интеграционни тестове). Не се включва в app build-а.
 
+## M5 (Firefox) и M7b (импорт + изтриване на оригинала)
+
+- **Firefox стартиране:** `firefox --new-instance -profile <mnt>/profile`, с env `MOZ_CRASHREPORTER_DISABLE=1` (без crash dump-ове в `~/Library/Application Support/Firefox/Crash Reports`; env-ът е само флаг, не секрет).
+- **`user.js`** се пише при създаване (create монтира новия образ веднъж) **и се презаписва при всяко отключване**. Mountpoint-ът е стабилен, но така пътят на кеша остава верен и при преместен store, и се поправя ръчно редактиран `user.js`. Управлява се само блок между `// BEGIN Browser Vault` и `// END Browser Vault`; останалото (напр. от импортиран профил) се запазва. Изборът `identity.fxaccounts.enabled=false` живее само в този блок (без ново поле в header-а); при unlock се пази текущият избор.
+- **Brave crash reporter:** добавени `--disable-crash-reporter --disable-breakpad` (crash dump съдържа памет на браузъра). На macos-14 CI Brave 1.94 все пак пипа `Crashpad/settings.dat` (метаданни на клиента, без данни от сърфиране) и E2E тестът позволява само този файл; dump-ове в `Crashpad/pending|completed` пак чупят теста.
+- **`Store::create_with(draft, size, settings, &CreateOptions { disable_fxa, import }, notify) -> Created { header, import_error }`**; `Store::create` е непроменен (вика `create_with` с default). При неуспешен импорт сейфът е създаден, празен и работещ, а грешката е в `import_error`.
+- **Импорт:** Brave `Profile N` → `<mnt>/profile/Default` (vault инстанцията ползва `<mnt>/profile` като user-data-dir); Firefox профил → `<mnt>/profile`. Копират се само обикновени файлове и папки; symlink-ове и сокети (lock файлове) се пропускат. Проверка: пълен списък относителни пътища + размер на всеки файл (покрива брой и общ размер) + SHA-256 на ключовите файлове (за Brave и `Network/Cookies`, защото Chromium ≥ 96 държи cookies там). При разминаване копието се трие и сейфът остава празен.
+- **`reviewed`:** `Store::close(session)` = `lock` + `profiles::mark_reviewed`. Първото затваряне на отключена сесия след импорта поставя `reviewed=true` (затварянето при самия create не се брои). Апът трябва да заключва през `close`, не през `lock(id)`, за да се отбележи прегледът.
+- **Проверка на паролата при изтриване:** паролата сама не отваря VMK (нужен е и втори фактор), а hash на паролата на диска би бил offline oracle. Затова `cleanup_original` изисква **отключена сесия**: при unlock на сейф с оригинал (state ≠ deleted) и credential с парола, в паметта се пази `PasswordVerifier` = HMAC(HKDF(VMK, "bv-cleanup-pw-v1"), Argon2id(password)) в `Zeroizing`; на диска не се пише нищо. Цена: един допълнителен Argon2id при unlock, само докато има оригинал. Сесия от recovery фраза няма verifier → `unlock_failed`.
+- **`cleanup_original`** проверява наново, в този ред: MAC на прочетения от диска header под VMK на сесията (подправен header не може да насочи изтриването или да вдигне `reviewed`), `reviewed` (`not_reviewed`), обикновеният браузър (`browser_running`), паролата (`unlock_failed`). Пътищата за триене се изчисляват наново от `profile_id` + конфигурацията на браузъра (не от `original.paths`), с валидация срещу `..` и пътища над home. Ред: backup + редакция на `Local State` / `profiles.ini` + `installs.ini` → папка на профила → кеш → Saved Application State → `state: deleted`, `deleted_at`. Backup: `<файл>.bvault-<unix>.bak` до оригинала.
+- **Firefox `profiles.ini`:** секциите `[ProfileN]` се преномерират (Firefox спира на първия липсващ номер). Ако изтритият е бил default: `Default=1` и `Default=` в `[Install…]` / `installs.ini` минават към първия останал профил; ако няма останал, install секцията се маха.
+- **Обикновен браузър работи ли:** `ps -axo command=`; търси се главният binary (`…/Contents/MacOS/Brave Browser`, не `… Helper`; `…/Contents/MacOS/firefox`), чиито аргументи не сочат `…/mnt/<uuid>/profile`. Ако `ps` не може да се пусне → „работи“ (fail safe).
+- **Корени:** `profiles::Roots { home, browser_running, file_vault }` — всички пътища се смятат от `home`; тестовете ползват фалшив home в temp dir. E2E за M7b (`tests/e2e_import_macos.rs`) създава „съществуващите“ профили с истинските браузъри, но в temp home (`--user-data-dir` / `-profile`), така че никога не пипа реалните профили.
+- `keep_original` / `undo_keep_original` също искат отключена сесия (за MAC на header-а).
+
+Отворени въпроси:
+1. `cleanup_original` и `keep_original` изискват сейфът да е отключен (UI: `request_vault_action` → unlock прозорец → после cleanup). Алтернатива: пълен credential (парола + втори фактор) в cleanup прозореца.
+2. Firefox `extensions.json` / `addonStartup.json.lz4` съдържат абсолютни пътища към стария профил; Firefox обикновено ги пресканира, но не е проверено с разширения.
+
 ## M6 / M7 / M8 (DMG): Tauri приложение (`app/src-tauri`)
 
 **Локално (на Mac):**
@@ -90,14 +111,14 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 9. Panic hotkey: UI-ят записва `⌃⌥⌘L`; Rust го парсва (`src/hotkey.rs`). **Поправка във frontend-а:** записът на клавиша ползва `e.code`, защото с ⌥ `e.key` дава друг символ (⌥L → „¬“).
 10. Tray прозорецът е 360 px широк, а височината следва съдържанието чрез init script + вътрешната команда `tray_fit` (не е в UI.md). Скрива се при blur.
 11. Червената иконка (грешка при detach) не е template image, за да е наистина червена (SPEC §7).
-12. При заключване след импорт `original.reviewed = true` се записва от приложението (нужен е VMK за MAC-а), само ако MAC-ът на header-а е валиден.
+12. Заключване с отворена сесия минава през `lock::close_vault` → `Store::close` (там `profiles::mark_reviewed` вдига `reviewed`), после почистване на следи. `lock::lock_vault(id)` само когато сесия няма (останки след срив, mount от CLI).
+12a. Оригиналният профил (`src/original.rs`): `cleanup_preview`/`cleanup_original`/`keep_original`/`restore_original_notice` изискват отворена сесия. Ако сейфът е заключен, се отваря unlock прозорецът и действието продължава автоматично след успешно отключване (същото за `delete`). `open_window('cleanup')` при заключен сейф първо отключва. Сесия от recovery фраза не може да изтрива оригинала (`unlock_failed`).
+12b. `wizard_finish` ползва `Store::create_with` (`disableFxa`, импорт). При `import_error` сейфът остава създаден, връща се `importError` и се показва системно съобщение.
 13. `lock.rs`: `recover_after_crash` намира останали томове по `<root>/mnt/*` и по `hdiutil info -plist` (image под `<root>/vaults/` или mount под `<root>/mnt/`), спира оцелял браузър само ако командният му ред сочи в mount-а (защита от преизползван PID) и трие остарели pid файлове.
 14. `request_vault_action`: `delete` работи (сейфът трябва да е отключен в момента + системно потвърждение); останалите показват „още не е налично“ и връщат `unsupported`.
 15. Launch at login: `tauri-plugin-autostart` (LaunchAgent), прилага се при промяна на настройката.
 
-**TODO за интеграция:**
-- `TODO(integrate M7b)`: `cleanup_preview`, `cleanup_original`, `keep_original`, `restore_original_notice`, импорт при `wizard_finish` (`src/integrate.rs`). `detect_profiles` връща `[]`, докато е `Unsupported`.
+**TODO:**
 - `TODO(integrate)`: `change_password` (`totp::change_password` съществува), `add_fido2` (`fido2::add_key`), `replace_totp`, `new_recovery` в `request_vault_action`: API-тата в ядрото ги има, липсват UI екрани (нова парола; парола+PIN+етикет; еднократно показване на фразата). Засега показват „още не е налично“.
-- `TODO(integrate M5)`: `disableFxa` → `user.js`.
 - Ако `Store::create` се провали, черновата е загубена (`create` я консумира) и wizard-ът трябва да започне отначало.
 - M8: Developer ID подпис, notarization, hardened runtime, Tauri updater: не са направени.

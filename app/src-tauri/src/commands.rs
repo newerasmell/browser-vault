@@ -17,16 +17,18 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use vault_core::events::Event;
 use vault_core::header::{Header, OriginalState, Slot, VaultSettings};
 use vault_core::keyslot::{Draft, KdfCost};
-use vault_core::store::Devices;
+use vault_core::profiles::Roots;
+use vault_core::store::{CreateOptions, Devices, ImportRequest};
 use vault_core::{browser, Browser, Credential};
 use zeroize::Zeroizing;
 
 use crate::error::{CmdError, CmdResult};
 use crate::lockctl::{self, Reason};
+use crate::original::{self, Pending};
 use crate::settings::{Patch, Settings};
 use crate::state::{self, lock, AppState, Session};
 use crate::texts::{tr, T};
-use crate::{integrate, tray, triggers, windows};
+use crate::{tray, triggers, windows};
 
 /// Run blocking work (Argon2 256 MiB, hdiutil, browser shutdown) off the
 /// main thread and off the async executor.
@@ -80,7 +82,7 @@ pub fn mode_of(h: &Header) -> &'static str {
     }
 }
 
-fn bytes_to_mb(b: u64) -> u64 {
+pub fn bytes_to_mb(b: u64) -> u64 {
     (b + 512 * 1024) / (1024 * 1024)
 }
 
@@ -271,7 +273,13 @@ pub fn open_window(
             let _ = t.hide();
         }
     }
-    windows::open(&app, &view, &params.unwrap_or_default())
+    let params = params.unwrap_or_default();
+    if view == "cleanup" {
+        // Deleting the original needs the open session (SPEC §5.1).
+        let id = params.get("id").ok_or(CmdError::invalid())?;
+        return original::open_cleanup(&app, id);
+    }
+    windows::open(&app, &view, &params)
 }
 
 #[tauri::command]
@@ -385,6 +393,10 @@ fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
     lock(&st.errors).remove(id);
     triggers::watch_browser(app.clone(), id.to_string(), generation, child);
     lockctl::vaults_changed(app);
+    // An action that asked for this unlock (cleanup, keep, delete) resumes
+    // now, on its own thread so the unlock window can close.
+    let (app2, vid) = (app.clone(), id.to_string());
+    std::thread::spawn(move || original::resume(&app2, &vid));
     Ok(json!(OK))
 }
 
@@ -609,8 +621,6 @@ pub async fn wizard_finish(
         .remove(&draft_id)
         .ok_or(CmdError::not_found())?;
     let settings = vault_settings(&options);
-    // TODO(integrate M5): options.disable_fxa → user.js for Firefox vaults.
-    let _ = options.disable_fxa;
     blocking(move || {
         let st = state::get(&app);
         let app2 = app.clone();
@@ -622,18 +632,35 @@ pub async fn wizard_finish(
                 );
             }
         };
-        let header = st.store.create(draft, size_gb, settings, &progress)?;
-        let id = header.vault_id.clone();
-        if options.import_profile {
-            if let Some(pid) = options.import_profile_id.as_deref() {
-                let _ = app.emit("create_progress", json!({ "stage": "import", "pct": 90 }));
-                // TODO(integrate M7b): surface import failures in the UI.
-                let _ = integrate::import_profile(&st, &id, b, pid);
-            }
-        }
+        let import = match (options.import_profile, options.import_profile_id) {
+            (true, Some(profile_id)) => Some(ImportRequest {
+                roots: Roots::system()?,
+                profile_id,
+            }),
+            _ => None,
+        };
+        let opts = CreateOptions {
+            disable_fxa: options.disable_fxa,
+            import,
+        };
+        let created = st
+            .store
+            .create_with(draft, size_gb, settings, &opts, &progress)?;
+        let id = created.header.vault_id.clone();
         let _ = app.emit("create_progress", json!({ "stage": "done", "pct": 100 }));
         lockctl::vaults_changed(&app);
-        Ok(json!({ "vaultId": id }))
+        // The vault exists and works; only the import was refused.
+        let import_error = created.import_error.map(|e| CmdError::from(e).code);
+        if let Some(code) = import_error {
+            let bg = st.is_bg();
+            let text = match code {
+                "browser_running" => tr(bg, T::ImportBrowserRunning),
+                _ => tr(bg, T::ImportFailed),
+            };
+            let app2 = app.clone();
+            std::thread::spawn(move || message(&app2, text));
+        }
+        Ok(json!({ "vaultId": id, "importError": import_error }))
     })
     .await
 }
@@ -726,17 +753,12 @@ fn message(app: &AppHandle, text: &str) {
 
 /// Delete a vault the user has just proven they can open (it must be
 /// unlocked), after a native confirmation.
-fn delete_vault(app: &AppHandle, id: &str) -> CmdResult<Value> {
+pub fn delete_unlocked_vault(app: &AppHandle, id: &str) -> CmdResult<Value> {
     let st = state::get(app);
     let bg = st.is_bg();
-    if !lock(&st.sessions).contains_key(id) {
-        windows::open(
-            app,
-            "unlock",
-            &BTreeMap::from([("id".into(), id.to_string())]),
-        )?;
-        message(app, tr(bg, T::UnlockFirst));
-        return Ok(json!({ "ok": false }));
+    if !original::is_open(app, id) {
+        original::require_unlock(app, id, Pending::Delete)?;
+        return Ok(json!({ "ok": false, "pending": "unlock" }));
     }
     let confirmed = app
         .dialog()
@@ -782,7 +804,7 @@ pub async fn request_vault_action(app: AppHandle, id: String, action: String) ->
         let st = state::get(&app);
         st.store.load(&id)?; // validates the id
         match action.as_str() {
-            "delete" => delete_vault(&app, &id),
+            "delete" => delete_unlocked_vault(&app, &id),
             // TODO(integrate M3/M4): change_password / add_fido2 /
             // replace_totp need factor re-wrap APIs from totp.rs / fido2.rs;
             // new_recovery needs a one-time display + confirm screen.
@@ -799,33 +821,28 @@ pub async fn request_vault_action(app: AppHandle, id: String, action: String) ->
 // ---------------------------------------------------------------- original profile (M7b)
 
 #[tauri::command]
-pub fn cleanup_preview(app: AppHandle, id: String) -> CmdResult<Value> {
-    integrate::cleanup_preview(&state::get(&app), &id)
+pub async fn cleanup_preview(app: AppHandle, id: String) -> CmdResult<Value> {
+    blocking(move || original::preview(&app, &id)).await
 }
 
 #[tauri::command]
 pub async fn cleanup_original(app: AppHandle, id: String, password: String) -> CmdResult<Value> {
     let password = Zeroizing::new(password);
     blocking(move || {
-        integrate::cleanup_original(&state::get(&app), &id, &password)?;
-        lockctl::vaults_changed(&app);
+        original::cleanup(&app, &id, &password)?;
         Ok(json!(OK))
     })
     .await
 }
 
 #[tauri::command]
-pub fn keep_original(app: AppHandle, id: String) -> CmdResult<()> {
-    integrate::keep_original(&state::get(&app), &id)?;
-    lockctl::vaults_changed(&app);
-    Ok(())
+pub async fn keep_original(app: AppHandle, id: String) -> CmdResult<Value> {
+    blocking(move || original::set_kept(&app, &id, true)).await
 }
 
 #[tauri::command]
-pub fn restore_original_notice(app: AppHandle, id: String) -> CmdResult<()> {
-    integrate::restore_original_notice(&state::get(&app), &id)?;
-    lockctl::vaults_changed(&app);
-    Ok(())
+pub async fn restore_original_notice(app: AppHandle, id: String) -> CmdResult<Value> {
+    blocking(move || original::set_kept(&app, &id, false)).await
 }
 
 #[cfg(test)]

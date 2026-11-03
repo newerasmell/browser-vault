@@ -36,6 +36,8 @@ pub struct AppState {
     pub se: Box<dyn SecureEnclave>,
     pub fido: Box<dyn Authenticator>,
     generation: AtomicU64,
+    /// Actions waiting for an unlock of that vault (see original.rs).
+    pub pending: Mutex<HashMap<String, crate::original::Pending>>,
     /// When the tray popover was last hidden by losing focus (see tray.rs).
     pub tray_blurred_at: Mutex<Option<Instant>>,
 }
@@ -58,6 +60,7 @@ impl AppState {
             se: vault_core::se::system(),
             fido: vault_core::fido2::system(),
             generation: AtomicU64::new(1),
+            pending: Mutex::default(),
             tray_blurred_at: Mutex::new(None),
         }
     }

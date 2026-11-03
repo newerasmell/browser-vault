@@ -6,7 +6,6 @@ use std::thread;
 
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
-use vault_core::header::OriginalState;
 
 use crate::error::{CmdError, CmdResult};
 use crate::state::{self, lock, AppState, Session};
@@ -39,31 +38,6 @@ pub fn vaults_changed(app: &AppHandle) {
     tray::refresh(app);
 }
 
-/// SPEC §5.1 step 3: `reviewed` becomes true once the vault was opened and
-/// closed after an import. Needs the VMK to re-seal the header MAC, so it
-/// happens here, before the session (and its key) is dropped. Never re-seals
-/// a header whose MAC does not verify (that would hide tampering).
-fn mark_reviewed(st: &AppState, s: &Session) {
-    let id = &s.unlocked.header.vault_id;
-    let Ok(mut h) = st.store.load(id) else {
-        return;
-    };
-    let pending = h
-        .original
-        .as_ref()
-        .is_some_and(|o| !o.reviewed && o.state == OriginalState::Pending);
-    let vmk = s.unlocked.key.vmk();
-    if !pending || !h.verify_mac(vmk) {
-        return;
-    }
-    if let Some(o) = h.original.as_mut() {
-        o.reviewed = true;
-    }
-    if h.seal_mac(vmk).is_ok() {
-        let _ = st.store.save_header(&h);
-    }
-}
-
 /// Lock one vault. Idempotent; concurrent calls for the same id collapse.
 pub fn lock_one(app: &AppHandle, id: &str, reason: Reason) -> CmdResult<()> {
     let st = state::get(app);
@@ -72,12 +46,12 @@ pub fn lock_one(app: &AppHandle, id: &str, reason: Reason) -> CmdResult<()> {
     }
     let session = lock(&st.sessions).remove(id);
     let was_open = session.is_some() || st.store.is_unlocked(id);
-    if let Some(s) = &session {
-        mark_reviewed(&st, s);
-    }
-    let result = vault_core::lock::lock_vault(&st.store, id);
-    // Step 3: wipe keys (Unlocked/UnlockedKey zeroize on drop).
-    drop(session);
+    // With a session: Store::close (also flips SPEC §5.1 `reviewed`).
+    // Keys are wiped when the session is dropped inside (SPEC §6 step 3).
+    let result = match session {
+        Some(s) => vault_core::lock::close_vault(&st.store, s.unlocked),
+        None => vault_core::lock::lock_vault(&st.store, id),
+    };
     lock(&st.locking).remove(id);
 
     let bg = st.is_bg();

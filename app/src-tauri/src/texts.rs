@@ -9,11 +9,12 @@ pub enum T {
     DetachFailed,
     HeaderModified,
     NotAvailableYet,
-    UnlockFirst,
     DeleteConfirm,
     DeleteButton,
     Cancel,
     RecoveredAfterCrash,
+    ImportFailed,
+    ImportBrowserRunning,
 }
 
 pub fn tr(bg: bool, key: T) -> &'static str {
@@ -31,8 +32,6 @@ pub fn tr(bg: bool, key: T) -> &'static str {
         (false, HeaderModified) => "Warning: the vault header was modified outside the app.",
         (true, NotAvailableYet) => "Това действие още не е налично в тази версия.",
         (false, NotAvailableYet) => "This action is not available in this version yet.",
-        (true, UnlockFirst) => "Първо отключи сейфа, после повтори действието.",
-        (false, UnlockFirst) => "Unlock the vault first, then repeat the action.",
         (true, DeleteConfirm) => "Сейфът и всички данни в него ще бъдат изтрити окончателно. Продължаване?",
         (false, DeleteConfirm) => "The vault and all data in it will be deleted permanently. Continue?",
         (true, DeleteButton) => "Изтрий",
@@ -41,5 +40,9 @@ pub fn tr(bg: bool, key: T) -> &'static str {
         (false, Cancel) => "Cancel",
         (true, RecoveredAfterCrash) => "Сейфове, останали отворени след срив, бяха заключени.",
         (false, RecoveredAfterCrash) => "Vaults left open after a crash were locked.",
+        (true, ImportFailed) => "Сейфът е създаден, но импортът на профила не успя. Сейфът е празен и работи; оригиналът не е променян.",
+        (false, ImportFailed) => "The vault was created, but importing the profile failed. The vault is empty and works; the original was not changed.",
+        (true, ImportBrowserRunning) => "Сейфът е създаден, но профилът не е импортиран, защото браузърът работи. Сейфът е празен и работи.",
+        (false, ImportBrowserRunning) => "The vault was created, but the profile was not imported because the browser is running. The vault is empty and works.",
     }
 }

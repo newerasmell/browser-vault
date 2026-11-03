@@ -3,8 +3,8 @@
 mod commands;
 mod error;
 mod hotkey;
-mod integrate;
 mod lockctl;
+mod original;
 mod settings;
 mod state;
 mod texts;
