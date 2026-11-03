@@ -540,7 +540,10 @@ async function viewSettings(params) {
       const handler = (e) => {
         if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) return;
         e.preventDefault();
-        const combo = (e.ctrlKey ? '⌃' : '') + (e.altKey ? '⌥' : '') + (e.shiftKey ? '⇧' : '') + (e.metaKey ? '⌘' : '') + e.key.toUpperCase();
+        // Physical key (e.code): with ⌥ held, e.key is the alternate character (⌥L → "¬").
+        const key = /^Key[A-Z]$/.test(e.code) ? e.code.slice(3) : /^Digit\d$/.test(e.code) ? e.code.slice(5)
+          : e.code === 'Space' ? 'SPACE' : /^F\d{1,2}$/.test(e.code) ? e.code : e.key.toUpperCase();
+        const combo = (e.ctrlKey ? '⌃' : '') + (e.altKey ? '⌥' : '') + (e.shiftKey ? '⇧' : '') + (e.metaKey ? '⌘' : '') + key;
         window.removeEventListener('keydown', handler, true);
         rec.disabled = false;
         if (combo.length < 3) { hk.textContent = s.panicHotkey; return; } // require a modifier

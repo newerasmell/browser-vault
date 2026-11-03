@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "All Browser Vault windows: core IPC + events. App commands are in-crate; plugins are used from Rust only.",
+  "windows": ["tray", "unlock-*", "wizard", "settings", "cleanup"],
+  "permissions": ["core:default"]
+}
