@@ -14,6 +14,9 @@ sha2 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 bip39 = { version = "2", default-features = false, features = ["std", "zeroize"] }
+# TOTP (RFC 6238) and the setup QR code (SPEC §2, §4.1).
+totp-rs = { version = "6", default-features = false, features = ["std", "otpauth", "zeroize"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # Non-crypto support crates.
 base64 = "0.22"
@@ -24,10 +27,19 @@ thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 uuid = "1"
 
+# Secure Enclave via SecKey (SPEC §2, §4.1).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
 [features]
 # TEST ONLY: password-only keyslot for M1/M2 tests and E2E. Never enable in
 # the app build: a release must not be able to open a password-only vault.
 test-password-slot = []
+# TEST ONLY: software `MockSecureEnclave` for integration tests outside the crate.
+test-mocks = []
 
 [[test]]
 name = "e2e_macos"
