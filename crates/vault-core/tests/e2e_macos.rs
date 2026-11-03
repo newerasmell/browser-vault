@@ -12,10 +12,33 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use vault_core::store::Credential;
-use vault_core::{browser, hdiutil, Browser, Error, KdfCost, Store};
+use vault_core::header::VaultSettings;
+use vault_core::keyslot::Draft;
+use vault_core::store::{Credential, Devices};
+use vault_core::{browser, events, fido2, hdiutil, se, Browser, Error, KdfCost, Store};
 
 const PW: &str = "correct horse battery";
+
+fn devs() -> Devices<'static> {
+    Devices {
+        se: Box::leak(se::system()),
+        fido: Box::leak(fido2::system()),
+        notify: &events::ignore,
+    }
+}
+
+/// Password-only vault (test feature) → (header id, recovery phrase).
+fn create(s: &Store, name: &str, browser: Browser) -> (String, String) {
+    let mut d = Draft::new(name, browser, KdfCost::FAST).unwrap();
+    d.set_password(PW).unwrap();
+    d.add_password_only_slot().unwrap();
+    d.generate_recovery().unwrap();
+    let phrase = d.recovery_phrase().unwrap().to_string();
+    let h = s
+        .create(d, 1, VaultSettings::default(), &events::ignore)
+        .unwrap();
+    (h.vault_id, phrase)
+}
 
 fn store() -> (tempfile::TempDir, Store) {
     let d = tempfile::tempdir().unwrap();
@@ -29,13 +52,10 @@ fn store() -> (tempfile::TempDir, Store) {
 #[ignore = "needs macOS hdiutil; run manually (see file header)"]
 fn container_roundtrip() {
     let (_d, s) = store();
-    let c = s
-        .create("E2E", Browser::Brave, PW, 1, KdfCost::FAST)
-        .unwrap();
-    let id = c.header.vault_id.clone();
+    let (id, phrase) = create(&s, "E2E", Browser::Brave);
     assert!(s.image_path(&id).is_dir(), "sparsebundle is a directory");
 
-    let u = s.unlock(&id, Credential::Password(PW)).unwrap();
+    let u = s.unlock(&id, Credential::Password(PW), &devs()).unwrap();
     assert!(u.header_intact);
     assert!(hdiutil::is_mounted(&u.mountpoint));
     let secret_file = u.mountpoint.join("profile/secret.txt");
@@ -52,13 +72,13 @@ fn container_roundtrip() {
     ));
 
     assert!(matches!(
-        s.unlock(&id, Credential::Password("wrong password!!")),
+        s.unlock(&id, Credential::Password("wrong password!!"), &devs()),
         Err(Error::UnlockFailed)
     ));
     assert!(!hdiutil::is_mounted(&s.mountpoint(&id)));
 
     let u = s
-        .unlock(&id, Credential::Recovery(&c.recovery_phrase))
+        .unlock(&id, Credential::Recovery(&phrase), &devs())
         .unwrap();
     assert_eq!(
         fs::read(u.mountpoint.join("profile/secret.txt")).unwrap(),
@@ -76,15 +96,12 @@ fn container_roundtrip() {
 fn m1_brave_acceptance() {
     let brave = browser::detect(Browser::Brave).expect("Brave must be installed");
     let (_d, s) = store();
-    let c = s
-        .create("M1", Browser::Brave, PW, 1, KdfCost::FAST)
-        .unwrap();
-    let id = c.header.vault_id.clone();
+    let (id, _phrase) = create(&s, "M1", Browser::Brave);
 
     let marker = SystemTime::now();
     std::thread::sleep(Duration::from_secs(1));
 
-    let u = s.unlock(&id, Credential::Password(PW)).unwrap();
+    let u = s.unlock(&id, Credential::Password(PW), &devs()).unwrap();
     let mut child = s.launch(&u, Some(&brave)).unwrap();
     std::thread::sleep(Duration::from_secs(10));
     assert!(

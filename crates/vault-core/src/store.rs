@@ -15,9 +15,12 @@ use std::process::Child;
 
 use crate::browser::{self, Browser};
 use crate::error::{Error, Result};
+use crate::events::{CreateStage, Event, Notify};
+use crate::fido2::Authenticator;
 use crate::hdiutil;
-use crate::header::Header;
-use crate::keyslot::{self, KdfCost, UnlockedKey};
+use crate::header::{Header, VaultSettings};
+use crate::keyslot::{self, Draft, UnlockedKey};
+use crate::se::SecureEnclave;
 
 pub const DEFAULT_SIZE_GB: u32 = 20;
 /// Overrides the base directory (tests / debugging). Holds a path, never a secret.
@@ -27,15 +30,31 @@ pub struct Store {
     root: PathBuf,
 }
 
-/// Credential presented to unlock a vault. M3/M4 add TOTP and FIDO2 variants.
+/// Credential presented to unlock a vault.
 pub enum Credential<'a> {
-    Password(&'a str),
+    /// Password + 6-digit code from the authenticator app (SPEC §4.1).
+    Totp { password: &'a str, code: &'a str },
+    /// Password + YubiKey PIN (+ touch) (SPEC §4.2).
+    Fido2 { password: &'a str, pin: &'a str },
+    /// The 24-word recovery phrase alone.
     Recovery(&'a str),
+    /// TEST ONLY: temporary password-only slot.
+    #[cfg(any(test, feature = "test-password-slot"))]
+    Password(&'a str),
 }
 
-pub struct Created {
-    pub header: Header,
-    pub recovery_phrase: zeroize::Zeroizing<String>,
+/// Hardware backends used for unlocking. Tests pass mocks.
+pub struct Devices<'a> {
+    pub se: &'a dyn SecureEnclave,
+    pub fido: &'a dyn Authenticator,
+    pub notify: Notify<'a>,
+}
+
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub struct Unlocked {
@@ -153,20 +172,23 @@ impl Store {
         header.save(&self.vault_dir(&header.vault_id))
     }
 
-    /// Create the header and the encrypted sparsebundle. The recovery phrase is
-    /// returned once and never stored.
+    /// Finish a [`Draft`]: build the sealed header, create the encrypted
+    /// sparsebundle and save the header. On failure nothing is left behind.
     pub fn create(
         &self,
-        name: &str,
-        browser: Browser,
-        password: &str,
+        draft: Draft,
         size_gb: u32,
-        cost: KdfCost,
-    ) -> Result<Created> {
-        if browser == Browser::Firefox {
+        settings: VaultSettings,
+        notify: Notify<'_>,
+    ) -> Result<Header> {
+        if draft.browser() == Browser::Firefox {
             return Err(Error::Unsupported("Firefox vaults arrive in milestone M5"));
         }
-        let nv = keyslot::new_vault(name, browser, password, cost)?;
+        notify(Event::CreateProgress {
+            stage: CreateStage::Keys,
+            pct: 10,
+        });
+        let nv = draft.finish(settings)?;
         let id = nv.header.vault_id.clone();
         mkdir_700(&self.root)?;
         mkdir_700(&self.vaults_dir())?;
@@ -174,17 +196,23 @@ impl Store {
         mkdir_700(&dir)?;
 
         let result = (|| {
+            notify(Event::CreateProgress {
+                stage: CreateStage::Disk,
+                pct: 30,
+            });
             hdiutil::create(&self.image_path(&id), size_gb, &id, &nv.key.disk_key_hex())?;
-            self.save_header(&nv.header)
+            self.save_header(&nv.header)?;
+            notify(Event::CreateProgress {
+                stage: CreateStage::Profile,
+                pct: 80,
+            });
+            Ok(())
         })();
         if let Err(e) = result {
             let _ = fs::remove_dir_all(&dir);
             return Err(e);
         }
-        Ok(Created {
-            header: nv.header,
-            recovery_phrase: nv.recovery_phrase,
-        })
+        Ok(nv.header)
     }
 
     pub fn is_unlocked(&self, id: &str) -> bool {
@@ -192,11 +220,21 @@ impl Store {
     }
 
     /// Derive the VMK and attach the image at `mnt/<id>`.
-    pub fn unlock(&self, id: &str, cred: Credential<'_>) -> Result<Unlocked> {
-        let header = self.load(id)?;
+    pub fn unlock(&self, id: &str, cred: Credential<'_>, dev: &Devices<'_>) -> Result<Unlocked> {
+        let mut header = self.load(id)?;
         let key = match cred {
-            Credential::Password(p) => keyslot::unlock_with_password(&header, p)?,
+            Credential::Totp { password, code } => {
+                let r = crate::totp::unlock(&mut header, password, code, dev.se, now_unix());
+                // Counters (anti-replay, rate limit) change on success and failure.
+                self.save_header(&header)?;
+                r?
+            }
+            Credential::Fido2 { password, pin } => {
+                crate::fido2::unlock(&header, dev.fido, password, pin, dev.notify)?
+            }
             Credential::Recovery(p) => keyslot::unlock_with_recovery(&header, p)?,
+            #[cfg(any(test, feature = "test-password-slot"))]
+            Credential::Password(p) => keyslot::unlock_with_password(&header, p)?,
         };
         let mnt = self.mountpoint(id);
         if !hdiutil::is_mounted(&mnt) {
@@ -265,14 +303,24 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyslot::new_vault;
+    use crate::keyslot::{new_vault, KdfCost};
+
+    fn devs() -> Devices<'static> {
+        Devices {
+            se: Box::leak(crate::se::system()),
+            fido: Box::leak(crate::fido2::system()),
+            notify: &crate::events::ignore,
+        }
+    }
 
     const PW: &str = "correct horse battery";
 
     fn store_with_vault(name: &str) -> (tempfile::TempDir, Store, Header) {
         let d = tempfile::tempdir().unwrap();
         let s = Store::new(d.path());
-        let nv = new_vault(name, Browser::Brave, PW, KdfCost::FAST).unwrap();
+        let nv = new_vault(name, Browser::Brave, PW, KdfCost::FAST)
+            .unwrap()
+            .0;
         mkdir_700(&s.vault_dir(&nv.header.vault_id)).unwrap();
         s.save_header(&nv.header).unwrap();
         (d, s, nv.header)
@@ -291,7 +339,9 @@ mod tests {
     #[test]
     fn ambiguous_name_needs_id() {
         let (_d, s, _h) = store_with_vault("Work");
-        let nv = new_vault("work", Browser::Brave, PW, KdfCost::FAST).unwrap();
+        let nv = new_vault("work", Browser::Brave, PW, KdfCost::FAST)
+            .unwrap()
+            .0;
         mkdir_700(&s.vault_dir(&nv.header.vault_id)).unwrap();
         s.save_header(&nv.header).unwrap();
         assert!(matches!(s.resolve("WORK"), Err(Error::Invalid(_))));
@@ -317,7 +367,11 @@ mod tests {
     #[test]
     fn wrong_password_fails_before_touching_disk() {
         let (_d, s, h) = store_with_vault("Work");
-        let r = s.unlock(&h.vault_id, Credential::Password("wrong password!!"));
+        let r = s.unlock(
+            &h.vault_id,
+            Credential::Password("wrong password!!"),
+            &devs(),
+        );
         assert!(matches!(r, Err(Error::UnlockFailed)));
         assert!(!s.mountpoint(&h.vault_id).exists());
     }
@@ -326,8 +380,12 @@ mod tests {
     fn create_rejects_firefox_until_m5() {
         let d = tempfile::tempdir().unwrap();
         let s = Store::new(d.path());
+        let mut d = Draft::new("F", Browser::Firefox, KdfCost::FAST).unwrap();
+        d.set_password(PW).unwrap();
+        d.add_password_only_slot().unwrap();
+        d.generate_recovery().unwrap();
         assert!(matches!(
-            s.create("F", Browser::Firefox, PW, 1, KdfCost::FAST),
+            s.create(d, 1, VaultSettings::default(), &crate::events::ignore),
             Err(Error::Unsupported(_))
         ));
     }
@@ -338,7 +396,13 @@ mod tests {
         // Off macOS there is no hdiutil, so create must fail and clean up.
         let d = tempfile::tempdir().unwrap();
         let s = Store::new(d.path());
-        assert!(s.create("W", Browser::Brave, PW, 1, KdfCost::FAST).is_err());
+        let mut d = Draft::new("W", Browser::Brave, KdfCost::FAST).unwrap();
+        d.set_password(PW).unwrap();
+        d.add_password_only_slot().unwrap();
+        d.generate_recovery().unwrap();
+        assert!(s
+            .create(d, 1, VaultSettings::default(), &crate::events::ignore)
+            .is_err());
         assert!(s.list().unwrap().is_empty());
         assert_eq!(fs::read_dir(s.vaults_dir()).unwrap().count(), 0);
     }

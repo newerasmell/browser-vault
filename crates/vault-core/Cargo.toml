@@ -24,5 +24,14 @@ thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 uuid = "1"
 
+[features]
+# TEST ONLY: password-only keyslot for M1/M2 tests and E2E. Never enable in
+# the app build: a release must not be able to open a password-only vault.
+test-password-slot = []
+
+[[test]]
+name = "e2e_macos"
+required-features = ["test-password-slot"]
+
 [dev-dependencies]
 tempfile = "3"

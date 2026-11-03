@@ -1,5 +1,11 @@
 //! Keyslot creation and unlocking (SPEC §4). Pure functions over a [`Header`];
 //! no disk or process side effects, so everything here is unit-testable.
+//!
+//! New vaults are built with a [`Draft`] (the wizard's in-memory state):
+//! `Draft::new` → `set_password` → a second-factor module adds its slot
+//! (`totp::begin/confirm`, `fido2::register`) → `generate_recovery` →
+//! `finish`. Factor modules compute their KEK with [`factor_kek`] and wrap the
+//! VMK with [`Draft::wrap`]; on unlock they use [`unwrap_slot`] + [`unlocked`].
 
 use std::fmt;
 
@@ -42,8 +48,40 @@ fn kek_info(kind: &str) -> Vec<u8> {
 
 /// AAD binds a wrapped VMK to its vault and slot type, so slots cannot be
 /// moved between vaults or reinterpreted as another type.
-fn slot_aad(vault_id: &str, kind: &str) -> Vec<u8> {
+pub fn slot_aad(vault_id: &str, kind: &str) -> Vec<u8> {
     format!("bv-slot-v1|{vault_id}|{kind}").into_bytes()
+}
+
+/// SPEC §4: KEK = HKDF(PW ‖ factor_secret), domain-separated by slot kind.
+/// `factor_secret` is the YubiKey hmac-secret output or the SE_secret.
+pub fn factor_kek(pw: &Key, factor_secret: &[u8], kind: &str) -> Key {
+    crypto::hkdf_concat(pw.as_ref(), factor_secret, &kek_info(kind))
+}
+
+/// Unwrap a VMK from a slot of `kind`. Opaque failure.
+pub fn unwrap_slot(
+    header: &Header,
+    kind: &str,
+    kek: &Key,
+    nonce: &B64,
+    wrapped: &B64,
+) -> Result<Key> {
+    crypto::unwrap_key(kek, &slot_aad(&header.vault_id, kind), &nonce.0, &wrapped.0)
+        .map_err(|_| Error::UnlockFailed)
+}
+
+/// Wrap `vmk` for a slot of `kind` in the vault `vault_id`.
+pub fn wrap_slot(vault_id: &str, kind: &str, kek: &Key, vmk: &Key) -> Result<(B64, B64)> {
+    let (nonce, ct) = crypto::wrap_key(kek, &slot_aad(vault_id, kind), vmk)?;
+    Ok((nonce.into(), ct.into()))
+}
+
+/// Derive the password key `PW = Argon2id(password, kdf.salt)`; opaque failure.
+pub fn password_key(header: &Header, password: &str) -> Result<Key> {
+    header
+        .kdf
+        .derive(password.as_bytes())
+        .map_err(|_| Error::UnlockFailed)
 }
 
 /// The unwrapped Vault Master Key plus the header-integrity verdict.
@@ -72,11 +110,15 @@ impl UnlockedKey {
     }
 }
 
+/// Wrap a freshly unwrapped VMK and check the header MAC against it.
+pub fn unlocked(header: &Header, vmk: Key) -> UnlockedKey {
+    let header_intact = header.verify_mac(&vmk);
+    UnlockedKey { vmk, header_intact }
+}
+
 pub struct NewVault {
     pub header: Header,
     pub key: UnlockedKey,
-    /// Shown to the user exactly once (SPEC §4).
-    pub recovery_phrase: Zeroizing<String>,
 }
 
 pub fn validate_password(password: &str) -> Result<()> {
@@ -103,7 +145,7 @@ fn new_vault_id() -> String {
         .to_string()
 }
 
-fn now_rfc3339() -> String {
+pub fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .replace_nanosecond(0)
         .ok()
@@ -114,94 +156,240 @@ fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
-fn wrap_slot(vault_id: &str, kind: &str, kek: &Key, vmk: &Key) -> Result<(B64, B64)> {
-    let (nonce, ct) = crypto::wrap_key(kek, &slot_aad(vault_id, kind), vmk)?;
-    Ok((nonce.into(), ct.into()))
-}
-
-fn password_kek(pw: &Key) -> Key {
-    crypto::hkdf_concat(pw.as_ref(), &[], &kek_info("password"))
-}
-
 fn recovery_kek(kdf: &Kdf, phrase: &str, salt: &[u8]) -> Result<Key> {
     let rk = kdf.derive_with_salt(phrase.as_bytes(), salt)?;
     Ok(crypto::hkdf(rk.as_ref(), &kek_info("recovery")))
 }
 
-/// Build the header for a new vault: random VMK, a (temporary) password slot
-/// and a recovery slot. Nothing is written to disk here.
-pub fn new_vault(name: &str, browser: Browser, password: &str, cost: KdfCost) -> Result<NewVault> {
-    validate_name(name)?;
-    validate_password(password)?;
-
-    let vault_id = new_vault_id();
-    let vmk = crypto::random_key();
-    let kdf = Kdf {
-        alg: "argon2id".into(),
-        m_kib: cost.m_kib,
-        t: cost.t,
-        p: cost.p,
-        salt: crypto::random_bytes::<16>().into(),
-    };
-
-    let pw = kdf.derive(password.as_bytes())?;
-    let (nonce, wrapped_vmk) = wrap_slot(&vault_id, "password", &password_kek(&pw), &vmk)?;
-    let password_slot = Slot::Password { nonce, wrapped_vmk };
-
-    let phrase = recovery::generate()?;
+fn recovery_slot(vault_id: &str, kdf: &Kdf, phrase: &str, vmk: &Key) -> Result<Slot> {
     let rsalt = crypto::random_bytes::<16>();
-    let rkek = recovery_kek(&kdf, &phrase, &rsalt)?;
-    let (nonce, wrapped_vmk) = wrap_slot(&vault_id, "recovery", &rkek, &vmk)?;
-    let recovery_slot = Slot::Recovery {
+    let rkek = recovery_kek(kdf, phrase, &rsalt)?;
+    let (nonce, wrapped_vmk) = wrap_slot(vault_id, "recovery", &rkek, vmk)?;
+    Ok(Slot::Recovery {
         salt: rsalt.into(),
         nonce,
         wrapped_vmk,
-    };
-
-    let mut header = Header {
-        version: HEADER_VERSION,
-        vault_id,
-        name: name.trim().to_string(),
-        browser,
-        created_at: now_rfc3339(),
-        kdf,
-        slots: vec![password_slot, recovery_slot],
-        settings: VaultSettings::default(),
-        original: None,
-        mac: B64::default(),
-    };
-    header.seal_mac(&vmk)?;
-
-    Ok(NewVault {
-        header,
-        key: UnlockedKey {
-            vmk,
-            header_intact: true,
-        },
-        recovery_phrase: phrase,
     })
 }
 
-fn finish(header: &Header, vmk: Key) -> UnlockedKey {
-    let header_intact = header.verify_mac(&vmk);
-    UnlockedKey { vmk, header_intact }
+/// In-memory state of a vault being created (lives only in Rust memory; the
+/// UI holds just an opaque draft id). Secrets are zeroized on drop.
+pub struct Draft {
+    vault_id: String,
+    name: String,
+    browser: Browser,
+    kdf: Kdf,
+    vmk: Key,
+    pw: Option<Key>,
+    slots: Vec<Slot>,
+    recovery_phrase: Option<Zeroizing<String>>,
+    recovery_verified: bool,
+    /// TOTP setup awaiting confirmation with a first code (see `totp`).
+    pub(crate) pending_totp: Option<crate::totp::PendingTotp>,
 }
 
-/// Unlock with the password (temporary M1/M2 password slot).
-///
-/// Every failure — wrong password, tampered slot, bad KDF params — is
-/// [`Error::UnlockFailed`].
+impl fmt::Debug for Draft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Draft")
+            .field("vault_id", &self.vault_id)
+            .field("name", &self.name)
+            .field("browser", &self.browser)
+            .field("secrets", &Redacted)
+            .finish()
+    }
+}
+
+impl Draft {
+    pub fn new(name: &str, browser: Browser, cost: KdfCost) -> Result<Draft> {
+        validate_name(name)?;
+        Ok(Draft {
+            vault_id: new_vault_id(),
+            name: name.trim().to_string(),
+            browser,
+            kdf: Kdf {
+                alg: "argon2id".into(),
+                m_kib: cost.m_kib,
+                t: cost.t,
+                p: cost.p,
+                salt: crypto::random_bytes::<16>().into(),
+            },
+            vmk: crypto::random_key(),
+            pw: None,
+            slots: vec![],
+            recovery_phrase: None,
+            recovery_verified: false,
+            pending_totp: None,
+        })
+    }
+
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn browser(&self) -> Browser {
+        self.browser
+    }
+    pub fn set_name(&mut self, name: &str, browser: Browser) -> Result<()> {
+        validate_name(name)?;
+        self.name = name.trim().to_string();
+        self.browser = browser;
+        Ok(())
+    }
+    pub fn kdf(&self) -> &Kdf {
+        &self.kdf
+    }
+    pub fn vmk(&self) -> &Key {
+        &self.vmk
+    }
+    pub fn slots(&self) -> &[Slot] {
+        &self.slots
+    }
+
+    /// Set (or reset) the password. Factor slots already wrapped under the old
+    /// password are discarded, since their KEKs depend on it.
+    pub fn set_password(&mut self, password: &str) -> Result<()> {
+        validate_password(password)?;
+        self.pw = Some(self.kdf.derive(password.as_bytes())?);
+        self.slots.retain(|s| matches!(s, Slot::Recovery { .. }));
+        self.pending_totp = None;
+        Ok(())
+    }
+
+    /// `PW = Argon2id(password)` for factor modules.
+    pub fn password_key(&self) -> Result<&Key> {
+        self.pw
+            .as_ref()
+            .ok_or(Error::Invalid("set the password first"))
+    }
+
+    /// Wrap this draft's VMK for a slot of `kind` under `kek`.
+    pub fn wrap(&self, kind: &str, kek: &Key) -> Result<(B64, B64)> {
+        wrap_slot(&self.vault_id, kind, kek, &self.vmk)
+    }
+
+    pub fn add_slot(&mut self, slot: Slot) {
+        self.slots.push(slot);
+    }
+
+    pub fn has_second_factor(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| matches!(s, Slot::Fido2 { .. } | Slot::Totp { .. }))
+    }
+
+    /// Generate (or regenerate) the recovery phrase and its slot. Returns the 24 words.
+    pub fn generate_recovery(&mut self) -> Result<Vec<Zeroizing<String>>> {
+        let phrase = recovery::generate()?;
+        let slot = recovery_slot(&self.vault_id, &self.kdf, &phrase, &self.vmk)?;
+        self.slots.retain(|s| !matches!(s, Slot::Recovery { .. }));
+        self.slots.push(slot);
+        let words = recovery::words(&phrase);
+        self.recovery_phrase = Some(phrase);
+        self.recovery_verified = false;
+        Ok(words)
+    }
+
+    /// SPEC §4: the user types back 3 random words (1-based positions).
+    pub fn verify_recovery(&mut self, answers: &[(usize, &str)]) -> bool {
+        let ok = self
+            .recovery_phrase
+            .as_ref()
+            .is_some_and(|p| answers.len() >= 3 && recovery::verify_answers(p, answers));
+        if ok {
+            self.recovery_verified = true;
+        }
+        ok
+    }
+
+    pub fn recovery_verified(&self) -> bool {
+        self.recovery_verified
+    }
+
+    /// The phrase, for the CLI's one-time display. `None` before generation.
+    pub fn recovery_phrase(&self) -> Option<&str> {
+        self.recovery_phrase.as_deref().map(String::as_str)
+    }
+
+    /// TEST ONLY: add the temporary password-only slot (KEK = HKDF(PW)).
+    #[cfg(any(test, feature = "test-password-slot"))]
+    pub fn add_password_only_slot(&mut self) -> Result<()> {
+        let kek = factor_kek(self.password_key()?, &[], "password");
+        let (nonce, wrapped_vmk) = self.wrap("password", &kek)?;
+        self.slots.push(Slot::Password { nonce, wrapped_vmk });
+        Ok(())
+    }
+
+    /// Build the sealed header. Requires the password, at least one unlock
+    /// slot besides recovery, and a recovery slot. (The wizard additionally
+    /// requires `recovery_verified()` before calling this.)
+    pub fn finish(self, settings: VaultSettings) -> Result<NewVault> {
+        self.password_key()?;
+        let has_unlock_slot = self
+            .slots
+            .iter()
+            .any(|s| !matches!(s, Slot::Recovery { .. }));
+        if !has_unlock_slot {
+            return Err(Error::Invalid("add a second factor first"));
+        }
+        if !self
+            .slots
+            .iter()
+            .any(|s| matches!(s, Slot::Recovery { .. }))
+        {
+            return Err(Error::Invalid("generate the recovery phrase first"));
+        }
+        let mut header = Header {
+            version: HEADER_VERSION,
+            vault_id: self.vault_id.clone(),
+            name: self.name.clone(),
+            browser: self.browser,
+            created_at: now_rfc3339(),
+            kdf: self.kdf.clone(),
+            slots: self.slots.clone(),
+            settings,
+            original: None,
+            mac: B64::default(),
+        };
+        header.seal_mac(&self.vmk)?;
+        Ok(NewVault {
+            header,
+            key: UnlockedKey {
+                vmk: self.vmk.clone(),
+                header_intact: true,
+            },
+        })
+    }
+}
+
+/// TEST ONLY: one-shot password-only vault (M1/M2 tests, E2E, CLI dev mode).
+/// Returns the vault and its recovery phrase.
+#[cfg(any(test, feature = "test-password-slot"))]
+pub fn new_vault(
+    name: &str,
+    browser: Browser,
+    password: &str,
+    cost: KdfCost,
+) -> Result<(NewVault, Zeroizing<String>)> {
+    let mut d = Draft::new(name, browser, cost)?;
+    d.set_password(password)?;
+    d.add_password_only_slot()?;
+    d.generate_recovery()?;
+    let phrase = Zeroizing::new(d.recovery_phrase().unwrap_or_default().to_string());
+    Ok((d.finish(VaultSettings::default())?, phrase))
+}
+
+/// TEST ONLY: unlock the temporary password-only slot. Not compiled into
+/// release builds, so a shipped app can never open a password-only vault.
+#[cfg(any(test, feature = "test-password-slot"))]
 pub fn unlock_with_password(header: &Header, password: &str) -> Result<UnlockedKey> {
-    let pw = header
-        .kdf
-        .derive(password.as_bytes())
-        .map_err(|_| Error::UnlockFailed)?;
-    let kek = password_kek(&pw);
-    let aad = slot_aad(&header.vault_id, "password");
+    let pw = password_key(header, password)?;
+    let kek = factor_kek(&pw, &[], "password");
     for slot in &header.slots {
         if let Slot::Password { nonce, wrapped_vmk } = slot {
-            if let Ok(vmk) = crypto::unwrap_key(&kek, &aad, &nonce.0, &wrapped_vmk.0) {
-                return Ok(finish(header, vmk));
+            if let Ok(vmk) = unwrap_slot(header, "password", &kek, nonce, wrapped_vmk) {
+                return Ok(unlocked(header, vmk));
             }
         }
     }
@@ -211,7 +399,6 @@ pub fn unlock_with_password(header: &Header, password: &str) -> Result<UnlockedK
 /// Unlock with the 24-word recovery phrase alone.
 pub fn unlock_with_recovery(header: &Header, phrase: &str) -> Result<UnlockedKey> {
     let phrase = recovery::normalize(phrase)?;
-    let aad = slot_aad(&header.vault_id, "recovery");
     for slot in &header.slots {
         if let Slot::Recovery {
             salt,
@@ -221,24 +408,25 @@ pub fn unlock_with_recovery(header: &Header, phrase: &str) -> Result<UnlockedKey
         {
             let kek =
                 recovery_kek(&header.kdf, &phrase, &salt.0).map_err(|_| Error::UnlockFailed)?;
-            if let Ok(vmk) = crypto::unwrap_key(&kek, &aad, &nonce.0, &wrapped_vmk.0) {
-                return Ok(finish(header, vmk));
+            if let Ok(vmk) = unwrap_slot(header, "recovery", &kek, nonce, wrapped_vmk) {
+                return Ok(unlocked(header, vmk));
             }
         }
     }
     Err(Error::UnlockFailed)
 }
 
-/// Re-wrap the VMK under a new password (SPEC §4: the container is not
-/// re-encrypted). Replaces every password slot and re-seals the MAC.
+/// TEST ONLY (password slot): re-wrap the VMK under a new password. Factor
+/// modules provide their own re-wrap, since they need the factor secret.
+#[cfg(any(test, feature = "test-password-slot"))]
 pub fn change_password(header: &mut Header, key: &UnlockedKey, new_password: &str) -> Result<()> {
     validate_password(new_password)?;
     // A fresh salt for the password KDF. The recovery slot depends only on
     // the cost parameters and its own salt, so it stays valid.
     header.kdf.salt = crypto::random_bytes::<16>().into();
     let pw = header.kdf.derive(new_password.as_bytes())?;
-    let (nonce, wrapped_vmk) =
-        wrap_slot(&header.vault_id, "password", &password_kek(&pw), &key.vmk)?;
+    let kek = factor_kek(&pw, &[], "password");
+    let (nonce, wrapped_vmk) = wrap_slot(&header.vault_id, "password", &kek, &key.vmk)?;
     header.slots.retain(|s| !matches!(s, Slot::Password { .. }));
     header
         .slots
@@ -249,15 +437,9 @@ pub fn change_password(header: &mut Header, key: &UnlockedKey, new_password: &st
 /// Replace the recovery slot with a new phrase; returns the new phrase.
 pub fn new_recovery(header: &mut Header, key: &UnlockedKey) -> Result<Zeroizing<String>> {
     let phrase = recovery::generate()?;
-    let rsalt = crypto::random_bytes::<16>();
-    let rkek = recovery_kek(&header.kdf, &phrase, &rsalt)?;
-    let (nonce, wrapped_vmk) = wrap_slot(&header.vault_id, "recovery", &rkek, &key.vmk)?;
+    let slot = recovery_slot(&header.vault_id, &header.kdf, &phrase, &key.vmk)?;
     header.slots.retain(|s| !matches!(s, Slot::Recovery { .. }));
-    header.slots.push(Slot::Recovery {
-        salt: rsalt.into(),
-        nonce,
-        wrapped_vmk,
-    });
+    header.slots.push(slot);
     header.seal_mac(&key.vmk)?;
     Ok(phrase)
 }
@@ -268,8 +450,89 @@ mod tests {
 
     const PW: &str = "correct horse battery";
 
-    fn vault() -> NewVault {
-        new_vault("Work – Brave", Browser::Brave, PW, KdfCost::FAST).unwrap()
+    struct V {
+        header: Header,
+        key: UnlockedKey,
+        recovery_phrase: Zeroizing<String>,
+    }
+
+    fn vault() -> V {
+        let (nv, recovery_phrase) =
+            new_vault("Work – Brave", Browser::Brave, PW, KdfCost::FAST).unwrap();
+        V {
+            header: nv.header,
+            key: nv.key,
+            recovery_phrase,
+        }
+    }
+
+    #[test]
+    fn draft_flow_requires_password_factor_and_recovery() {
+        let mut d = Draft::new("D", Browser::Brave, KdfCost::FAST).unwrap();
+        assert!(d.password_key().is_err());
+        assert!(d.add_password_only_slot().is_err());
+        d.set_password(PW).unwrap();
+        d.generate_recovery().unwrap();
+        assert!(!d.has_second_factor());
+        // Recovery alone is not enough.
+        let mut d2 = Draft::new("D", Browser::Brave, KdfCost::FAST).unwrap();
+        d2.set_password(PW).unwrap();
+        d2.generate_recovery().unwrap();
+        assert!(d2.finish(VaultSettings::default()).is_err());
+        // Factor without recovery is not enough.
+        let mut d3 = Draft::new("D", Browser::Brave, KdfCost::FAST).unwrap();
+        d3.set_password(PW).unwrap();
+        d3.add_password_only_slot().unwrap();
+        assert!(d3.finish(VaultSettings::default()).is_err());
+
+        d.add_password_only_slot().unwrap();
+        let id = d.vault_id().to_string();
+        let nv = d.finish(VaultSettings::default()).unwrap();
+        assert_eq!(nv.header.vault_id, id);
+        assert!(nv.header.verify_mac(nv.key.vmk()));
+    }
+
+    #[test]
+    fn draft_password_reset_drops_factor_slots() {
+        let mut d = Draft::new("D", Browser::Brave, KdfCost::FAST).unwrap();
+        d.set_password(PW).unwrap();
+        d.generate_recovery().unwrap();
+        d.add_password_only_slot().unwrap();
+        d.set_password("another long password").unwrap();
+        let kinds: Vec<_> = d.slots().iter().map(Slot::kind).collect();
+        assert_eq!(kinds, ["recovery"]);
+    }
+
+    #[test]
+    fn draft_recovery_verification() {
+        let mut d = Draft::new("D", Browser::Brave, KdfCost::FAST).unwrap();
+        assert!(!d.verify_recovery(&[(1, "x"), (2, "y"), (3, "z")]));
+        let words = d.generate_recovery().unwrap();
+        assert_eq!(words.len(), 24);
+        assert!(
+            !d.verify_recovery(&[(1, words[0].as_str())]),
+            "needs 3 words"
+        );
+        assert!(!d.verify_recovery(&[(1, words[0].as_str()), (2, words[1].as_str()), (3, "nope")]));
+        assert!(!d.recovery_verified());
+        assert!(d.verify_recovery(&[
+            (1, words[0].as_str()),
+            (5, words[4].as_str()),
+            (24, words[23].as_str())
+        ]));
+        assert!(d.recovery_verified());
+        // Regenerating resets verification.
+        d.generate_recovery().unwrap();
+        assert!(!d.recovery_verified());
+    }
+
+    #[test]
+    fn draft_debug_is_redacted() {
+        let mut d = Draft::new("D", Browser::Brave, KdfCost::FAST).unwrap();
+        d.set_password(PW).unwrap();
+        let s = format!("{d:?}");
+        assert!(s.contains("<redacted>"));
+        assert!(!s.contains(PW));
     }
 
     #[test]

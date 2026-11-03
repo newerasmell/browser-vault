@@ -9,6 +9,10 @@ publish.workspace = true
 name = "bvault"
 path = "src/main.rs"
 
+[features]
+# Dev/test builds only: allows `--password-only` vaults (no second factor).
+test-password-slot = ["vault-core/test-password-slot"]
+
 [dependencies]
 vault-core = { path = "../vault-core" }
 clap = { version = "4", features = ["derive"] }

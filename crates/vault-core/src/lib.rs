@@ -4,11 +4,16 @@
 pub mod browser;
 pub mod crypto;
 pub mod error;
+pub mod events;
+pub mod fido2;
 pub mod hdiutil;
 pub mod header;
 pub mod keyslot;
+pub mod profiles;
 pub mod recovery;
+pub mod se;
 pub mod store;
+pub mod totp;
 
 pub use browser::Browser;
 pub use error::{Error, Result};

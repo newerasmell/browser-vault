@@ -8,8 +8,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use vault_core::store::{Credential, DEFAULT_SIZE_GB};
-use vault_core::{recovery, Browser, Error, KdfCost, Store};
+use vault_core::header::VaultSettings;
+use vault_core::keyslot::Draft;
+use vault_core::store::{Credential, Devices, DEFAULT_SIZE_GB};
+use vault_core::{events, fido2, recovery, se, totp, Browser, Error, KdfCost, Store};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -29,6 +31,10 @@ enum Cmd {
         browser: String,
         #[arg(long, default_value_t = DEFAULT_SIZE_GB)]
         size_gb: u32,
+        /// Second factor: `totp` (authenticator app) or `fido2` (YubiKey).
+        /// `password-only` exists only in builds with the `test-password-slot` feature.
+        #[arg(long, default_value = "fido2")]
+        mode: String,
         /// Read the password as one line from stdin (no confirmation prompt).
         #[arg(long)]
         password_stdin: bool,
@@ -39,7 +45,7 @@ enum Cmd {
     Unlock {
         /// Vault id or name.
         vault: String,
-        /// Unlock with the 24-word recovery phrase instead of the password.
+        /// Unlock with the 24-word recovery phrase instead of password + factor.
         #[arg(long)]
         recovery: bool,
         /// Only mount; do not launch the browser (lock later with `bvault lock`).
@@ -103,6 +109,70 @@ fn confirm_recovery(phrase: &str) -> Result<(), Error> {
     }
 }
 
+fn cli_notify(e: events::Event) {
+    match e {
+        events::Event::FidoTouchNeeded => eprintln!("Touch your YubiKey…"),
+        events::Event::FidoTouchDone => eprintln!("OK."),
+        _ => {}
+    }
+}
+
+#[cfg(feature = "test-password-slot")]
+fn unlock_password_only(
+    store: &Store,
+    id: &str,
+    password: &str,
+    dev: &Devices<'_>,
+) -> Result<vault_core::store::Unlocked, Error> {
+    store.unlock(id, Credential::Password(password), dev)
+}
+
+#[cfg(not(feature = "test-password-slot"))]
+fn unlock_password_only(
+    _: &Store,
+    _: &str,
+    _: &str,
+    _: &Devices<'_>,
+) -> Result<vault_core::store::Unlocked, Error> {
+    Err(Error::UnlockFailed)
+}
+
+fn add_factor(draft: &mut Draft, mode: &str, from_stdin: bool) -> Result<(), Error> {
+    match mode {
+        "totp" => {
+            let se = se::system();
+            let setup = totp::begin(draft, se.as_ref())?;
+            eprintln!("Add this account to your authenticator app:");
+            eprintln!("  {}", setup.uri.as_str());
+            eprintln!("  manual key: {}", setup.secret.as_str());
+            loop {
+                let code = read_secret("Code from the app: ", from_stdin)?;
+                match totp::confirm(draft, &code, se.as_ref(), vault_core::store::now_unix()) {
+                    Ok(()) => break,
+                    Err(Error::UnlockFailed) if !from_stdin => eprintln!("Wrong code, try again."),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        "fido2" => {
+            let auth = fido2::system();
+            let pin = read_secret("YubiKey PIN: ", from_stdin)?;
+            fido2::register(draft, auth.as_ref(), &pin, "YubiKey main", &cli_notify)?;
+            if !from_stdin && std::io::stdin().is_terminal() {
+                let ans = read_secret("Register a backup key now? Insert it and type y: ", false)?;
+                if ans.trim().eq_ignore_ascii_case("y") {
+                    let pin = read_secret("Backup key PIN: ", false)?;
+                    fido2::register(draft, auth.as_ref(), &pin, "YubiKey backup", &cli_notify)?;
+                }
+            }
+        }
+        #[cfg(feature = "test-password-slot")]
+        "password-only" => draft.add_password_only_slot()?,
+        _ => return Err(Error::Invalid("mode must be totp or fido2")),
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<(), Error> {
     let store = Store::default_location()?;
     match cli.cmd {
@@ -110,10 +180,12 @@ fn run(cli: Cli) -> Result<(), Error> {
             name,
             browser,
             size_gb,
+            mode,
             password_stdin,
         } => {
             let browser = Browser::parse(&browser)
                 .ok_or(Error::Invalid("browser must be brave or firefox"))?;
+            let mut draft = Draft::new(&name, browser, KdfCost::DEFAULT)?;
             let pw = read_secret("Password (min 12 characters): ", password_stdin)?;
             vault_core::keyslot::validate_password(&pw)?;
             if !password_stdin && std::io::stdin().is_terminal() {
@@ -122,12 +194,17 @@ fn run(cli: Cli) -> Result<(), Error> {
                     return Err(Error::Invalid("passwords do not match"));
                 }
             }
-            eprintln!("Creating vault (deriving keys, creating encrypted disk)…");
-            let created = store.create(&name, browser, &pw, size_gb, KdfCost::DEFAULT)?;
+            eprintln!("Deriving keys…");
+            draft.set_password(&pw)?;
             drop(pw);
-            print_recovery(&created.recovery_phrase);
-            confirm_recovery(&created.recovery_phrase)?;
-            println!("{}", created.header.vault_id);
+            add_factor(&mut draft, &mode, password_stdin)?;
+            draft.generate_recovery()?;
+            let phrase = Zeroizing::new(draft.recovery_phrase().unwrap_or_default().to_string());
+            eprintln!("Creating encrypted disk…");
+            let header = store.create(draft, size_gb, VaultSettings::default(), &events::ignore)?;
+            print_recovery(&phrase);
+            confirm_recovery(&phrase)?;
+            println!("{}", header.vault_id);
         }
         Cmd::List => {
             for h in store.list()? {
@@ -153,19 +230,43 @@ fn run(cli: Cli) -> Result<(), Error> {
             password_stdin,
         } => {
             let h = store.resolve(&vault)?;
-            let prompt = if recovery {
-                "Recovery phrase: "
-            } else {
-                "Password: "
+            let se = se::system();
+            let fido = fido2::system();
+            let dev = Devices {
+                se: se.as_ref(),
+                fido: fido.as_ref(),
+                notify: &cli_notify,
             };
-            let secret = read_secret(prompt, password_stdin)?;
-            let cred = if recovery {
-                Credential::Recovery(&secret)
+            let unlocked = if recovery {
+                let phrase = read_secret("Recovery phrase: ", password_stdin)?;
+                store.unlock(&h.vault_id, Credential::Recovery(&phrase), &dev)?
             } else {
-                Credential::Password(&secret)
+                let password = read_secret("Password: ", password_stdin)?;
+                let kinds: Vec<&str> = h.slots.iter().map(|s| s.kind()).collect();
+                if kinds.contains(&"totp") {
+                    let code = read_secret("Authenticator code: ", password_stdin)?;
+                    store.unlock(
+                        &h.vault_id,
+                        Credential::Totp {
+                            password: &password,
+                            code: &code,
+                        },
+                        &dev,
+                    )?
+                } else if kinds.contains(&"fido2") {
+                    let pin = read_secret("YubiKey PIN: ", password_stdin)?;
+                    store.unlock(
+                        &h.vault_id,
+                        Credential::Fido2 {
+                            password: &password,
+                            pin: &pin,
+                        },
+                        &dev,
+                    )?
+                } else {
+                    unlock_password_only(&store, &h.vault_id, &password, &dev)?
+                }
             };
-            let unlocked = store.unlock(&h.vault_id, cred)?;
-            drop(secret);
             if !unlocked.header_intact {
                 eprintln!(
                     "WARNING: this vault's header.json was modified outside Browser Vault. \

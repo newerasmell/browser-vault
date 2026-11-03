@@ -11,6 +11,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("Unlock failed")]
     UnlockFailed,
+    /// Too many failed attempts; retry after this many seconds (SPEC §4.1).
+    #[error("too many attempts, retry in {retry_after} s")]
+    RateLimited { retry_after: u64 },
+    /// SPEC §5.1: the imported copy has not been opened and closed yet.
+    #[error("the imported profile has not been reviewed yet")]
+    NotReviewed,
+    /// The regular (non-vault) browser instance is running.
+    #[error("the browser is running; quit it first")]
+    BrowserRunning,
     #[error("vault not found")]
     NotFound,
     #[error("browser is not installed")]
@@ -34,6 +43,9 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Error::UnlockFailed | Error::Crypto => "unlock_failed",
+            Error::RateLimited { .. } => "rate_limited",
+            Error::NotReviewed => "not_reviewed",
+            Error::BrowserRunning => "browser_running",
             Error::NotFound => "not_found",
             Error::BrowserMissing => "browser_missing",
             Error::Invalid(_) | Error::Unsupported(_) | Error::Format(_) => "invalid",
