@@ -20,6 +20,7 @@ use crate::fido2::Authenticator;
 use crate::hdiutil;
 use crate::header::{Header, VaultSettings};
 use crate::keyslot::{self, Draft, UnlockedKey};
+use crate::profiles::{self, PasswordVerifier, Roots};
 use crate::se::SecureEnclave;
 
 pub const DEFAULT_SIZE_GB: u32 = 20;
@@ -64,6 +65,31 @@ pub struct Unlocked {
     pub header_intact: bool,
     /// Held for header updates while unlocked; wiped on drop (lock).
     pub key: UnlockedKey,
+    /// In-memory password proof for `profiles::cleanup_original`; only set
+    /// when the header records an imported original and the credential had
+    /// a password. Wiped on drop.
+    pub(crate) cleanup_verifier: Option<PasswordVerifier>,
+}
+
+/// Extra choices for [`Store::create_with`] (wizard options).
+#[derive(Default)]
+pub struct CreateOptions {
+    /// Firefox only: `identity.fxaccounts.enabled = false` in user.js.
+    pub disable_fxa: bool,
+    /// SPEC §5.1: copy this regular profile into the new vault.
+    pub import: Option<ImportRequest>,
+}
+
+pub struct ImportRequest {
+    pub roots: Roots,
+    pub profile_id: String,
+}
+
+pub struct Created {
+    pub header: Header,
+    /// The vault was created, but the import was refused (browser running,
+    /// verification mismatch …); the vault is empty and usable.
+    pub import_error: Option<Error>,
 }
 
 fn mkdir_700(p: &Path) -> Result<()> {
@@ -181,9 +207,20 @@ impl Store {
         settings: VaultSettings,
         notify: Notify<'_>,
     ) -> Result<Header> {
-        if draft.browser() == Browser::Firefox {
-            return Err(Error::Unsupported("Firefox vaults arrive in milestone M5"));
-        }
+        self.create_with(draft, size_gb, settings, &CreateOptions::default(), notify)
+            .map(|c| c.header)
+    }
+
+    /// [`Store::create`] plus wizard options. Firefox vaults and imports
+    /// mount the new image once to write `user.js` / copy the profile.
+    pub fn create_with(
+        &self,
+        draft: Draft,
+        size_gb: u32,
+        settings: VaultSettings,
+        opts: &CreateOptions,
+        notify: Notify<'_>,
+    ) -> Result<Created> {
         notify(Event::CreateProgress {
             stage: CreateStage::Keys,
             pct: 10,
@@ -206,13 +243,72 @@ impl Store {
                 stage: CreateStage::Profile,
                 pct: 80,
             });
-            Ok(())
+            if nv.header.browser == Browser::Firefox || opts.import.is_some() {
+                self.init_profile(&nv.header, &nv.key, opts, notify)
+            } else {
+                Ok(None)
+            }
         })();
-        if let Err(e) = result {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(e);
-        }
-        Ok(nv.header)
+        let import_result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = hdiutil::detach_with_retries(&self.mountpoint(&id));
+                let _ = fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        };
+        let mut header = nv.header;
+        let import_error = match import_result {
+            None => None,
+            Some(Ok(original)) => {
+                header.original = Some(original);
+                header.seal_mac(nv.key.vmk())?;
+                self.save_header(&header)?;
+                None
+            }
+            Some(Err(e)) => Some(e),
+        };
+        notify(Event::CreateProgress {
+            stage: CreateStage::Done,
+            pct: 100,
+        });
+        Ok(Created {
+            header,
+            import_error,
+        })
+    }
+
+    /// Mount the new image, import (if asked) and write Firefox's user.js,
+    /// then detach. Returns the import outcome.
+    fn init_profile(
+        &self,
+        header: &Header,
+        key: &UnlockedKey,
+        opts: &CreateOptions,
+        notify: Notify<'_>,
+    ) -> Result<Option<Result<crate::header::Original>>> {
+        let id = &header.vault_id;
+        let mnt = self.mountpoint(id);
+        mkdir_700(&self.root.join("mnt"))?;
+        mkdir_700(&mnt)?;
+        hdiutil::attach(&self.image_path(id), &mnt, &key.disk_key_hex())?;
+        let _ = hdiutil::disable_spotlight(&mnt);
+        let r = (|| -> Result<_> {
+            mkdir_700(&browser::profile_dir(&mnt))?;
+            mkdir_700(&browser::cache_dir(&mnt))?;
+            let imported = opts.import.as_ref().map(|req| {
+                profiles::import_profile(&req.roots, header.browser, &req.profile_id, &mnt, notify)
+            });
+            // After the import, so our managed block wins over an imported user.js.
+            if header.browser == Browser::Firefox {
+                browser::write_firefox_user_js(&mnt, Some(opts.disable_fxa))?;
+            }
+            Ok(imported)
+        })();
+        let detached = hdiutil::detach_with_retries(&mnt);
+        let imported = r?;
+        detached?;
+        Ok(imported)
     }
 
     pub fn is_unlocked(&self, id: &str) -> bool {
@@ -222,6 +318,14 @@ impl Store {
     /// Derive the VMK and attach the image at `mnt/<id>`.
     pub fn unlock(&self, id: &str, cred: Credential<'_>, dev: &Devices<'_>) -> Result<Unlocked> {
         let mut header = self.load(id)?;
+        let password: Option<&str> = match &cred {
+            Credential::Totp { password, .. } | Credential::Fido2 { password, .. } => {
+                Some(password)
+            }
+            Credential::Recovery(_) => None,
+            #[cfg(any(test, feature = "test-password-slot"))]
+            Credential::Password(p) => Some(p),
+        };
         let key = match cred {
             Credential::Totp { password, code } => {
                 let r = crate::totp::unlock(&mut header, password, code, dev.se, now_unix());
@@ -246,12 +350,32 @@ impl Store {
         }
         mkdir_700(&browser::profile_dir(&mnt))?;
         mkdir_700(&browser::cache_dir(&mnt))?;
+        if header.browser == Browser::Firefox {
+            browser::write_firefox_user_js(&mnt, None)?;
+        }
+        // Only vaults with an original still on disk pay the extra Argon2id.
+        let cleanup_verifier = match (&header.original, password) {
+            (Some(o), Some(pw)) if o.state != crate::header::OriginalState::Deleted => {
+                Some(PasswordVerifier::new(&header.kdf, key.vmk(), pw)?)
+            }
+            _ => None,
+        };
         Ok(Unlocked {
             header_intact: key.header_intact,
             header,
             mountpoint: mnt,
             key,
+            cleanup_verifier,
         })
+    }
+
+    /// Lock an unlocked session and, if this was the first close after an
+    /// import, mark the copy as reviewed (SPEC §5.1 step 3). Keys are wiped
+    /// when `session` drops at the end.
+    pub fn close(&self, mut session: Unlocked) -> Result<()> {
+        self.lock(&session.header.vault_id)?;
+        profiles::mark_reviewed(self, &mut session)?;
+        Ok(())
     }
 
     /// Launch the vault's browser against the mounted volume and record its PID.
@@ -376,35 +500,23 @@ mod tests {
         assert!(!s.mountpoint(&h.vault_id).exists());
     }
 
-    #[test]
-    fn create_rejects_firefox_until_m5() {
-        let d = tempfile::tempdir().unwrap();
-        let s = Store::new(d.path());
-        let mut d = Draft::new("F", Browser::Firefox, KdfCost::FAST).unwrap();
-        d.set_password(PW).unwrap();
-        d.add_password_only_slot().unwrap();
-        d.generate_recovery().unwrap();
-        assert!(matches!(
-            s.create(d, 1, VaultSettings::default(), &crate::events::ignore),
-            Err(Error::Unsupported(_))
-        ));
-    }
-
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn failed_create_leaves_no_vault_behind() {
         // Off macOS there is no hdiutil, so create must fail and clean up.
-        let d = tempfile::tempdir().unwrap();
-        let s = Store::new(d.path());
-        let mut d = Draft::new("W", Browser::Brave, KdfCost::FAST).unwrap();
-        d.set_password(PW).unwrap();
-        d.add_password_only_slot().unwrap();
-        d.generate_recovery().unwrap();
-        assert!(s
-            .create(d, 1, VaultSettings::default(), &crate::events::ignore)
-            .is_err());
-        assert!(s.list().unwrap().is_empty());
-        assert_eq!(fs::read_dir(s.vaults_dir()).unwrap().count(), 0);
+        // Firefox is no longer rejected up front (M5).
+        for b in [Browser::Brave, Browser::Firefox] {
+            let d = tempfile::tempdir().unwrap();
+            let s = Store::new(d.path());
+            let mut d = Draft::new("W", b, KdfCost::FAST).unwrap();
+            d.set_password(PW).unwrap();
+            d.add_password_only_slot().unwrap();
+            d.generate_recovery().unwrap();
+            let r = s.create(d, 1, VaultSettings::default(), &crate::events::ignore);
+            assert!(matches!(r, Err(Error::Command { .. })));
+            assert!(s.list().unwrap().is_empty());
+            assert_eq!(fs::read_dir(s.vaults_dir()).unwrap().count(), 0);
+        }
     }
 
     #[test]
