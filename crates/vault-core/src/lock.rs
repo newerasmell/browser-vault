@@ -276,15 +276,16 @@ fn pid_file(store: &Store, id: &str) -> PathBuf {
 /// PID and a path — no secrets.
 pub fn spawn_crash_guard(app_pid: u32, browser_pid: u32, mnt: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
+    let real_mnt = std::fs::canonicalize(mnt).unwrap_or_else(|_| mnt.to_path_buf());
     const SCRIPT: &str = r#"
-APP="$1"; BR="$2"; MNT="$3"
+APP="$1"; BR="$2"; MNT="$3"; ORIG="$4"
 mounted() { /sbin/mount | /usr/bin/grep -qF " on $MNT ("; }
 while kill -0 "$APP" 2>/dev/null; do
   mounted || exit 0
   sleep 1
 done
 mounted || exit 0
-if /bin/ps -p "$BR" -o command= 2>/dev/null | /usr/bin/grep -qF "$MNT"; then
+if /bin/ps -p "$BR" -o command= 2>/dev/null | /usr/bin/grep -qF -e "$MNT" -e "$ORIG"; then
   kill -TERM "$BR" 2>/dev/null
   i=0; while kill -0 "$BR" 2>/dev/null && [ $i -lt 8 ]; do sleep 1; i=$((i+1)); done
   kill -KILL "$BR" 2>/dev/null
@@ -301,6 +302,9 @@ done
         .arg("bv-crash-guard")
         .arg(app_pid.to_string())
         .arg(browser_pid.to_string())
+        // `mount` lists the resolved path (/var → /private/var); the
+        // browser's command line has the path as we passed it.
+        .arg(&real_mnt)
         .arg(mnt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
