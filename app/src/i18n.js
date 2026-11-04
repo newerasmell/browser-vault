@@ -1,6 +1,10 @@
 // UI strings. Keys are shared; add a language by adding a dictionary.
 const dict = {
   en: {
+    import_quit_title: 'Quit {browser} to copy your profile',
+    import_quit_body: 'The profile is copied while {browser} is closed, so the copy is complete and consistent. Quit {browser} (⌘Q); creation continues automatically.',
+    import_waiting: 'Waiting for the browser to close…',
+    import_skip: 'Create without import',
     act_auth_title: 'Confirm it\'s you',
     act_auth_body: 'Enter the vault password and the current authenticator code. The vault stays closed.',
     act_auth_body_fido: 'Enter the vault password and your YubiKey PIN, then touch the key. The vault stays closed.',
@@ -184,6 +188,10 @@ const dict = {
     recheck: 'Check again'
   },
   bg: {
+    import_quit_title: 'Затвори {browser}, за да се копира профилът',
+    import_quit_body: 'Профилът се копира, докато {browser} е затворен, за да е копието пълно и цяло. Затвори {browser} (⌘Q) и създаването продължава само.',
+    import_waiting: 'Изчаквам браузърът да се затвори…',
+    import_skip: 'Създай без импорт',
     act_auth_title: 'Потвърди, че си ти',
     act_auth_body: 'Въведи паролата на сейфа и текущия код от аутентикатора. Сейфът остава затворен.',
     act_auth_body_fido: 'Въведи паролата на сейфа и PIN-а на YubiKey, после докосни ключа. Сейфът остава затворен.',

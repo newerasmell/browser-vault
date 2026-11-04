@@ -495,6 +495,29 @@ async function viewWizard() {
           h('button', { class: 'btn ghost', onclick: () => api('close_window') }, t('close')),
           h('button', { class: 'btn primary', onclick: () => api('open_window', { view: 'unlock', params: { id: w.vaultId } }) }, t('open_now'))));
     }
+    // SPEC §5.1 step 2: copying a profile the browser is writing to would
+    // give a broken copy. Ask the user to quit the regular browser and wait.
+    if (w.importProfile && !w.started && !w.browserClosedChecked) {
+      const box = h('div', { class: 'creating' },
+        h('div', { class: 'lock-art' }, icon('alert', 'lg')),
+        h('h2', {}, t('import_quit_title', { browser: BROWSERS[w.browser] })),
+        h('p', { class: 'muted' }, t('import_quit_body', { browser: BROWSERS[w.browser] })),
+        h('p', { class: 'muted' }, h('span', { class: 'spinner', style: 'display:inline-block;vertical-align:-2px' }), ' ', t('import_waiting')),
+        h('div', { class: 'wiz-nav center' },
+          h('button', { class: 'btn ghost', type: 'button', onclick: () => { stop(); go(4); } }, t('back')),
+          h('button', { class: 'btn ghost', type: 'button', onclick: () => { stop(); w.importProfile = false; render(); } }, t('import_skip'))));
+      let iv = null;
+      const stop = () => { if (iv) clearInterval(iv); iv = null; };
+      const check = async () => {
+        let running = true;
+        try { running = (await api('browser_running', { browser: w.browser })).running; } catch {}
+        if (!running) { stop(); w.browserClosedChecked = true; render(); }
+      };
+      iv = setInterval(check, 1500);
+      cleanup.push(stop);
+      check();
+      return box;
+    }
     const bar = h('div', { class: 'progress' }, h('i'));
     const stage = h('p', { class: 'muted' }, t('stage_disk'));
     const off = on('create_progress', ({ stage: s, pct }) => {
