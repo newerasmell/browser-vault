@@ -33,6 +33,10 @@ pub enum Event {
     CleanupProgress {
         pct: u8,
     },
+    /// Backup to / import from a drive, by bytes copied (see `backup`).
+    BackupProgress {
+        pct: u8,
+    },
 }
 
 /// Callback for [`Event`]s. Must be cheap and must not block.

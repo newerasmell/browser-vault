@@ -144,7 +144,12 @@ fn vault_info(st: &AppState, h: &Header) -> VaultInfo {
         browser: h.browser.as_str(),
         mode: mode_of(h),
         status,
-        original: original_info(h),
+        // Added from a backup: the original is on the other Mac (backup.rs).
+        original: if vault_core::backup::restored_from_backup(&st.store, &id) {
+            None
+        } else {
+            original_info(h)
+        },
         id,
     }
 }
@@ -922,6 +927,120 @@ pub async fn restore_original_notice(app: AppHandle, id: String) -> CmdResult<Va
     blocking(move || original::set_kept(&app, &id, false)).await
 }
 
+// ---------------------------------------------------------------- backup to / add from a drive
+
+/// Specific codes for backup / import refusals (UI texts `err_backup_*`).
+fn backup_error(e: vault_core::Error) -> CmdError {
+    use vault_core::backup::*;
+    use vault_core::Error::{Format, Invalid, NotFound};
+    let code = match &e {
+        Invalid(m) => match *m {
+            ERR_UNLOCKED => "backup_unlocked",
+            ERR_OTHER_VAULT => "backup_other_vault",
+            ERR_DEST_IN_STORE => "backup_dest_in_store",
+            ERR_NOT_A_VAULT => "backup_not_a_vault",
+            ERR_INCOMPLETE => "backup_incomplete",
+            ERR_ALREADY_ADDED => "backup_already_added",
+            ERR_VERIFY => "backup_verify_failed",
+            _ => return e.into(),
+        },
+        Format(_) => "backup_not_a_vault",
+        NotFound => "not_found",
+        _ => "backup_io",
+    };
+    CmdError::new(code)
+}
+
+fn backup_notify(app: &AppHandle, id: Option<String>) -> impl Fn(Event) + Sync {
+    let app = app.clone();
+    move |e: Event| {
+        if let Event::BackupProgress { pct } = e {
+            let _ = app.emit("backup_progress", json!({ "id": id, "pct": pct }));
+        }
+    }
+}
+
+fn pick_folder(app: &AppHandle) -> Option<PathBuf> {
+    app.dialog()
+        .file()
+        .set_directory("/Volumes")
+        .blocking_pick_folder()
+        .and_then(|p| p.into_path().ok())
+}
+
+/// `backup_vault { id }`: folder picker, then copy the LOCKED vault there
+/// (incremental). Emits `backup_progress { id, pct }`.
+/// Returns `{ path, copiedFiles, unchangedFiles }` or `{ cancelled: true }`.
+#[tauri::command]
+pub async fn backup_vault(app: AppHandle, id: String) -> CmdResult<Value> {
+    blocking(move || {
+        let st = state::get(&app);
+        st.store.load(&id)?;
+        let busy = |st: &AppState| {
+            lock(&st.sessions).contains_key(&id)
+                || lock(&st.locking).contains(&id)
+                || st.store.is_unlocked(&id)
+        };
+        if busy(&st) {
+            return Err(CmdError::new("backup_unlocked"));
+        }
+        let Some(dest) = pick_folder(&app) else {
+            return Ok(json!({ "cancelled": true }));
+        };
+        // Unlocked while the picker was open.
+        if busy(&st) {
+            return Err(CmdError::new("backup_unlocked"));
+        }
+        crate::applog::log(&format!("backup {id}: begin"));
+        let notify = backup_notify(&app, Some(id.clone()));
+        match vault_core::backup::export(&st.store, &id, &dest, &notify) {
+            Ok(out) => {
+                crate::applog::log(&format!(
+                    "backup {id}: done ({} copied, {} unchanged, {} removed)",
+                    out.stats.copied_files, out.stats.unchanged_files, out.stats.removed
+                ));
+                Ok(json!({
+                    "path": out.path.to_string_lossy(),
+                    "copiedFiles": out.stats.copied_files,
+                    "unchangedFiles": out.stats.unchanged_files,
+                }))
+            }
+            Err(e) => {
+                crate::applog::log(&format!("backup {id}: error {e}"));
+                Err(backup_error(e))
+            }
+        }
+    })
+    .await
+}
+
+/// `add_vault_from_drive {}`: folder picker (the `.bvault` folder or the
+/// folder that holds it), then copy the vault into the local store.
+/// Returns `{ id, name, mode }` or `{ cancelled: true }`.
+#[tauri::command]
+pub async fn add_vault_from_drive(app: AppHandle) -> CmdResult<Value> {
+    blocking(move || {
+        let st = state::get(&app);
+        let Some(src) = pick_folder(&app) else {
+            return Ok(json!({ "cancelled": true }));
+        };
+        crate::applog::log("add from drive: begin");
+        let notify = backup_notify(&app, None);
+        match vault_core::backup::import(&st.store, &src, &notify) {
+            Ok(h) => {
+                crate::applog::log(&format!("add from drive {}: done", h.vault_id));
+                lockctl::vaults_changed(&app);
+                Ok(json!({ "id": h.vault_id, "name": h.name, "mode": mode_of(&h) }))
+            }
+            Err(e) => {
+                crate::applog::log(&format!("add from drive: error {e}"));
+                Err(backup_error(e))
+            }
+        }
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,6 +1088,29 @@ mod tests {
             vault_settings(&FinishOptions::default()),
             VaultSettings::default()
         );
+    }
+
+    #[test]
+    fn backup_error_codes() {
+        use vault_core::backup::{ERR_ALREADY_ADDED, ERR_UNLOCKED};
+        use vault_core::Error;
+        assert_eq!(
+            backup_error(Error::Invalid(ERR_UNLOCKED)).code,
+            "backup_unlocked"
+        );
+        assert_eq!(
+            backup_error(Error::Invalid(ERR_ALREADY_ADDED)).code,
+            "backup_already_added"
+        );
+        assert_eq!(
+            backup_error(Error::Format("x".into())).code,
+            "backup_not_a_vault"
+        );
+        assert_eq!(
+            backup_error(Error::Io(std::io::Error::other("x"))).code,
+            "backup_io"
+        );
+        assert_eq!(backup_error(Error::Invalid("other")).code, "invalid");
     }
 
     #[test]

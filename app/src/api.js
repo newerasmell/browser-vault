@@ -160,6 +160,22 @@ const mock = {
   keep_original: async ({ id }) => { vaults.find((x) => x.id === id).original.state = 'kept'; emit('vaults_changed'); },
   restore_original_notice: async ({ id }) => { vaults.find((x) => x.id === id).original.state = 'pending'; emit('vaults_changed'); },
   pick_browser_path: async () => null,
+  // Backup / add from drive (the native folder picker is skipped in the mock).
+  backup_vault: async ({ id }) => {
+    const v = vaults.find((x) => x.id === id);
+    if (v.status !== 'locked') throw err('backup_unlocked');
+    await wait(500);
+    for (const pct of [8, 30, 61, 87, 99, 100]) { emit('backup_progress', { id, pct }); await wait(300); }
+    return { path: `/Volumes/BACKUP/${v.name} (${id}).bvault`, copiedFiles: 42, unchangedFiles: 0 };
+  },
+  add_vault_from_drive: async () => {
+    if (vaults.some((x) => x.id === 'v9')) throw err('backup_already_added');
+    await wait(500);
+    for (const pct of [12, 47, 80, 99, 100]) { emit('backup_progress', { id: null, pct }); await wait(300); }
+    vaults.push({ id: 'v9', name: 'Travel – Firefox', browser: 'firefox', mode: 'totp', status: 'locked', sizeGb: 20, original: null });
+    emit('vaults_changed');
+    return { id: 'v9', name: 'Travel – Firefox', mode: 'totp' };
+  },
   app_info: async () => ({ version: '0.1.0-dev' })
 };
 

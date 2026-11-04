@@ -671,6 +671,10 @@ pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<Clea
     }
 }
 
+/// The vault was added from a backup: its imported original lives on
+/// another Mac; nothing on this Mac may be deleted for it.
+pub const ERR_ORIGINAL_ELSEWHERE: &str = "the original profile is on another Mac";
+
 /// `cleanup_preview` (UI.md).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupPreview {
@@ -686,6 +690,10 @@ pub struct CleanupPreview {
 
 pub fn cleanup_preview(store: &Store, roots: &Roots, id: &str) -> Result<CleanupPreview> {
     let h = store.load(id)?;
+    // Added from a backup: `original` names a profile on the other Mac.
+    if crate::backup::restored_from_backup(store, id) {
+        return Err(Error::Invalid(ERR_ORIGINAL_ELSEWHERE));
+    }
     let o = h
         .original
         .ok_or(Error::Invalid("this vault has no imported profile"))?;
@@ -717,6 +725,9 @@ pub fn cleanup_original(
     notify: Notify<'_>,
 ) -> Result<()> {
     let mut h = load_verified(store, session)?;
+    if crate::backup::restored_from_backup(store, &h.vault_id) {
+        return Err(Error::Invalid(ERR_ORIGINAL_ELSEWHERE));
+    }
     let o = h
         .original
         .clone()
