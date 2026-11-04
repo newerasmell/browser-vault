@@ -611,11 +611,47 @@ mod hid {
         c
     }
 
-    /// hidapi's constructor panics if HID is unavailable; never let that
-    /// take down the app.
-    fn guard<T>(f: impl FnOnce() -> R<T>) -> R<T> {
-        catch_unwind(AssertUnwindSafe(f))
-            .unwrap_or_else(|_| Err(FidoError::Other("HID backend panicked".into())))
+    type Job = Box<dyn FnOnce() + Send + 'static>;
+
+    /// The one thread that ever talks to hidapi. On macOS hidapi schedules
+    /// its IOHIDManager on the run loop of the thread that first used it;
+    /// calling it later from another (short-lived tokio) thread hit a dead
+    /// run loop and crashed the app (EXC_BREAKPOINT in CFRunLoopAddSource
+    /// during YubiKey registration). All HID work is therefore serialised
+    /// onto this long-lived thread.
+    fn hid_thread() -> Option<std::sync::mpsc::Sender<Job>> {
+        use std::sync::{mpsc, Mutex, OnceLock};
+        static TX: OnceLock<Option<Mutex<mpsc::Sender<Job>>>> = OnceLock::new();
+        TX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name("bv-fido-hid".into())
+                .spawn(move || {
+                    for job in rx {
+                        job();
+                    }
+                })
+                .ok()
+                .map(|_| Mutex::new(tx))
+        })
+        .as_ref()
+        .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    /// Run `f` on the HID thread and wait for it. hidapi's constructor
+    /// panics if HID is unavailable; a panic becomes an error, never a crash.
+    fn guard<T: Send + 'static>(f: impl FnOnce() -> R<T> + Send + 'static) -> R<T> {
+        let tx = hid_thread().ok_or_else(|| FidoError::Other("HID thread unavailable".into()))?;
+        let (rtx, rrx) = std::sync::mpsc::sync_channel::<R<T>>(1);
+        let job: Job = Box::new(move || {
+            let r = catch_unwind(AssertUnwindSafe(f))
+                .unwrap_or_else(|_| Err(FidoError::Other("HID backend panicked".into())));
+            let _ = rtx.send(r);
+        });
+        tx.send(job)
+            .map_err(|_| FidoError::Other("HID thread stopped".into()))?;
+        rrx.recv()
+            .unwrap_or_else(|_| Err(FidoError::Other("HID thread stopped".into())))
     }
 
     fn devices() -> Vec<HidParam> {
@@ -731,14 +767,19 @@ mod hid {
         }
 
         fn make_credential(&self, rp_id: &str, pin: &str, exclude: &[Vec<u8>]) -> R<Vec<u8>> {
-            guard(|| {
+            let (rp_id, pin, exclude) = (
+                rp_id.to_owned(),
+                Zeroizing::new(pin.to_owned()),
+                exclude.to_vec(),
+            );
+            guard(move || {
                 let dev = open_single()?;
                 let challenge = crypto::random_bytes::<32>();
                 let ext = [Mext::HmacSecret(Some(true))];
-                let mut b = MakeCredentialArgsBuilder::new(rp_id, &challenge)
-                    .pin(pin)
+                let mut b = MakeCredentialArgsBuilder::new(&rp_id, &challenge)
+                    .pin(&pin)
                     .extensions(&ext);
-                for id in exclude {
+                for id in &exclude {
                     b = b.exclude_authenticator(id);
                 }
                 let att = dev
@@ -760,13 +801,14 @@ mod hid {
         }
 
         fn find_credential(&self, rp_id: &str, allow: &[Vec<u8>]) -> R<Option<Vec<u8>>> {
-            guard(|| {
+            let (rp_id, allow) = (rp_id.to_owned(), allow.to_vec());
+            guard(move || {
                 if allow.is_empty() {
                     return Ok(None);
                 }
                 for param in devices() {
                     let Ok(dev) = open(&param) else { continue };
-                    if let Ok(Some(id)) = probe(&dev, rp_id, allow) {
+                    if let Ok(Some(id)) = probe(&dev, &rp_id, &allow) {
                         return Ok(Some(id));
                     }
                 }
@@ -781,12 +823,18 @@ mod hid {
             salt: &[u8; SALT_LEN],
             pin: &str,
         ) -> R<Zeroizing<[u8; 32]>> {
-            guard(|| {
-                let allow = [credential_id.to_vec()];
+            let (rp_id, credential_id, salt, pin) = (
+                rp_id.to_owned(),
+                credential_id.to_vec(),
+                Zeroizing::new(*salt),
+                Zeroizing::new(pin.to_owned()),
+            );
+            guard(move || {
+                let allow = [credential_id.clone()];
                 let mut holder = None;
                 for param in devices() {
                     let Ok(dev) = open(&param) else { continue };
-                    if let Ok(Some(_)) = probe(&dev, rp_id, &allow) {
+                    if let Ok(Some(_)) = probe(&dev, &rp_id, &allow) {
                         holder = Some(dev);
                         break;
                     }
@@ -794,9 +842,9 @@ mod hid {
                 let dev = holder.ok_or(FidoError::NoCredential)?;
                 let challenge = crypto::random_bytes::<32>();
                 let ext = [Gext::HmacSecret(Some(*salt))];
-                let args = GetAssertionArgsBuilder::new(rp_id, &challenge)
-                    .pin(pin)
-                    .credential_id(credential_id)
+                let args = GetAssertionArgsBuilder::new(&rp_id, &challenge)
+                    .pin(&pin)
+                    .credential_id(&credential_id)
                     .extensions(&ext)
                     .build();
                 let mut asss = dev
