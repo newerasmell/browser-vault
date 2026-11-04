@@ -130,7 +130,10 @@ fn vault_info(st: &AppState, h: &Header) -> VaultInfo {
     let id = h.vault_id.clone();
     let status = if lock(&st.errors).contains(&id) {
         "error"
-    } else if lock(&st.sessions).contains_key(&id) || st.store.is_unlocked(&id) {
+    } else if lock(&st.sessions).contains_key(&id) || lock(&st.locking).contains(&id) {
+        // Open, or being locked right now: don't touch a volume mid-detach.
+        "unlocked"
+    } else if st.store.is_unlocked(&id) {
         "unlocked"
     } else {
         "locked"
@@ -147,7 +150,7 @@ fn vault_info(st: &AppState, h: &Header) -> VaultInfo {
 }
 
 #[tauri::command]
-pub fn list_vaults(app: AppHandle) -> CmdResult<Vec<VaultInfo>> {
+pub async fn list_vaults(app: AppHandle) -> CmdResult<Vec<VaultInfo>> {
     let st = state::get(&app);
     Ok(st
         .store
@@ -179,7 +182,7 @@ fn browser_binary(st: &AppState, b: Browser) -> Option<PathBuf> {
 }
 
 #[tauri::command]
-pub fn detect_browsers(app: AppHandle) -> Value {
+pub async fn detect_browsers(app: AppHandle) -> Value {
     let st = state::get(&app);
     let one = |b: Browser| {
         let path = browser_binary(&st, b).and_then(|bin| app_bundle_of(&bin));
@@ -218,13 +221,13 @@ pub async fn pick_browser_path(app: AppHandle, browser: String) -> CmdResult<Opt
 }
 
 #[tauri::command]
-pub fn browser_running(browser: String) -> CmdResult<Value> {
+pub async fn browser_running(browser: String) -> CmdResult<Value> {
     let b = parse_browser(&browser)?;
     Ok(json!({ "running": vault_core::profiles::regular_browser_running(b) }))
 }
 
 #[tauri::command]
-pub fn detect_profiles(browser: String) -> CmdResult<Value> {
+pub async fn detect_profiles(browser: String) -> CmdResult<Value> {
     let b = parse_browser(&browser)?;
     match vault_core::profiles::detect_profiles(b) {
         Ok(list) => Ok(Value::Array(
@@ -739,7 +742,7 @@ pub fn factors(h: &Header) -> Vec<Value> {
 }
 
 #[tauri::command]
-pub fn list_factors(app: AppHandle, id: String) -> CmdResult<Vec<Value>> {
+pub async fn list_factors(app: AppHandle, id: String) -> CmdResult<Vec<Value>> {
     Ok(factors(&state::get(&app).store.load(&id)?))
 }
 

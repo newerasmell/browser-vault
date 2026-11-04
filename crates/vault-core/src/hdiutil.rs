@@ -1,7 +1,7 @@
 //! Native macOS encrypted disk images (SPEC §3). The Disk Key is only ever
 //! written to the child's stdin — never argv, env, Keychain or temp files.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -13,14 +13,35 @@ use crate::error::{Error, Result};
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const MDUTIL: &str = "/usr/bin/mdutil";
 
+/// How long each tool may run before it is killed. A wedged `hdiutil`
+/// must never hang a lock (SPEC §6) or the app forever.
+fn timeout_for(tool: &str) -> Duration {
+    match tool {
+        "hdiutil create" => Duration::from_secs(600),
+        "hdiutil attach" => Duration::from_secs(120),
+        "hdiutil detach" => Duration::from_secs(60),
+        _ => Duration::from_secs(30),
+    }
+}
+
 fn run(tool: &'static str, cmd: &mut Command, stdin_secret: Option<&str>) -> Result<()> {
+    run_with_timeout(tool, cmd, stdin_secret, timeout_for(tool))
+}
+
+fn run_with_timeout(
+    tool: &'static str,
+    cmd: &mut Command,
+    stdin_secret: Option<&str>,
+    timeout: Duration,
+) -> Result<()> {
     cmd.stdin(if stdin_secret.is_some() {
         Stdio::piped()
     } else {
         Stdio::null()
     })
-    .stdout(Stdio::piped())
+    .stdout(Stdio::null())
     .stderr(Stdio::piped());
+    crate::trace::emit(&format!("{tool}: start"));
     let mut child = cmd.spawn().map_err(|e| Error::Command {
         tool,
         detail: e.to_string(),
@@ -34,14 +55,45 @@ fn run(tool: &'static str, cmd: &mut Command, stdin_secret: Option<&str>) -> Res
         stdin.write_all(secret.as_bytes())?;
         drop(stdin);
     }
-    let out = child.wait_with_output()?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(Error::Command {
-            tool,
-            detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        })
+    // Drain stderr on a thread so a chatty tool can't block on a full pipe.
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break Some(st);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        sleep(Duration::from_millis(50));
+    };
+    let err = reader.join().unwrap_or_default();
+    match status {
+        Some(st) if st.success() => {
+            crate::trace::emit(&format!("{tool}: ok"));
+            Ok(())
+        }
+        Some(_) => {
+            let detail = String::from_utf8_lossy(&err).trim().to_string();
+            crate::trace::emit(&format!("{tool}: failed: {detail}"));
+            Err(Error::Command { tool, detail })
+        }
+        None => {
+            crate::trace::emit(&format!("{tool}: timed out after {timeout:?}"));
+            Err(Error::Command {
+                tool,
+                detail: format!("timed out after {} s", timeout.as_secs()),
+            })
+        }
     }
 }
 
@@ -165,6 +217,16 @@ mod tests {
         cmd.args(["-c", "cat > \"$0\""]).arg(&out);
         run("test", &mut cmd, Some("deadbeef")).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"deadbeef");
+    }
+
+    #[test]
+    fn hung_tool_is_killed_after_timeout() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let t = std::time::Instant::now();
+        let e = run_with_timeout("test", &mut cmd, None, Duration::from_millis(300)).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(e.to_string().contains("timed out"));
     }
 
     #[test]

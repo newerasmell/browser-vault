@@ -7,6 +7,7 @@ use std::thread;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
+use crate::applog;
 use crate::error::{CmdError, CmdResult};
 use crate::state::{self, lock, AppState, Session};
 use crate::texts::{tr, T};
@@ -25,6 +26,9 @@ pub enum Reason {
 }
 
 pub fn notify(app: &AppHandle, body: &str) {
+    if state::get(app).is_quitting() {
+        return;
+    }
     let _ = app
         .notification()
         .builder()
@@ -34,6 +38,9 @@ pub fn notify(app: &AppHandle, body: &str) {
 }
 
 pub fn vaults_changed(app: &AppHandle) {
+    if state::get(app).is_quitting() {
+        return; // see AppState::quitting
+    }
     let _ = app.emit("vaults_changed", ());
     tray::refresh(app);
 }
@@ -42,8 +49,10 @@ pub fn vaults_changed(app: &AppHandle) {
 pub fn lock_one(app: &AppHandle, id: &str, reason: Reason) -> CmdResult<()> {
     let st = state::get(app);
     if !lock(&st.locking).insert(id.to_string()) {
+        applog::log(&format!("lock {id} ({reason:?}): already in progress"));
         return Ok(()); // another trigger is already locking it
     }
+    applog::log(&format!("lock {id} ({reason:?}): begin"));
     let session = lock(&st.sessions).remove(id);
     let was_open = session.is_some() || st.store.is_unlocked(id);
     // With a session: Store::close (also flips SPEC §5.1 `reviewed`).
@@ -53,6 +62,10 @@ pub fn lock_one(app: &AppHandle, id: &str, reason: Reason) -> CmdResult<()> {
         None => vault_core::lock::lock_vault(&st.store, id),
     };
     lock(&st.locking).remove(id);
+    match &result {
+        Ok(()) => applog::log(&format!("lock {id}: done")),
+        Err(e) => applog::log(&format!("lock {id}: error {e}")),
+    }
 
     let bg = st.is_bg();
     match &result {
@@ -68,6 +81,7 @@ pub fn lock_one(app: &AppHandle, id: &str, reason: Reason) -> CmdResult<()> {
         }
     }
     vaults_changed(app);
+    applog::log(&format!("lock {id}: ui refreshed"));
     result.map_err(CmdError::from)
 }
 

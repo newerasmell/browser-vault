@@ -1,5 +1,6 @@
 //! Browser Vault — macOS menu bar app (Tauri 2). UI contract: docs/UI.md.
 
+mod applog;
 mod commands;
 mod error;
 mod hotkey;
@@ -23,6 +24,7 @@ use crate::lockctl::Reason;
 use crate::state::AppState;
 
 fn main() {
+    applog::install();
     let store = Store::default_location().expect("HOME must be set");
     let app_state = Arc::new(AppState::new(store));
 
@@ -32,6 +34,7 @@ fn main() {
                 .with_handler(|app, _shortcut, event| {
                     // The panic hotkey is the only registered shortcut.
                     if event.state() == ShortcutState::Pressed {
+                        applog::log("hotkey pressed: lock all");
                         lockctl::spawn_lock_all(app, Reason::Hotkey);
                     }
                 })
@@ -119,7 +122,12 @@ fn main() {
         } => api.prevent_exit(),
         // Logout / shutdown / quit: never leave a vault mounted.
         RunEvent::Exit => {
+            applog::log("exit: locking all vaults");
+            state::get(handle)
+                .quitting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = lockctl::lock_all(handle, Reason::Quit);
+            applog::log("exit: done");
         }
         _ => {}
     });

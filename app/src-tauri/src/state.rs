@@ -1,7 +1,7 @@
 //! Process-wide app state, managed by Tauri as `Arc<AppState>`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -36,6 +36,10 @@ pub struct AppState {
     pub se: Box<dyn SecureEnclave>,
     pub fido: Box<dyn Authenticator>,
     generation: AtomicU64,
+    /// Set while the process exits. The final lock then runs ON the main
+    /// thread, so it must not touch anything that needs the main thread
+    /// (tray icon, events) or it deadlocks (seen on ⌘Q via the app menu).
+    pub quitting: AtomicBool,
     /// Actions waiting for an unlock of that vault (see original.rs).
     pub pending: Mutex<HashMap<String, crate::original::Pending>>,
     /// When the tray popover was last hidden by losing focus (see tray.rs).
@@ -60,9 +64,14 @@ impl AppState {
             se: vault_core::se::system(),
             fido: vault_core::fido2::system(),
             generation: AtomicU64::new(1),
+            quitting: AtomicBool::new(false),
             pending: Mutex::default(),
             tray_blurred_at: Mutex::new(None),
         }
+    }
+
+    pub fn is_quitting(&self) -> bool {
+        self.quitting.load(Ordering::SeqCst)
     }
 
     pub fn next_generation(&self) -> u64 {

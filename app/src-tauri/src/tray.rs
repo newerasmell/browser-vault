@@ -89,6 +89,9 @@ pub fn current_state(app: &AppHandle) -> IconState {
 }
 
 pub fn refresh(app: &AppHandle) {
+    if state::get(app).is_quitting() {
+        return; // see AppState::quitting
+    }
     let Some(tray) = app.tray_by_id(ID) else {
         return;
     };

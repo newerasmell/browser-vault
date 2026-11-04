@@ -103,7 +103,9 @@ impl Settings {
             next.lock_on_key_removal = v;
         }
         if let Some(h) = p.panic_hotkey {
-            hotkey::parse(&h).ok_or("invalid hotkey")?;
+            if !hotkey::allowed(&h) {
+                return Err("invalid hotkey");
+            }
             next.panic_hotkey = h;
         }
         *self = next;

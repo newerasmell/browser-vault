@@ -525,7 +525,7 @@ async function viewSettings(params) {
     api('get_settings'), api('list_vaults'), api('detect_browsers'), api('app_info')]);
   let tab = params.get('tab') || 'general';
   const el = h('div', { class: 'pane settings' });
-  const save = async (patch) => { Object.assign(s, patch); await api('save_settings', patch); toast(t('saved')); };
+  const save = async (patch) => { await api('save_settings', patch); Object.assign(s, patch); toast(t('saved')); };
 
   const tabs = [['general', 'sliders'], ['vaults', 'shield'], ['browsers', 'globe'], ['about', 'alert']];
   const render = async () => {
@@ -550,8 +550,15 @@ async function viewSettings(params) {
         const combo = (e.ctrlKey ? '⌃' : '') + (e.altKey ? '⌥' : '') + (e.shiftKey ? '⇧' : '') + (e.metaKey ? '⌘' : '') + key;
         window.removeEventListener('keydown', handler, true);
         rec.disabled = false;
-        if (combo.length < 3) { hk.textContent = s.panicHotkey; return; } // require a modifier
-        hk.textContent = combo; save({ panicHotkey: combo });
+        // Global hotkeys swallow the keys in every app: require ≥2 modifiers and
+        // not ⌘⇧ alone (rules out ⌘Q, ⌘W, ⌘⇧T…). Rust enforces the same rule.
+        const mods = [e.ctrlKey, e.altKey, e.shiftKey, e.metaKey].filter(Boolean).length;
+        const cmdShiftOnly = mods === 2 && e.metaKey && e.shiftKey;
+        if (mods < 2 || cmdShiftOnly || !key || key.length > 3) {
+          hk.textContent = s.panicHotkey; toast(t('hotkey_invalid')); return;
+        }
+        hk.textContent = combo;
+        save({ panicHotkey: combo }).catch(() => { hk.textContent = s.panicHotkey; toast(t('hotkey_invalid')); });
       };
       window.addEventListener('keydown', handler, true);
       cleanup.push(() => window.removeEventListener('keydown', handler, true));

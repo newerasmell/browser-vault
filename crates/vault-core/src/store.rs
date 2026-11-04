@@ -406,11 +406,19 @@ impl Store {
     /// tries). Idempotent. Keys are wiped when the caller drops its `Unlocked`.
     pub fn lock(&self, id: &str) -> Result<()> {
         check_id(id)?;
+        crate::trace::emit(&format!("lock {id}: start"));
         if let Some(pid) = self.browser_pid(id) {
-            browser::terminate(pid, browser::TERMINATE_GRACE);
+            crate::trace::emit(&format!("lock {id}: terminate pid {pid}"));
+            let killed = browser::terminate(pid, browser::TERMINATE_GRACE);
+            crate::trace::emit(&format!("lock {id}: browser stopped (forced: {killed})"));
             let _ = fs::remove_file(self.pid_path(id));
         }
-        hdiutil::detach_with_retries(&self.mountpoint(id))
+        let r = hdiutil::detach_with_retries(&self.mountpoint(id));
+        crate::trace::emit(&format!(
+            "lock {id}: detach {}",
+            if r.is_ok() { "ok" } else { "FAILED" }
+        ));
+        r
     }
 
     pub fn lock_all(&self) -> Result<()> {
