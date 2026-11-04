@@ -166,21 +166,32 @@ pub fn begin(draft: &mut Draft, se: &dyn SecureEnclave) -> Result<TotpSetup> {
     if let Some(old) = draft.pending_totp.take() {
         let _ = se.delete_key(&old.key);
     }
-    let vault_id = draft.vault_id().to_string();
+    let (setup, pending) = prepare(draft.vault_id(), draft.name(), se)?;
+    draft.pending_totp = Some(pending);
+    Ok(setup)
+}
+
+/// New seed, SE key and SE_secret, wrapped and round-trip checked, plus the
+/// QR / manual key to show. Shared by the wizard and "replace authenticator".
+fn prepare(
+    vault_id: &str,
+    vault_name: &str,
+    se: &dyn SecureEnclave,
+) -> Result<(TotpSetup, PendingTotp)> {
     let seed = Zeroizing::new(crypto::random_bytes::<SEED_LEN>().to_vec());
     let se_secret = crypto::random_key();
-    let key = se.create_key(&se_key_tag(&vault_id))?;
+    let key = se.create_key(&se_key_tag(vault_id))?;
 
     let result = (|| {
-        let wrapped_seed = se_wrap(se, &key, &vault_id, "seed", &seed)?;
-        let wrapped_se_secret = se_wrap(se, &key, &vault_id, "se_secret", se_secret.as_ref())?;
+        let wrapped_seed = se_wrap(se, &key, vault_id, "seed", &seed)?;
+        let wrapped_se_secret = se_wrap(se, &key, vault_id, "se_secret", se_secret.as_ref())?;
         // Prove the SE can open what it wrapped before the user scans the QR:
         // a vault whose blobs cannot be unwrapped would be unopenable.
-        let s = se_unwrap(se, &key, &vault_id, "seed", SEED_LEN, &wrapped_seed);
+        let s = se_unwrap(se, &key, vault_id, "seed", SEED_LEN, &wrapped_seed);
         let k = se_unwrap(
             se,
             &key,
-            &vault_id,
+            vault_id,
             "se_secret",
             SE_SECRET_LEN,
             &wrapped_se_secret,
@@ -194,7 +205,7 @@ pub fn begin(draft: &mut Draft, se: &dyn SecureEnclave) -> Result<TotpSetup> {
                 })
             }
         }
-        let totp = generator(&seed, Some(&account_name(draft.name())))?;
+        let totp = generator(&seed, Some(&account_name(vault_name)))?;
         let uri = Zeroizing::new(
             totp.to_url()
                 .map_err(|_| Error::Invalid("TOTP parameters"))?,
@@ -216,18 +227,70 @@ pub fn begin(draft: &mut Draft, se: &dyn SecureEnclave) -> Result<TotpSetup> {
             return Err(e);
         }
     };
-    draft.pending_totp = Some(PendingTotp {
-        seed,
-        se_secret,
-        key,
-        wrapped_seed,
-        wrapped_se_secret,
-    });
-    Ok(TotpSetup {
-        secret,
-        uri,
-        qr_svg,
-    })
+    Ok((
+        TotpSetup {
+            secret,
+            uri,
+            qr_svg,
+        },
+        PendingTotp {
+            seed,
+            se_secret,
+            key,
+            wrapped_seed,
+            wrapped_se_secret,
+        },
+    ))
+}
+
+/// Settings → "replace authenticator" (e.g. new phone), step 1: fresh
+/// seed + SE key for an existing vault. Nothing is written yet.
+pub fn replace_begin(header: &Header, se: &dyn SecureEnclave) -> Result<(TotpSetup, PendingTotp)> {
+    if slot_data(header).is_none() {
+        return Err(Error::Invalid("vault has no authenticator slot"));
+    }
+    prepare(&header.vault_id, &header.name, se)
+}
+
+/// Step 2: the first code from the new app confirms it; the VMK is re-wrapped
+/// under PW ‖ new SE_secret and the old TOTP slot is replaced.
+///
+/// `password` must be the password that just produced `key` (the app
+/// re-authenticates with password + current code right before).
+pub fn replace_confirm(
+    header: &mut Header,
+    key: &UnlockedKey,
+    password: &str,
+    pending: &PendingTotp,
+    code: &str,
+    now: u64,
+) -> Result<()> {
+    if !header.verify_mac(key.vmk()) {
+        return Err(Error::Invalid("header was modified outside the app"));
+    }
+    let d = slot_data(header).ok_or(Error::Invalid("vault has no authenticator slot"))?;
+    let counter = matching_counter(&pending.seed, code, now, 0).ok_or(Error::UnlockFailed)?;
+    let pw = keyslot::password_key(header, password)?;
+    let kek = factor_kek(&pw, pending.se_secret.as_ref(), KIND);
+    let (nonce, wrapped_vmk) = keyslot::wrap_slot(&header.vault_id, KIND, &kek, key.vmk())?;
+    let state = State {
+        last_counter: counter,
+        failures: 0,
+        locked_until: 0,
+    };
+    header.slots[d.index] = Slot::Totp {
+        se_key_tag: pending.key.tag.clone(),
+        se_key_blob: pending.key.blob.clone().map(B64),
+        wrapped_se_secret: B64(pending.wrapped_se_secret.clone()),
+        wrapped_seed: B64(pending.wrapped_seed.clone()),
+        last_counter: state.last_counter,
+        failures: state.failures,
+        locked_until: state.locked_until,
+        state_mac: state_mac(&pending.seed, &header.vault_id, &state),
+        nonce,
+        wrapped_vmk,
+    };
+    header.seal_mac(key.vmk())
 }
 
 /// Counter state of a TOTP slot.
@@ -564,6 +627,43 @@ mod tests {
 
     fn state(h: &Header) -> State {
         slot_data(h).unwrap().state
+    }
+
+    #[test]
+    fn replace_authenticator_switches_seed() {
+        let mut v = vault();
+        let mut h = v.header.clone();
+        let key = unlock(&mut h, PW, &code_at(&v.seed, T0), &v.se, T0).unwrap();
+        v.header = h;
+        let (setup, pending) = replace_begin(&v.header, &v.se).unwrap();
+        let new_seed = Secret::try_from_base32(setup.secret.as_str())
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        // Wrong code: nothing changes.
+        let before = v.header.clone();
+        assert!(
+            replace_confirm(&mut v.header, &key, PW, &pending, "000000", T0 + 30).is_err()
+                || code_at(&new_seed, T0 + 30) == "000000"
+        );
+        assert_eq!(v.header, before);
+        replace_confirm(
+            &mut v.header,
+            &key,
+            PW,
+            &pending,
+            &code_at(&new_seed, T0 + 30),
+            T0 + 30,
+        )
+        .unwrap();
+        assert!(v.header.verify_mac(key.vmk()));
+        // Old app's code no longer works; new app's does.
+        let mut h = v.header.clone();
+        assert!(unlock(&mut h, PW, &code_at(&v.seed, T0 + 90), &v.se, T0 + 90).is_err());
+        let mut h = v.header.clone();
+        let k2 = unlock(&mut h, PW, &code_at(&new_seed, T0 + 90), &v.se, T0 + 90).unwrap();
+        assert_eq!(**k2.vmk(), *v.vmk);
+        assert!(unlock_with_recovery(&v.header, &v.phrase).is_ok());
     }
 
     #[test]

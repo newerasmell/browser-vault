@@ -437,11 +437,22 @@ pub fn change_password(header: &mut Header, key: &UnlockedKey, new_password: &st
 /// Replace the recovery slot with a new phrase; returns the new phrase.
 pub fn new_recovery(header: &mut Header, key: &UnlockedKey) -> Result<Zeroizing<String>> {
     let phrase = recovery::generate()?;
+    set_recovery(header, key, &phrase)?;
+    Ok(phrase)
+}
+
+/// Replace the recovery slot with one for `phrase` (generated earlier with
+/// [`recovery::generate`] and confirmed by the user) and re-seal the MAC.
+/// Refuses a header that doesn't verify under this VMK.
+pub fn set_recovery(header: &mut Header, key: &UnlockedKey, phrase: &str) -> Result<()> {
+    if !header.verify_mac(&key.vmk) {
+        return Err(Error::Invalid("header was modified outside the app"));
+    }
+    let phrase = recovery::normalize(phrase).map_err(|_| Error::Invalid("recovery phrase"))?;
     let slot = recovery_slot(&header.vault_id, &header.kdf, &phrase, &key.vmk)?;
     header.slots.retain(|s| !matches!(s, Slot::Recovery { .. }));
     header.slots.push(slot);
-    header.seal_mac(&key.vmk)?;
-    Ok(phrase)
+    header.seal_mac(&key.vmk)
 }
 
 #[cfg(test)]
@@ -726,6 +737,19 @@ mod tests {
             1
         );
         assert!(change_password(&mut v.header, &k2, "short").is_err());
+    }
+
+    #[test]
+    fn set_recovery_uses_given_phrase_and_checks_mac() {
+        let mut v = vault();
+        let k = unlock_with_password(&v.header, PW).unwrap();
+        let p = recovery::generate().unwrap();
+        set_recovery(&mut v.header, &k, &p).unwrap();
+        assert!(unlock_with_recovery(&v.header, &p).is_ok());
+        assert!(unlock_with_recovery(&v.header, &v.recovery_phrase).is_err());
+        let mut t = v.header.clone();
+        t.name = "evil".into();
+        assert!(set_recovery(&mut t, &k, &p).is_err());
     }
 
     #[test]

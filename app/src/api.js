@@ -116,6 +116,20 @@ const mock = {
       : [{ type: 'totp', label: 'Authenticator' }, { type: 'recovery', label: 'Recovery phrase' }];
   },
   request_vault_action: async () => ({ ok: true }),
+  action_auth: async ({ id, code, pin }) => {
+    const v = vaults.find((x) => x.id === id);
+    if (v.mode === 'totp' && code !== '123456') throw { code: 'unlock_failed' };
+    if (v.mode === 'fido2') { emit('fido_touch_needed'); await wait(900); emit('fido_touch_done'); }
+    return { token: 'demo', mode: v.mode, keys: v.mode === 'fido2' ? ['YubiKey main', 'YubiKey backup'] : [] };
+  },
+  action_change_password: async () => ({ done: true }),
+  action_fido_rewrap: async () => ({ done: true, remaining: [] }),
+  action_totp_begin: async () => ({ secret: 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP', qrSvg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#000"/></svg>' }),
+  action_totp_confirm: async ({ code }) => ({ ok: code === '123456' }),
+  action_add_fido2: async ({ label }) => { emit('fido_touch_needed'); await wait(900); emit('fido_touch_done'); return { label }; },
+  action_recovery_generate: async () => ({ words: 'abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual'.split(' ') }),
+  action_recovery_confirm: async ({ answers }) => ({ ok: Object.values(answers).every((w) => w.length > 2) }),
+  action_end: async () => {},
 
   detect_profiles: async ({ browser }) => browser === 'brave'
     ? [{ id: 'Default', name: 'Default', sizeMb: 842 }, { id: 'Profile 1', name: 'Work', sizeMb: 311 }]

@@ -596,10 +596,214 @@ async function viewSettings(params) {
         h('button', { class: 'btn sm ghost', onclick: async () => { await api('keep_original', { id: v.id }); route(); } }, t('keep_original'))));
   }
 
+  // Settings → vault actions, inline (no native dialogs): re-authenticate
+  // with the full credential, then the action. Secrets are cleared from the
+  // inputs right after each request; nothing is kept in JS state.
+  function actionFlow(v, action) {
+    let token = null;
+    const sheet = h('div', { class: 'sheet form' });
+    const overlay = h('div', { class: 'overlay sheet-overlay' }, sheet);
+    let touch;
+    const offA = on('fido_touch_needed', () => { touch = h('div', { class: 'overlay' }, touchPrompt()); el.append(touch); });
+    const offB = on('fido_touch_done', () => touch?.remove());
+    const close = async () => {
+      offA(); offB(); touch?.remove(); overlay.remove();
+      if (token) { try { await api('action_end', { token }); } catch {} }
+      render();
+    };
+    cleanup.push(() => { offA(); offB(); });
+    const errMsg = (e) => {
+      if (e?.code === 'expired') return t('act_expired');
+      if (e?.code === 'header_modified') return t('act_header_modified');
+      if (e?.code === 'rate_limited') return t('rate_limited', { s: e.retryAfter || 30 });
+      const k = 'err_' + (e && e.code);
+      return t(k) !== k ? t(k) : t('unlock_failed');
+    };
+    const head = (title, body) => [h('h2', {}, title), body && h('p', { class: 'muted' }, body)];
+    const navRow = (primary) => h('div', { class: 'wiz-nav' },
+      h('button', { class: 'btn ghost', type: 'button', onclick: close }, t('cancel')), primary);
+    const show = (...kids) => sheet.replaceChildren(h('p', { class: 'vault-chip' }, badge(v.browser), v.name), ...kids);
+    const done = (msg) => show(h('div', { class: 'callout ok' }, icon('check', 'sm'), h('p', {}, msg)),
+      h('div', { class: 'wiz-nav center' }, h('button', { class: 'btn primary', type: 'button', onclick: close }, t('close'))));
+
+    function authStep() {
+      const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
+      const pin = v.mode === 'fido2' ? h('input', { class: 'input', type: 'password', inputmode: 'numeric', autocomplete: 'off' }) : null;
+      const otp = v.mode === 'totp' ? otpInput(() => submit()) : null;
+      const err = h('p', { class: 'error', role: 'alert' });
+      const btn = h('button', { class: 'btn primary', type: 'submit' }, t('act_continue'));
+      async function submit() {
+        if (btn.disabled) return;
+        err.textContent = ''; btn.disabled = true;
+        try {
+          const r = await api('action_auth', { id: v.id, password: pw.value, pin: pin?.value, code: otp?.getValue() });
+          pw.value = ''; if (pin) pin.value = '';
+          token = r.token; next(r);
+        } catch (e) { touch?.remove(); err.textContent = errMsg(e); otp?.clear(); btn.disabled = false; }
+      }
+      show(...head(t('act_auth_title'), v.mode === 'fido2' ? t('act_auth_body_fido') : t('act_auth_body')),
+        h('form', { class: 'form', onsubmit: (e) => { e.preventDefault(); submit(); } },
+          h('label', { class: 'field' }, h('span', {}, t('password')), pw),
+          pin && h('label', { class: 'field' }, h('span', {}, t('yubikey_pin')), pin),
+          otp && h('div', { class: 'field' }, h('span', {}, t('auth_code')), otp),
+          err, navRow(btn)));
+      setTimeout(() => pw.focus(), 0);
+    }
+
+    function next(r) {
+      if (action === 'change_password') return passwordStep();
+      if (action === 'replace_totp') return totpStep();
+      if (action === 'new_recovery') return recoveryStep();
+      if (action === 'add_fido2') return addKeyStep(r.keys || []);
+    }
+
+    function passwordStep() {
+      const meter = h('div', { class: 'meter' }, h('i'), h('i'), h('i'), h('i'));
+      const label = h('small', { class: 'muted' }, ' ');
+      const mismatch = h('small', { class: 'error' });
+      const err = h('p', { class: 'error', role: 'alert' });
+      const btn = h('button', { class: 'btn primary', type: 'submit', disabled: true }, t('act_continue'));
+      const upd = () => {
+        const sc = strength(p1.value);
+        meter.dataset.s = p1.value ? sc : '';
+        label.textContent = p1.value ? t('pw_strength')[sc] : ' ';
+        mismatch.textContent = p2.value && p1.value !== p2.value ? t('pw_mismatch') : '';
+        btn.disabled = !(p1.value.length >= 12 && sc >= 2 && p1.value === p2.value);
+      };
+      const p1 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: upd });
+      const p2 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: upd });
+      show(...head(t('act_pw_title'), t('pw_hint')),
+        h('form', { class: 'form', onsubmit: async (e) => {
+          e.preventDefault(); btn.disabled = true; err.textContent = '';
+          try {
+            const r = await api('action_change_password', { token, newPassword: p1.value });
+            p1.value = p2.value = '';
+            if (r.done) done(t('act_pw_done')); else rewrapStep(r.remaining);
+          } catch (e2) { err.textContent = errMsg(e2); btn.disabled = false; }
+        } },
+          h('label', { class: 'field' }, h('span', {}, t('password')), p1, meter, label),
+          h('label', { class: 'field' }, h('span', {}, t('pw_confirm')), p2, mismatch),
+          h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', {}, t('pw_warning'))),
+          err, navRow(btn)));
+      setTimeout(() => p1.focus(), 0);
+    }
+
+    function rewrapStep(remaining) {
+      const pin = h('input', { class: 'input', type: 'password', inputmode: 'numeric', autocomplete: 'off' });
+      const err = h('p', { class: 'error', role: 'alert' });
+      const btn = h('button', { class: 'btn primary', type: 'submit' }, icon('key', 'sm'), t('act_rewrap_btn'));
+      show(...head(t('act_rewrap_title'), t('act_rewrap_body', { label: remaining[0] })),
+        h('div', { class: 'keys' }, remaining.map((k) => h('div', { class: 'key-item' }, icon('key', 'sm'), k))),
+        h('form', { class: 'form', onsubmit: async (e) => {
+          e.preventDefault(); btn.disabled = true; err.textContent = '';
+          try {
+            const r = await api('action_fido_rewrap', { token, pin: pin.value });
+            pin.value = '';
+            if (r.done) done(t('act_pw_done')); else rewrapStep(r.remaining);
+          } catch (e2) { touch?.remove(); err.textContent = errMsg(e2); btn.disabled = false; }
+        } },
+          h('label', { class: 'field' }, h('span', {}, t('yubikey_pin')), pin), err, navRow(btn)));
+      setTimeout(() => pin.focus(), 0);
+    }
+
+    async function totpStep() {
+      const qr = h('div', { class: 'qr' });
+      const secret = h('code', { class: 'secret' });
+      const err = h('p', { class: 'error', role: 'alert' });
+      let setup;
+      const otp = otpInput(async (code) => {
+        err.textContent = '';
+        try {
+          const r = await api('action_totp_confirm', { token, code });
+          if (r.ok) done(t('act_totp_done')); else { err.textContent = t('code_wrong'); otp.clear(); }
+        } catch (e) { err.textContent = errMsg(e); otp.clear(); }
+      });
+      show(...head(t('act_totp_title'), t('act_totp_body')),
+        h('div', { class: 'totp-grid' }, qr,
+          h('div', {},
+            h('strong', {}, t('scan_qr')),
+            h('small', { class: 'muted block' }, t('manual_key')),
+            h('div', { class: 'secret-row' }, secret,
+              h('button', { class: 'btn sm ghost', type: 'button', onclick: async () => {
+                try { await navigator.clipboard.writeText(setup.secret); toast(t('copied')); } catch {}
+              } }, icon('copy', 'sm'), t('copy'))))),
+        h('div', { class: 'field' }, h('span', {}, t('enter_code')), otp), err,
+        h('div', { class: 'wiz-nav' }, h('button', { class: 'btn ghost', type: 'button', onclick: close }, t('cancel'))));
+      try {
+        setup = await api('action_totp_begin', { token });
+        qr.innerHTML = setup.qrSvg;
+        secret.textContent = setup.secret.match(/.{1,4}/g).join(' ');
+        otp.focusFirst();
+      } catch (e) { err.textContent = errMsg(e); }
+    }
+
+    async function recoveryStep() {
+      let words;
+      try { words = (await api('action_recovery_generate', { token })).words; }
+      catch (e) { show(h('p', { class: 'error' }, errMsg(e)), navRow(null)); return; }
+      let ack = false;
+      const btn = h('button', { class: 'btn primary', type: 'button', disabled: true, onclick: () => {
+        const set = new Set();
+        while (set.size < 3) set.add(1 + Math.floor(Math.random() * 24));
+        verifyStep([...set].sort((a, b) => a - b));
+      } }, t('act_continue'));
+      show(...head(t('recovery_show_title'), t('recovery_show_body')),
+        h('ol', { class: 'words' }, words.map((wd) => h('li', {}, h('span', {}, wd)))),
+        toggle(t('recovery_ack'), false, (val) => { ack = val; btn.disabled = !ack; }),
+        navRow(btn));
+      words = null;
+    }
+
+    function verifyStep(idx) {
+      const inputs = idx.map((i) => [i, h('input', { class: 'input mono', autocomplete: 'off', spellcheck: 'false' })]);
+      const err = h('p', { class: 'error', role: 'alert' });
+      show(...head(t('recovery_verify_title'), t('recovery_verify_body')),
+        h('form', { class: 'form', onsubmit: async (e) => {
+          e.preventDefault(); err.textContent = '';
+          const answers = Object.fromEntries(inputs.map(([i, inp]) => [String(i), inp.value]));
+          try {
+            const r = await api('action_recovery_confirm', { token, answers });
+            if (r.ok) done(t('act_rec_done')); else err.textContent = t('verify_failed');
+          } catch (e2) { err.textContent = errMsg(e2); }
+        } },
+          h('div', { class: 'grid3' }, inputs.map(([i, inp]) => h('label', { class: 'field' }, h('span', {}, t('word_n', { n: i })), inp))),
+          err, navRow(h('button', { class: 'btn primary', type: 'submit' }, t('verify')))));
+      setTimeout(() => inputs[0][1].focus(), 0);
+    }
+
+    function addKeyStep(keys) {
+      const pin = h('input', { class: 'input', type: 'password', inputmode: 'numeric', autocomplete: 'off' });
+      let n = keys.length + 1;
+      while (keys.includes('YubiKey ' + n)) n++;
+      const label = h('input', { class: 'input', value: 'YubiKey ' + n, maxlength: 40 });
+      const err = h('p', { class: 'error', role: 'alert' });
+      const btn = h('button', { class: 'btn primary', type: 'submit' }, icon('plus', 'sm'), t('register_key'));
+      show(...head(t('act_key_title'), t('backup_hint')),
+        keys.length && h('div', { class: 'keys' }, h('small', { class: 'muted' }, t('registered_keys')),
+          keys.map((k) => h('div', { class: 'key-item' }, icon('check', 'sm ok'), k))),
+        h('form', { class: 'form', onsubmit: async (e) => {
+          e.preventDefault(); btn.disabled = true; err.textContent = '';
+          try {
+            const r = await api('action_add_fido2', { token, pin: pin.value, label: label.value.trim() || 'YubiKey' });
+            pin.value = '';
+            done(t('act_key_done', { label: r.label }));
+          } catch (e2) { touch?.remove(); err.textContent = errMsg(e2); btn.disabled = false; }
+        } },
+          h('div', { class: 'grid2' },
+            h('label', { class: 'field' }, h('span', {}, t('key_label')), label),
+            h('label', { class: 'field' }, h('span', {}, t('yubikey_pin')), pin)),
+          err, navRow(btn)));
+    }
+
+    el.append(overlay);
+    authStep();
+  }
+
   async function vaultsTab() {
     const cards = await Promise.all(vaults.map(async (v) => {
       const factors = await api('list_factors', { id: v.id });
       const act = (action, label, cls = 'ghost') => h('button', { class: 'btn sm ' + cls, onclick: async () => {
+        if (action !== 'delete') { actionFlow(v, action); return; }
         await api('request_vault_action', { id: v.id, action });
         if (!isTauri) toast(t('auth_required'));
       } }, label);
@@ -716,6 +920,12 @@ async function route() {
   const view = VIEWS[name] ? name : 'tray';
   const seq = ++routeSeq;
   document.body.dataset.view = view;
+  // Rust settings are the single source of truth for the language (the
+  // tray menu uses them too); localStorage is only a cache.
+  if (isTauri) {
+    try { const st = await api('get_settings'); if (st.language && st.language !== getLang()) setLang(st.language); } catch {}
+    if (seq !== routeSeq) return;
+  }
   document.documentElement.lang = getLang();
   const node = await VIEWS[view](new URLSearchParams(qs));
   if (seq !== routeSeq) return; // a newer navigation won
@@ -725,6 +935,7 @@ async function route() {
 }
 
 window.addEventListener('hashchange', route);
+if (isTauri) on('settings_changed', () => route());
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && document.body.dataset.view !== 'tray' && isTauri) api('close_window');
 });

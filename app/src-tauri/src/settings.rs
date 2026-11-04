@@ -30,6 +30,25 @@ pub struct Settings {
     pub browser_paths: BTreeMap<String, String>,
 }
 
+/// "bg" if the user's first preferred macOS language is Bulgarian, else "en".
+fn system_language() -> String {
+    let first = std::process::Command::new("/usr/bin/defaults")
+        .args(["read", "-g", "AppleLanguages"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split(|c: char| c == '"' || c == '(' || c == ',' || c.is_whitespace())
+                .find(|w| !w.is_empty())
+                .map(str::to_lowercase)
+        })
+        .or_else(|| std::env::var("LANG").ok().map(|l| l.to_lowercase()));
+    match first {
+        Some(l) if l.starts_with("bg") => "bg".into(),
+        _ => "en".into(),
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -56,11 +75,16 @@ pub struct Patch {
 }
 
 impl Settings {
+    /// Saved settings, or defaults with the language taken from the system
+    /// on first run. The UI windows and the tray menu all follow this value.
     pub fn load(dir: &Path) -> Settings {
         fs::read(dir.join(FILE_NAME))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_else(|| Settings {
+                language: system_language(),
+                ..Settings::default()
+            })
     }
 
     /// Atomic write (temp → fsync → rename), mode 600.

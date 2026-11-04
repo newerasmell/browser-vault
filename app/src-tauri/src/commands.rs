@@ -713,6 +713,8 @@ pub fn save_settings(
     }
     if before.language != after.language {
         tray::rebuild_menu(&app);
+        // Every open window re-renders in the new language.
+        let _ = app.emit("settings_changed", ());
     }
     if before.launch_at_login != after.launch_at_login {
         let al = app.autolaunch();
@@ -808,17 +810,89 @@ pub async fn request_vault_action(app: AppHandle, id: String, action: String) ->
         st.store.load(&id)?; // validates the id
         match action.as_str() {
             "delete" => delete_unlocked_vault(&app, &id),
-            // TODO(integrate M3/M4): change_password / add_fido2 /
-            // replace_totp need factor re-wrap APIs from totp.rs / fido2.rs;
-            // new_recovery needs a one-time display + confirm screen.
+            // The other actions run in the settings window itself
+            // (action_auth → action_* commands below).
             "change_password" | "add_fido2" | "replace_totp" | "new_recovery" => {
-                message(&app, tr(st.is_bg(), T::NotAvailableYet));
-                Err(CmdError::unsupported())
+                Ok(json!({ "inline": true }))
             }
             _ => Err(CmdError::invalid()),
         }
     })
     .await
+}
+
+#[tauri::command]
+pub async fn action_auth(
+    app: AppHandle,
+    id: String,
+    password: String,
+    code: Option<String>,
+    pin: Option<String>,
+) -> CmdResult<Value> {
+    let (pw, code, pin) = (
+        Zeroizing::new(password),
+        Zeroizing::new(code.unwrap_or_default()),
+        Zeroizing::new(pin.unwrap_or_default()),
+    );
+    blocking(move || crate::actions::auth(&app, &id, pw, code, pin)).await
+}
+
+#[tauri::command]
+pub async fn action_change_password(
+    app: AppHandle,
+    token: String,
+    new_password: String,
+) -> CmdResult<Value> {
+    let pw = Zeroizing::new(new_password);
+    blocking(move || crate::actions::change_password(&app, &token, pw)).await
+}
+
+#[tauri::command]
+pub async fn action_fido_rewrap(app: AppHandle, token: String, pin: String) -> CmdResult<Value> {
+    let pin = Zeroizing::new(pin);
+    blocking(move || crate::actions::fido_rewrap(&app, &token, pin)).await
+}
+
+#[tauri::command]
+pub async fn action_totp_begin(app: AppHandle, token: String) -> CmdResult<Value> {
+    blocking(move || crate::actions::totp_begin(&app, &token)).await
+}
+
+#[tauri::command]
+pub async fn action_totp_confirm(app: AppHandle, token: String, code: String) -> CmdResult<Value> {
+    let code = Zeroizing::new(code);
+    blocking(move || crate::actions::totp_confirm(&app, &token, code)).await
+}
+
+#[tauri::command]
+pub async fn action_add_fido2(
+    app: AppHandle,
+    token: String,
+    pin: String,
+    label: String,
+) -> CmdResult<Value> {
+    let pin = Zeroizing::new(pin);
+    blocking(move || crate::actions::add_fido2(&app, &token, pin, label)).await
+}
+
+#[tauri::command]
+pub async fn action_recovery_generate(app: AppHandle, token: String) -> CmdResult<Value> {
+    blocking(move || crate::actions::recovery_generate(&app, &token)).await
+}
+
+#[tauri::command]
+pub async fn action_recovery_confirm(
+    app: AppHandle,
+    token: String,
+    answers: std::collections::HashMap<String, String>,
+) -> CmdResult<Value> {
+    blocking(move || crate::actions::recovery_confirm(&app, &token, answers)).await
+}
+
+#[tauri::command]
+pub async fn action_end(app: AppHandle, token: String) -> CmdResult<()> {
+    crate::actions::end(&app, &token);
+    Ok(())
 }
 
 // ---------------------------------------------------------------- original profile (M7b)

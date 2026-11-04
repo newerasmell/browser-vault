@@ -430,6 +430,116 @@ pub fn remove_key(header: &mut Header, key: &UnlockedKey, label: &str) -> Result
     header.seal_mac(key.vmk())
 }
 
+/// Password change for YubiKey vaults, one key at a time: the plugged-in
+/// registered key (PIN + touch) gives its hmac-secret and the VMK is
+/// re-wrapped under `new_pw` (derived by the caller from the NEW kdf).
+/// Returns the credential id it handled and the new slot; nothing in
+/// `header` changes until [`apply_password_change`].
+pub fn rewrap_present(
+    header: &Header,
+    key: &UnlockedKey,
+    new_pw: &Key,
+    auth: &dyn Authenticator,
+    pin: &str,
+    notify: Notify<'_>,
+) -> Result<(Vec<u8>, Slot)> {
+    check_key(header, key)?;
+    if !pin_well_formed(pin) {
+        return Err(Error::Invalid(ERR_PIN_FORMAT));
+    }
+    let ids = credential_ids(&header.slots);
+    let found = auth
+        .find_credential(RP_ID, &ids)
+        .map_err(setup_error)?
+        .ok_or(Error::Invalid(ERR_NO_KEY))?;
+    for slot in &header.slots {
+        let Slot::Fido2 {
+            label,
+            credential_id,
+            salt,
+            ..
+        } = slot
+        else {
+            continue;
+        };
+        if credential_id.0 != found {
+            continue;
+        }
+        let salt_arr = <[u8; SALT_LEN]>::try_from(salt.0.as_slice())
+            .map_err(|_| Error::Format("fido2 salt length".into()))?;
+        let secret = with_touch(notify, || auth.hmac_secret(RP_ID, &found, &salt_arr, pin))
+            .map_err(setup_error)?;
+        let kek = factor_kek(new_pw, secret.as_ref(), KIND);
+        let (nonce, wrapped_vmk) = wrap_slot(&header.vault_id, KIND, &kek, key.vmk())?;
+        return Ok((
+            found.clone(),
+            Slot::Fido2 {
+                label: label.clone(),
+                credential_id: credential_id.clone(),
+                salt: salt.clone(),
+                nonce,
+                wrapped_vmk,
+            },
+        ));
+    }
+    Err(Error::Invalid(ERR_NO_KEY))
+}
+
+/// Labels of registered keys whose credential id is not in `done`.
+pub fn remaining_keys(header: &Header, done: &[Vec<u8>]) -> Vec<String> {
+    header
+        .slots
+        .iter()
+        .filter_map(|s| match s {
+            Slot::Fido2 {
+                label,
+                credential_id,
+                ..
+            } if !done.contains(&credential_id.0) => Some(label.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Commit a password change once EVERY fido2 slot was re-wrapped with
+/// [`rewrap_present`]: switch to `new_kdf` (new salt), replace the slots,
+/// re-seal. Refuses if any registered key is missing from `rewrapped`.
+pub fn apply_password_change(
+    header: &mut Header,
+    key: &UnlockedKey,
+    new_kdf: crate::header::Kdf,
+    rewrapped: Vec<Slot>,
+) -> Result<()> {
+    check_key(header, key)?;
+    if header
+        .slots
+        .iter()
+        .any(|s| matches!(s, Slot::Totp { .. } | Slot::Password { .. }))
+    {
+        return Err(Error::Unsupported(
+            "password change for vaults with other factors",
+        ));
+    }
+    let mut new_slots = Vec::with_capacity(header.slots.len());
+    for s in &header.slots {
+        match s {
+            Slot::Fido2 { credential_id, .. } => {
+                let r = rewrapped
+                    .iter()
+                    .find(
+                        |r| matches!(r, Slot::Fido2 { credential_id: c, .. } if c == credential_id),
+                    )
+                    .ok_or(Error::Invalid("not every key was re-wrapped"))?;
+                new_slots.push(r.clone());
+            }
+            other => new_slots.push(other.clone()),
+        }
+    }
+    header.kdf = new_kdf;
+    header.slots = new_slots;
+    header.seal_mac(key.vmk())
+}
+
 /// SPEC §6 trigger 4: whether one of the vault's registered keys is plugged
 /// in. Uses a silent probe (no PIN, no touch). The app polls this (about
 /// every 2 s) while a fido2 vault is unlocked and locks when it turns
@@ -988,6 +1098,45 @@ mod tests {
 
     fn failed<T: fmt::Debug>(r: Result<T>) -> bool {
         matches!(r, Err(Error::UnlockFailed))
+    }
+
+    #[test]
+    fn password_change_rewraps_every_key() {
+        let mut v = vault();
+        let new_pw_str = "a brand new passphrase";
+        let mut kdf = v.header.kdf.clone();
+        kdf.salt = crypto::random_bytes::<16>().into();
+        let new_pw = kdf.derive(new_pw_str.as_bytes()).unwrap();
+        let mut done = vec![];
+        let mut slots = vec![];
+        // Nothing plugged in → clear error, no touch.
+        v.auth.unplug_all();
+        assert!(rewrap_present(&v.header, &v.key, &new_pw, &v.auth, PIN_A, n()).is_err());
+        v.auth.only(v.a);
+        let (id, slot) = rewrap_present(&v.header, &v.key, &new_pw, &v.auth, PIN_A, n()).unwrap();
+        done.push(id);
+        slots.push(slot);
+        assert_eq!(
+            remaining_keys(&v.header, &done),
+            vec!["YubiKey backup".to_string()]
+        );
+        // Committing with a key missing is refused.
+        let mut h = v.header.clone();
+        assert!(apply_password_change(&mut h, &v.key, kdf.clone(), slots.clone()).is_err());
+        v.auth.only(v.b);
+        let (id, slot) = rewrap_present(&v.header, &v.key, &new_pw, &v.auth, PIN_B, n()).unwrap();
+        done.push(id);
+        slots.push(slot);
+        assert!(remaining_keys(&v.header, &done).is_empty());
+        apply_password_change(&mut v.header, &v.key, kdf, slots).unwrap();
+        assert!(v.header.verify_mac(v.key.vmk()));
+        for (k, pin) in [(v.a, PIN_A), (v.b, PIN_B)] {
+            v.auth.only(k);
+            assert!(failed(unlock(&v.header, &v.auth, PW, pin, n())));
+            let u = unlock(&v.header, &v.auth, new_pw_str, pin, n()).unwrap();
+            assert_eq!(**u.vmk(), **v.key.vmk());
+        }
+        assert!(unlock_with_recovery(&v.header, &v.phrase).is_ok());
     }
 
     #[test]

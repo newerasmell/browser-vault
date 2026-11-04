@@ -42,6 +42,8 @@ pub struct AppState {
     pub quitting: AtomicBool,
     /// Actions waiting for an unlock of that vault (see original.rs).
     pub pending: Mutex<HashMap<String, crate::original::Pending>>,
+    /// Settings → vault actions in progress (see actions.rs), by token.
+    pub actions: Mutex<crate::actions::Actions>,
     /// When the tray popover was last hidden by losing focus (see tray.rs).
     pub tray_blurred_at: Mutex<Option<Instant>>,
 }
@@ -67,6 +69,7 @@ impl AppState {
             quitting: AtomicBool::new(false),
             pending: Mutex::default(),
             tray_blurred_at: Mutex::new(None),
+            actions: Mutex::default(),
         }
     }
 

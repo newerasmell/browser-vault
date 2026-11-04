@@ -1,5 +1,6 @@
 //! Browser Vault — macOS menu bar app (Tauri 2). UI contract: docs/UI.md.
 
+mod actions;
 mod applog;
 mod commands;
 mod error;
@@ -71,6 +72,15 @@ fn main() {
             commands::save_settings,
             commands::list_factors,
             commands::request_vault_action,
+            commands::action_auth,
+            commands::action_change_password,
+            commands::action_fido_rewrap,
+            commands::action_totp_begin,
+            commands::action_totp_confirm,
+            commands::action_add_fido2,
+            commands::action_recovery_generate,
+            commands::action_recovery_confirm,
+            commands::action_end,
             commands::detect_profiles,
             commands::browser_running,
             commands::cleanup_preview,
