@@ -122,3 +122,11 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 - `TODO(integrate)`: `change_password` (`totp::change_password` съществува), `add_fido2` (`fido2::add_key`), `replace_totp`, `new_recovery` в `request_vault_action`: API-тата в ядрото ги има, липсват UI екрани (нова парола; парола+PIN+етикет; еднократно показване на фразата). Засега показват „още не е налично“.
 - Ако `Store::create` се провали, черновата е загубена (`create` я консумира) и wizard-ът трябва да започне отначало.
 - M8: Developer ID подпис, notarization, hardened runtime, Tauri updater: не са направени.
+
+## Преносимост: нов Mac, recovery фраза, логини на Brave
+
+1. **Нови Brave сейфове са „преносими“** (`settings.portable_keys = true` в header-а): Brave се стартира с `--use-mock-keychain` и криптира cookies/паролите с фиксиран ключ, независим от Mac-а (Chromium `mock_password`). Реалната защита е криптираният сейф около профила. Полето се пропуска в JSON, когато е `false`, за да остане MAC-ът на старите header-и валиден.
+2. **Импортиран Brave профил** се конвертира при импорта: приложението чете „Brave Safe Storage“ от Keychain (macOS пита веднъж — Allow) и преобразува всяка „v10“ стойност **в копието в сейфа** от ключа на Mac-а към преносимия (`portable::convert_mount`, една SQLite транзакция на база, WAL checkpoint). Оригиналът не се пипа. При отказ на достъпа сейфът остава непреносим, но работи на този Mac.
+3. **Съществуващи сейфове:** Settings → Vaults → „Направи логините преносими…“ (сейфът трябва да е заключен; mount без браузър → конвертиране → detach → флаг). Трябва да се направи на **оригиналния** Mac, преди преместване. Конвертирането се пуска само веднъж на сейф (флагът го пази): грешен ключ минава padding проверката ~1/256 и би развалил стойност.
+4. **Recovery фраза в Settings** („Използвай recovery фраза…“): за нов Mac или забравена парола. TOTP сейф: нова парола + нов аутентикатор, вързан към Secure Enclave на този Mac (`totp::reset_with_recovery`). YubiKey сейф: нова парола + докосване на всеки ключ.
+5. **Нови crates** (`aes`, `cbc`, `pbkdf2`, `sha1`, + `rusqlite` за SQLite) — одобрени изрично само за т. 2–3. Тестов вектор е сверен независимо (Python `hashlib` + `openssl enc`), а E2E тест на macOS проверява, че истински Brave с `--use-mock-keychain` записва cookie, което нашият код декриптира с преносимия ключ.

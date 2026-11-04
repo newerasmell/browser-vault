@@ -38,6 +38,11 @@ pub struct ActionCtx {
     pending_recovery: Option<Zeroizing<String>>,
     /// YubiKey password change in progress: new kdf, new PW, re-wrapped slots.
     pw_change: Option<PwChange>,
+    /// Authenticated with the recovery phrase (no password known): only the
+    /// reset, new-recovery and portable actions are allowed.
+    via_recovery: bool,
+    /// New password chosen for a TOTP reset, until the first code confirms.
+    reset_password: Option<Zeroizing<String>>,
 }
 
 pub type Actions = HashMap<String, ActionCtx>;
@@ -134,6 +139,8 @@ pub fn auth(
             pending_totp: None,
             pending_recovery: None,
             pw_change: None,
+            via_recovery: false,
+            reset_password: None,
         },
     );
     applog::log(&format!("action auth ok for {id}"));
@@ -156,6 +163,9 @@ pub fn change_password(
     with_ctx(app, token, |c| {
         let mut h = st.store.load(&c.id)?;
         if mode_of(&h) == "totp" {
+            if c.via_recovery {
+                return Err(CmdError::invalid()); // use the reset flow
+            }
             totp::change_password(&mut h, &c.key, &new_password, st.se.as_ref())?;
             commit(app, &h)?;
             c.password = new_password;
@@ -203,6 +213,9 @@ pub fn fido_rewrap(app: &AppHandle, token: &str, pin: Zeroizing<String>) -> CmdR
 pub fn totp_begin(app: &AppHandle, token: &str) -> CmdResult<Value> {
     let st = state::get(app);
     with_ctx(app, token, |c| {
+        if c.via_recovery {
+            return Err(CmdError::invalid()); // use the reset flow
+        }
         let h = st.store.load(&c.id)?;
         let (setup, pending) = totp::replace_begin(&h, st.se.as_ref())?;
         c.pending_totp = Some(pending);
@@ -244,6 +257,9 @@ pub fn add_fido2(
 ) -> CmdResult<Value> {
     let st = state::get(app);
     with_ctx(app, token, |c| {
+        if c.via_recovery {
+            return Err(CmdError::invalid()); // needs the password
+        }
         let mut h = st.store.load(&c.id)?;
         let app2 = app.clone();
         let notify = move |e| emit_touch(&app2, e);
@@ -298,5 +314,116 @@ pub fn recovery_confirm(
         c.pending_recovery = None;
         applog::log(&format!("recovery phrase replaced for {}", c.id));
         Ok(json!({ "ok": true }))
+    })
+}
+
+// ---------------------------------------------------------------- recovery phrase / new Mac
+
+/// Re-authenticate with the 24-word recovery phrase (e.g. on a new Mac,
+/// where a TOTP vault's Secure Enclave key does not exist).
+pub fn auth_recovery(app: &AppHandle, id: &str, phrase: Zeroizing<String>) -> CmdResult<Value> {
+    let st = state::get(app);
+    let header = st.store.load(id)?;
+    let key = keyslot::unlock_with_recovery(&header, &phrase)?;
+    drop(phrase);
+    if !key.header_intact {
+        return Err(CmdError::new("header_modified"));
+    }
+    let token = new_token();
+    let mode = mode_of(&header);
+    let keys: Vec<String> = fido2::keys(&header).into_iter().map(|k| k.label).collect();
+    lock(&st.actions).insert(
+        token.clone(),
+        ActionCtx {
+            id: id.to_string(),
+            key,
+            password: Zeroizing::new(String::new()),
+            created: Instant::now(),
+            pending_totp: None,
+            pending_recovery: None,
+            pw_change: None,
+            via_recovery: true,
+            reset_password: None,
+        },
+    );
+    applog::log(&format!("action auth (recovery phrase) ok for {id}"));
+    Ok(json!({ "token": token, "mode": mode, "keys": keys }))
+}
+
+/// TOTP vault reset, step 1: remember the new password, start a new
+/// authenticator bound to THIS Mac. (YubiKey vaults use
+/// `change_password` + `fido_rewrap`, which only need the VMK.)
+pub fn reset_begin(
+    app: &AppHandle,
+    token: &str,
+    new_password: Zeroizing<String>,
+) -> CmdResult<Value> {
+    let st = state::get(app);
+    keyslot::validate_password(&new_password).map_err(|_| CmdError::invalid())?;
+    with_ctx(app, token, |c| {
+        let h = st.store.load(&c.id)?;
+        if mode_of(&h) != "totp" {
+            return Err(CmdError::invalid());
+        }
+        let (setup, pending) = totp::replace_begin(&h, st.se.as_ref())?;
+        c.pending_totp = Some(pending);
+        c.reset_password = Some(new_password);
+        Ok(json!({ "secret": setup.secret.as_str(), "qrSvg": setup.qr_svg.as_str() }))
+    })
+}
+
+/// Step 2: the first code from the new app confirms; new password + new
+/// authenticator are written together.
+pub fn reset_confirm(app: &AppHandle, token: &str, code: Zeroizing<String>) -> CmdResult<Value> {
+    let st = state::get(app);
+    with_ctx(app, token, |c| {
+        let mut h = st.store.load(&c.id)?;
+        let pending = c.pending_totp.as_ref().ok_or(CmdError::invalid())?;
+        let pw = c.reset_password.as_ref().ok_or(CmdError::invalid())?;
+        match totp::reset_with_recovery(
+            &mut h,
+            &c.key,
+            pw,
+            pending,
+            &code,
+            vault_core::store::now_unix(),
+        ) {
+            Ok(()) => {}
+            Err(vault_core::Error::UnlockFailed) => return Ok(json!({ "ok": false })),
+            Err(e) => return Err(e.into()),
+        }
+        commit(app, &h)?;
+        c.pending_totp = None;
+        c.reset_password = None;
+        applog::log(&format!("password + authenticator reset for {}", c.id));
+        Ok(json!({ "ok": true }))
+    })
+}
+
+// ---------------------------------------------------------------- portable Brave logins
+
+/// Convert an existing Brave vault's logins to the portable key (vault must
+/// be locked). macOS asks once for access to "Brave Safe Storage".
+pub fn make_portable(app: &AppHandle, token: &str) -> CmdResult<Value> {
+    let st = state::get(app);
+    with_ctx(app, token, |c| {
+        let stats = st.store.make_portable(&c.id, &c.key).map_err(|e| match e {
+            vault_core::Error::Invalid(m) if m == vault_core::store::ERR_LOCK_FIRST => {
+                CmdError::new("lock_first")
+            }
+            vault_core::Error::Invalid(m) if m == vault_core::portable::ERR_KEYCHAIN => {
+                CmdError::new("keychain_denied")
+            }
+            other => other.into(),
+        })?;
+        if let Some(s) = lock(&st.sessions).get_mut(&c.id) {
+            s.unlocked.header.settings.portable_keys = true;
+        }
+        lockctl::vaults_changed(app);
+        applog::log(&format!(
+            "logins made portable for {}: {} converted, {} unreadable",
+            c.id, stats.converted, stats.failed
+        ));
+        Ok(json!({ "converted": stats.converted, "failed": stats.failed }))
     })
 }

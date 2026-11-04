@@ -649,7 +649,87 @@ async function viewSettings(params) {
     const done = (msg) => show(h('div', { class: 'callout ok' }, icon('check', 'sm'), h('p', {}, msg)),
       h('div', { class: 'wiz-nav center' }, h('button', { class: 'btn primary', type: 'button', onclick: close }, t('close'))));
 
+    function recoveryAuthStep() {
+      const ta = h('textarea', { class: 'input mono', rows: 4, spellcheck: 'false', autocomplete: 'off' });
+      const err = h('p', { class: 'error', role: 'alert' });
+      const btn = h('button', { class: 'btn primary', type: 'submit' }, t('act_continue'));
+      show(...head(t('act_rec_auth_title'), v.mode === 'totp' ? t('act_rec_auth_body_totp') : t('act_rec_auth_body_fido')),
+        h('form', { class: 'form', onsubmit: async (e) => {
+          e.preventDefault(); err.textContent = ''; btn.disabled = true;
+          try {
+            const r = await api('action_auth_recovery', { id: v.id, phrase: ta.value });
+            ta.value = ''; token = r.token;
+            if (v.mode === 'totp') resetStep(); else passwordStep();
+          } catch (e2) { err.textContent = errMsg(e2); btn.disabled = false; }
+        } }, ta, err, navRow(btn)));
+      setTimeout(() => ta.focus(), 0);
+    }
+
+    function resetStep() {
+      const meter = h('div', { class: 'meter' }, h('i'), h('i'), h('i'), h('i'));
+      const label = h('small', { class: 'muted' }, ' ');
+      const mismatch = h('small', { class: 'error' });
+      const err = h('p', { class: 'error', role: 'alert' });
+      const btn = h('button', { class: 'btn primary', type: 'submit', disabled: true }, t('act_continue'));
+      const upd = () => {
+        const sc = strength(p1.value);
+        meter.dataset.s = p1.value ? sc : '';
+        label.textContent = p1.value ? t('pw_strength')[sc] : ' ';
+        mismatch.textContent = p2.value && p1.value !== p2.value ? t('pw_mismatch') : '';
+        btn.disabled = !(p1.value.length >= 12 && sc >= 2 && p1.value === p2.value);
+      };
+      const p1 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: upd });
+      const p2 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', oninput: upd });
+      show(...head(t('act_pw_title'), t('act_reset_pw_body')),
+        h('form', { class: 'form', onsubmit: async (e) => {
+          e.preventDefault(); btn.disabled = true; err.textContent = '';
+          try {
+            const setup = await api('action_reset_begin', { token, newPassword: p1.value });
+            p1.value = p2.value = '';
+            resetTotpStep(setup);
+          } catch (e2) { err.textContent = errMsg(e2); btn.disabled = false; }
+        } },
+          h('label', { class: 'field' }, h('span', {}, t('password')), p1, meter, label),
+          h('label', { class: 'field' }, h('span', {}, t('pw_confirm')), p2, mismatch),
+          err, navRow(btn)));
+      setTimeout(() => p1.focus(), 0);
+    }
+
+    function resetTotpStep(setup) {
+      const qr = h('div', { class: 'qr' });
+      qr.innerHTML = setup.qrSvg;
+      const err = h('p', { class: 'error', role: 'alert' });
+      const otp = otpInput(async (code) => {
+        err.textContent = '';
+        try {
+          const r = await api('action_reset_confirm', { token, code });
+          if (r.ok) done(t('act_reset_done')); else { err.textContent = t('code_wrong'); otp.clear(); }
+        } catch (e) { err.textContent = errMsg(e); otp.clear(); }
+      });
+      show(...head(t('act_totp_title'), t('act_reset_totp_body')),
+        h('div', { class: 'totp-grid' }, qr,
+          h('div', {}, h('strong', {}, t('scan_qr')), h('small', { class: 'muted block' }, t('manual_key')),
+            h('div', { class: 'secret-row' }, h('code', { class: 'secret' }, setup.secret.match(/.{1,4}/g).join(' '))))),
+        h('div', { class: 'field' }, h('span', {}, t('enter_code')), otp), err,
+        h('div', { class: 'wiz-nav' }, h('button', { class: 'btn ghost', type: 'button', onclick: close }, t('cancel'))));
+      setTimeout(() => otp.focusFirst(), 0);
+    }
+
+    async function portableStep() {
+      const bar = h('div', { class: 'progress' }, h('i', { style: 'width:100%' }));
+      show(...head(t('act_portable_title'), t('act_portable_working')), bar);
+      try {
+        const r = await api('action_make_portable', { token });
+        done(t('act_portable_done', { n: r.converted }));
+      } catch (e) {
+        const msg = e?.code === 'lock_first' ? t('act_lock_first') : e?.code === 'keychain_denied' ? t('act_keychain_denied') : errMsg(e);
+        show(h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', {}, msg)),
+          h('div', { class: 'wiz-nav center' }, h('button', { class: 'btn primary', type: 'button', onclick: close }, t('close'))));
+      }
+    }
+
     function authStep() {
+      if (action === 'recovery_reset') return recoveryAuthStep();
       const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
       const pin = v.mode === 'fido2' ? h('input', { class: 'input', type: 'password', inputmode: 'numeric', autocomplete: 'off' }) : null;
       const otp = v.mode === 'totp' ? otpInput(() => submit()) : null;
@@ -678,6 +758,7 @@ async function viewSettings(params) {
       if (action === 'replace_totp') return totpStep();
       if (action === 'new_recovery') return recoveryStep();
       if (action === 'add_fido2') return addKeyStep(r.keys || []);
+      if (action === 'make_portable') return portableStep();
     }
 
     function passwordStep() {
@@ -835,11 +916,13 @@ async function viewSettings(params) {
           h('span', { class: 'status status-' + v.status + ' push' }, t('status_' + v.status))),
         originalBlock(v),
         h('div', { class: 'factors' }, h('small', { class: 'muted' }, t('factors')),
-          factors.map((f) => h('span', { class: 'chip' }, icon(f.type === 'fido2' ? 'key' : f.type === 'totp' ? 'phone' : 'shield', 'xs'), f.label))),
+          factors.map((f) => h('span', { class: 'chip' }, icon(f.type === 'fido2' ? 'key' : f.type === 'totp' ? 'phone' : 'shield', 'xs'), f.type === 'recovery' ? t('chip_recovery') : f.type === 'totp' ? t('chip_totp') : f.label))),
         h('div', { class: 'row wrap' },
           act('change_password', t('change_password')),
           v.mode === 'fido2' ? act('add_fido2', t('add_yubikey')) : act('replace_totp', t('replace_authenticator')),
           act('new_recovery', t('new_recovery')),
+          v.browser === 'brave' && !v.portable && act('make_portable', t('act_portable_btn')),
+          act('recovery_reset', t('act_recovery_link')),
           act('delete', t('delete_vault'), 'danger push')));
     }));
     return h('div', { class: 'form' },

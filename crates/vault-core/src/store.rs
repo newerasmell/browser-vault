@@ -24,6 +24,8 @@ use crate::profiles::{self, PasswordVerifier, Roots};
 use crate::se::SecureEnclave;
 
 pub const DEFAULT_SIZE_GB: u32 = 20;
+/// The action needs the vault closed (its volume is mounted right now).
+pub const ERR_LOCK_FIRST: &str = "lock the vault first";
 /// Overrides the base directory (tests / debugging). Holds a path, never a secret.
 pub const HOME_ENV: &str = "BVAULT_HOME";
 
@@ -225,6 +227,11 @@ impl Store {
             stage: CreateStage::Keys,
             pct: 10,
         });
+        let mut settings = settings;
+        // Fresh Brave vaults start portable (logins work on any Mac). An
+        // imported profile becomes portable only if its logins can be
+        // converted below.
+        settings.portable_keys = draft.browser() == Browser::Brave && opts.import.is_none();
         let nv = draft.finish(settings)?;
         let id = nv.header.vault_id.clone();
         mkdir_700(&self.root)?;
@@ -260,8 +267,9 @@ impl Store {
         let mut header = nv.header;
         let import_error = match import_result {
             None => None,
-            Some(Ok(original)) => {
+            Some(Ok((original, portable))) => {
                 header.original = Some(original);
+                header.settings.portable_keys = portable;
                 header.seal_mac(nv.key.vmk())?;
                 self.save_header(&header)?;
                 None
@@ -286,7 +294,7 @@ impl Store {
         key: &UnlockedKey,
         opts: &CreateOptions,
         notify: Notify<'_>,
-    ) -> Result<Option<Result<crate::header::Original>>> {
+    ) -> Result<Option<Result<(crate::header::Original, bool)>>> {
         let id = &header.vault_id;
         let mnt = self.mountpoint(id);
         mkdir_700(&self.root.join("mnt"))?;
@@ -298,6 +306,26 @@ impl Store {
             mkdir_700(&browser::cache_dir(&mnt))?;
             let imported = opts.import.as_ref().map(|req| {
                 profiles::import_profile(&req.roots, header.browser, &req.profile_id, &mnt, notify)
+                    .map(|original| {
+                        // Re-encrypt the COPY's logins for other Macs. If the
+                        // Keychain can't be read (user clicked Deny), the
+                        // vault stays tied to this Mac and still works here.
+                        let portable = header.browser == Browser::Brave
+                            && match crate::portable::convert_mount(&mnt) {
+                                Ok(st) => {
+                                    crate::trace::emit(&format!(
+                                        "portable: converted {} values ({} unreadable) in {} dbs",
+                                        st.converted, st.failed, st.databases
+                                    ));
+                                    true
+                                }
+                                Err(e) => {
+                                    crate::trace::emit(&format!("portable: skipped: {e}"));
+                                    false
+                                }
+                            };
+                        (original, portable)
+                    })
             });
             // After the import, so our managed block wins over an imported user.js.
             if header.browser == Browser::Firefox {
@@ -309,6 +337,37 @@ impl Store {
         let imported = r?;
         detached?;
         Ok(imported)
+    }
+
+    /// Settings → "make logins portable" for an existing (locked) Brave
+    /// vault: mount without launching, convert the profile copy from this
+    /// Mac's Keychain key to the portable key, detach, set the flag.
+    pub fn make_portable(&self, id: &str, key: &UnlockedKey) -> Result<crate::portable::Stats> {
+        let mut header = self.load(id)?;
+        if header.browser != Browser::Brave {
+            return Err(Error::Invalid("only Brave vaults need this"));
+        }
+        if header.settings.portable_keys {
+            return Ok(crate::portable::Stats::default());
+        }
+        if !header.verify_mac(key.vmk()) {
+            return Err(Error::Invalid("header was modified outside the app"));
+        }
+        let mnt = self.mountpoint(id);
+        if hdiutil::is_mounted(&mnt) {
+            return Err(Error::Invalid(ERR_LOCK_FIRST));
+        }
+        mkdir_700(&self.root.join("mnt"))?;
+        mkdir_700(&mnt)?;
+        hdiutil::attach(&self.image_path(id), &mnt, &key.disk_key_hex())?;
+        let r = crate::portable::convert_mount(&mnt);
+        let detached = hdiutil::detach_with_retries(&mnt);
+        let stats = r?;
+        detached?;
+        header.settings.portable_keys = true;
+        header.seal_mac(key.vmk())?;
+        self.save_header(&header)?;
+        Ok(stats)
     }
 
     pub fn is_unlocked(&self, id: &str) -> bool {
@@ -385,7 +444,12 @@ impl Store {
             Some(b) => b.to_path_buf(),
             None => browser::detect(browser).ok_or(Error::BrowserMissing)?,
         };
-        let child = browser::launch(browser, &bin, &unlocked.mountpoint)?;
+        let child = browser::launch_with(
+            browser,
+            &bin,
+            &unlocked.mountpoint,
+            unlocked.header.settings.portable_keys,
+        )?;
         mkdir_700(&self.root.join("run"))?;
         fs::write(
             self.pid_path(&unlocked.header.vault_id),

@@ -22,6 +22,7 @@ Desktop приложение за macOS, което държи профилит�
   - `ctap-hid-fido2` (YubiKey FIDO2 hmac-secret)
   - `totp-rs` (RFC 6238), `qrcode` (QR при setup)
   - `bip39` (recovery фраза)
+  - `aes` + `cbc` + `pbkdf2` + `sha1` — одобрени от собственика на 2026-11-04 **само** за преобразуване на криптираните стойности на Brave (cookies, пароли; Chromium „v10“) от ключа на Mac-а към преносимия ключ (`chromium.rs`, `portable.rs`). Не се ползват за собствената криптография на сейфа.
 - Дистрибуция: Developer ID подпис + notarization, hardened runtime, DMG. Без sandbox (нужни са `hdiutil` и контрол на процеси).
 
 ## 3. Криптиран контейнер (без външни драйвери)

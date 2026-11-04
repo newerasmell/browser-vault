@@ -18,7 +18,17 @@ bip39 = { version = "2", default-features = false, features = ["std", "zeroize"]
 totp-rs = { version = "6", default-features = false, features = ["std", "otpauth", "zeroize"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
+# Approved 2026-11-04 by the owner for ONE purpose: re-encrypting Brave's
+# own cookie/password values (Chromium "v10" format on macOS: PBKDF2-SHA1
+# + AES-128-CBC) from the Mac's Keychain key to the portable key, so a
+# vault's logins work on another Mac. Not used for our own crypto.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+
 # Non-crypto support crates.
+rusqlite = { version = "0.32", features = ["bundled"] }
 base64 = "0.22"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

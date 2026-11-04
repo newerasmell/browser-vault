@@ -71,6 +71,8 @@ pub struct VaultInfo {
     status: &'static str,
     size_gb: u32,
     original: Option<OriginalInfo>,
+    /// Brave logins use the Mac-independent key (vault works on any Mac).
+    portable: bool,
 }
 
 /// `fido2` if the vault has a YubiKey slot, else `totp`.
@@ -145,6 +147,7 @@ fn vault_info(st: &AppState, h: &Header) -> VaultInfo {
         mode: mode_of(h),
         status,
         original: original_info(h),
+        portable: h.browser != Browser::Brave || h.settings.portable_keys,
         id,
     }
 }
@@ -592,6 +595,8 @@ fn vault_settings(o: &FinishOptions) -> VaultSettings {
         idle_minutes: o.idle_minutes.unwrap_or(d.idle_minutes),
         lock_on_screen_lock: o.lock_on_screen_lock.unwrap_or(d.lock_on_screen_lock),
         lock_on_key_removal: o.lock_on_key_removal.unwrap_or(d.lock_on_key_removal),
+        // Decided by Store::create_with (fresh Brave vaults / converted imports).
+        portable_keys: false,
     }
 }
 
@@ -887,6 +892,33 @@ pub async fn action_recovery_confirm(
     answers: std::collections::HashMap<String, String>,
 ) -> CmdResult<Value> {
     blocking(move || crate::actions::recovery_confirm(&app, &token, answers)).await
+}
+
+#[tauri::command]
+pub async fn action_auth_recovery(app: AppHandle, id: String, phrase: String) -> CmdResult<Value> {
+    let phrase = Zeroizing::new(phrase);
+    blocking(move || crate::actions::auth_recovery(&app, &id, phrase)).await
+}
+
+#[tauri::command]
+pub async fn action_reset_begin(
+    app: AppHandle,
+    token: String,
+    new_password: String,
+) -> CmdResult<Value> {
+    let pw = Zeroizing::new(new_password);
+    blocking(move || crate::actions::reset_begin(&app, &token, pw)).await
+}
+
+#[tauri::command]
+pub async fn action_reset_confirm(app: AppHandle, token: String, code: String) -> CmdResult<Value> {
+    let code = Zeroizing::new(code);
+    blocking(move || crate::actions::reset_confirm(&app, &token, code)).await
+}
+
+#[tauri::command]
+pub async fn action_make_portable(app: AppHandle, token: String) -> CmdResult<Value> {
+    blocking(move || crate::actions::make_portable(&app, &token)).await
 }
 
 #[tauri::command]

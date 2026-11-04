@@ -147,6 +147,15 @@ pub struct VaultSettings {
     pub idle_minutes: u32,
     pub lock_on_screen_lock: bool,
     pub lock_on_key_removal: bool,
+    /// Brave runs with a Mac-independent key (see `portable.rs`), so the
+    /// vault's logins work on another Mac. Omitted when false, so headers
+    /// written before this field existed keep a valid MAC.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub portable_keys: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Default for VaultSettings {
@@ -155,6 +164,7 @@ impl Default for VaultSettings {
             idle_minutes: 15,
             lock_on_screen_lock: true,
             lock_on_key_removal: true,
+            portable_keys: false,
         }
     }
 }

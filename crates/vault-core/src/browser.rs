@@ -198,10 +198,24 @@ pub fn write_firefox_user_js(mnt: &Path, disable_fxa: Option<bool>) -> Result<()
 /// Start the browser binary directly (not `open -a`) so we own the PID and get
 /// a separate instance even when the regular browser is running.
 pub fn launch(browser: Browser, binary: &Path, mnt: &Path) -> Result<Child> {
+    launch_with(browser, binary, mnt, false)
+}
+
+/// Like [`launch`]; `portable_keys` makes Brave use a Mac-independent key
+/// for cookies and saved passwords (`--use-mock-keychain`, see portable.rs).
+pub fn launch_with(
+    browser: Browser,
+    binary: &Path,
+    mnt: &Path,
+    portable_keys: bool,
+) -> Result<Child> {
     if !binary.is_file() {
         return Err(Error::BrowserMissing);
     }
-    let args = launch_args(browser, mnt)?;
+    let mut args = launch_args(browser, mnt)?;
+    if portable_keys && browser == Browser::Brave {
+        args.push(crate::portable::MOCK_KEYCHAIN_FLAG.into());
+    }
     Command::new(binary)
         .args(args)
         .envs(launch_env(browser))

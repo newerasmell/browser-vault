@@ -129,6 +129,14 @@ const mock = {
   action_add_fido2: async ({ label }) => { emit('fido_touch_needed'); await wait(900); emit('fido_touch_done'); return { label }; },
   action_recovery_generate: async () => ({ words: 'abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual'.split(' ') }),
   action_recovery_confirm: async ({ answers }) => ({ ok: Object.values(answers).every((w) => w.length > 2) }),
+  action_auth_recovery: async ({ id, phrase }) => {
+    const v = vaults.find((x) => x.id === id);
+    if ((phrase || '').trim().split(/\s+/).length !== 24) throw { code: 'unlock_failed' };
+    return { token: 'demo', mode: v.mode, keys: [] };
+  },
+  action_reset_begin: async () => ({ secret: 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP', qrSvg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#000"/></svg>' }),
+  action_reset_confirm: async ({ code }) => ({ ok: code === '123456' }),
+  action_make_portable: async () => { await wait(800); return { converted: 42, failed: 0 }; },
   action_end: async () => {},
 
   detect_profiles: async ({ browser }) => browser === 'brave'

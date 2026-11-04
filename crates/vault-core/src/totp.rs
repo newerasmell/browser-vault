@@ -348,6 +348,60 @@ pub fn confirm(draft: &mut Draft, code: &str, _se: &dyn SecureEnclave, now: u64)
     Ok(())
 }
 
+/// New Mac / forgotten password: after unlocking with the RECOVERY PHRASE
+/// (`key`), set a new password AND a new authenticator bound to this Mac's
+/// Secure Enclave in one step. `pending` comes from [`replace_begin`]; the
+/// first code from the new app confirms it. The old TOTP slot (whose SE key
+/// may live on another Mac) is replaced.
+pub fn reset_with_recovery(
+    header: &mut Header,
+    key: &UnlockedKey,
+    new_password: &str,
+    pending: &PendingTotp,
+    code: &str,
+    now: u64,
+) -> Result<()> {
+    keyslot::validate_password(new_password)?;
+    if !header.verify_mac(key.vmk()) {
+        return Err(Error::Invalid("header was modified outside the app"));
+    }
+    if header
+        .slots
+        .iter()
+        .any(|s| !matches!(s, Slot::Totp { .. } | Slot::Recovery { .. }))
+    {
+        return Err(Error::Unsupported(
+            "authenticator reset for vaults with other factors",
+        ));
+    }
+    let d = slot_data(header).ok_or(Error::Invalid("vault has no authenticator slot"))?;
+    let counter = matching_counter(&pending.seed, code, now, 0).ok_or(Error::UnlockFailed)?;
+    let mut kdf = header.kdf.clone();
+    kdf.salt = crypto::random_bytes::<16>().into();
+    let pw = kdf.derive(new_password.as_bytes())?;
+    let kek = factor_kek(&pw, pending.se_secret.as_ref(), KIND);
+    let (nonce, wrapped_vmk) = keyslot::wrap_slot(&header.vault_id, KIND, &kek, key.vmk())?;
+    let state = State {
+        last_counter: counter,
+        failures: 0,
+        locked_until: 0,
+    };
+    header.kdf = kdf;
+    header.slots[d.index] = Slot::Totp {
+        se_key_tag: pending.key.tag.clone(),
+        se_key_blob: pending.key.blob.clone().map(B64),
+        wrapped_se_secret: B64(pending.wrapped_se_secret.clone()),
+        wrapped_seed: B64(pending.wrapped_seed.clone()),
+        last_counter: state.last_counter,
+        failures: state.failures,
+        locked_until: state.locked_until,
+        state_mac: state_mac(&pending.seed, &header.vault_id, &state),
+        nonce,
+        wrapped_vmk,
+    };
+    header.seal_mac(key.vmk())
+}
+
 /// Immutable parts of the TOTP slot, copied out so the header can be mutated.
 struct SlotData {
     index: usize,
@@ -627,6 +681,48 @@ mod tests {
 
     fn state(h: &Header) -> State {
         slot_data(h).unwrap().state
+    }
+
+    #[test]
+    fn recovery_reset_on_another_mac() {
+        let v = vault();
+        // "New Mac": a different Secure Enclave can't open the old slot.
+        let other_mac = MockSecureEnclave::new();
+        let mut h = v.header.clone();
+        assert!(unlock(&mut h, PW, &code_at(&v.seed, T0), &other_mac, T0).is_err());
+        let mut h = v.header.clone();
+        let key = unlock_with_recovery(&h, &v.phrase).unwrap();
+        let (setup, pending) = replace_begin(&h, &other_mac).unwrap();
+        let seed = Secret::try_from_base32(setup.secret.as_str())
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        assert!(
+            reset_with_recovery(&mut h, &key, "short", &pending, &code_at(&seed, T0), T0).is_err()
+        );
+        reset_with_recovery(
+            &mut h,
+            &key,
+            "new mac passphrase",
+            &pending,
+            &code_at(&seed, T0),
+            T0,
+        )
+        .unwrap();
+        assert!(h.verify_mac(key.vmk()));
+        let mut h2 = h.clone();
+        assert!(unlock(&mut h2, PW, &code_at(&seed, T0 + 60), &other_mac, T0 + 60).is_err());
+        let mut h2 = h.clone();
+        let k2 = unlock(
+            &mut h2,
+            "new mac passphrase",
+            &code_at(&seed, T0 + 60),
+            &other_mac,
+            T0 + 60,
+        )
+        .unwrap();
+        assert_eq!(**k2.vmk(), *v.vmk);
+        assert!(unlock_with_recovery(&h, &v.phrase).is_ok());
     }
 
     #[test]

@@ -52,7 +52,8 @@ fn system_language() -> String {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            language: "bg".into(),
+            // First run follows the macOS language (see `system_language`).
+            language: system_language(),
             launch_at_login: false,
             idle_minutes: 15,
             lock_on_screen_lock: true,
@@ -81,10 +82,7 @@ impl Settings {
         fs::read(dir.join(FILE_NAME))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_else(|| Settings {
-                language: system_language(),
-                ..Settings::default()
-            })
+            .unwrap_or_default()
     }
 
     /// Atomic write (temp → fsync → rename), mode 600.

@@ -254,3 +254,57 @@ fn dir_contains(dir: &Path, needle: &[u8]) -> bool {
         .unwrap();
     !out.stdout.is_empty()
 }
+
+/// Portable Brave logins: Brave started with `--use-mock-keychain` must
+/// encrypt cookies with the Mac-independent key that `chromium.rs`
+/// implements (proves both the flag and our v10 decoder on real Brave).
+#[test]
+#[ignore = "needs macOS + Brave; opens a browser window (see file header)"]
+fn brave_mock_keychain_cookie_uses_portable_key() {
+    use std::io::{Read, Write};
+    use vault_core::chromium::{self, ChromiumKey};
+
+    let brave = browser::detect(Browser::Brave).expect("Brave must be installed");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in listener.incoming().flatten().take(8) {
+            let mut s = s;
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nSet-Cookie: bvtest=portable-hello; Max-Age=3600; Path=/\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        }
+    });
+
+    let d = tempfile::tempdir().unwrap();
+    let mnt = d.path();
+    std::fs::create_dir_all(browser::profile_dir(mnt)).unwrap();
+    std::fs::create_dir_all(browser::cache_dir(mnt)).unwrap();
+    let mut args = browser::launch_args(Browser::Brave, mnt).unwrap();
+    args.push(vault_core::portable::MOCK_KEYCHAIN_FLAG.into());
+    args.push(format!("http://127.0.0.1:{port}/").into());
+    let mut child = Command::new(&brave).args(args).spawn().unwrap();
+    std::thread::sleep(Duration::from_secs(12));
+    browser::terminate(child.id() as i32, Duration::from_secs(8));
+    let _ = child.wait();
+
+    let profile = browser::profile_dir(mnt).join("Default");
+    let db = [profile.join("Network/Cookies"), profile.join("Cookies")]
+        .into_iter()
+        .find(|p| p.is_file())
+        .expect("Brave wrote a cookie database");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT encrypted_value FROM cookies WHERE name = 'bvtest'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("cookie stored");
+    assert!(chromium::is_v10(&blob), "cookie is v10-encrypted");
+    let pt = chromium::decrypt(&ChromiumKey::mock(), &blob).expect("portable key opens it");
+    // Newer Chromium prefixes SHA-256(host) (32 bytes) to the value.
+    assert!(pt.ends_with(b"portable-hello"), "decrypted value");
+}

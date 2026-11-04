@@ -2,6 +2,7 @@
 //! control. See `docs/SPEC.md` — it is the source of truth.
 
 pub mod browser;
+pub mod chromium;
 pub mod crypto;
 pub mod error;
 pub mod events;
@@ -10,6 +11,7 @@ pub mod hdiutil;
 pub mod header;
 pub mod keyslot;
 pub mod lock;
+pub mod portable;
 pub mod profiles;
 pub mod recovery;
 pub mod se;
