@@ -98,7 +98,10 @@ fn key_loop(app: AppHandle) {
         previous.retain(|(id, g), _| open.iter().any(|(i, gg, ..)| i == id && gg == g));
         let global = lock(&st.settings).lock_on_key_removal;
         for (id, generation, header, vault_enabled) in open {
-            let now = vault_core::fido2::key_present(&header, st.fido.as_ref());
+            // IOKit registry only — never open the HID device while polling
+            // (pulling the key out mid-probe crashed the app via hidapi).
+            let _ = &header;
+            let now = vault_core::fido2::fido_hid_present();
             let prev = previous.insert((id.clone(), generation), now);
             if key_removed(prev, now) && global && vault_enabled {
                 let app = app.clone();

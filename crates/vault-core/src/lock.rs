@@ -268,6 +268,50 @@ fn pid_file(store: &Store, id: &str) -> PathBuf {
     store.root().join("run").join(format!("{id}.pid"))
 }
 
+/// Crash guard: a tiny detached shell process that outlives the app. While
+/// the vault stays mounted it waits; if the app process dies first (crash,
+/// force quit), it stops the vault's browser (only if that PID's command
+/// line points into the vault) and force-detaches the volume. It exits on
+/// its own once the vault is locked normally (mount gone). Arguments are a
+/// PID and a path — no secrets.
+pub fn spawn_crash_guard(app_pid: u32, browser_pid: u32, mnt: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    const SCRIPT: &str = r#"
+APP="$1"; BR="$2"; MNT="$3"
+mounted() { /sbin/mount | /usr/bin/grep -qF " on $MNT ("; }
+while kill -0 "$APP" 2>/dev/null; do
+  mounted || exit 0
+  sleep 1
+done
+mounted || exit 0
+if /bin/ps -p "$BR" -o command= 2>/dev/null | /usr/bin/grep -qF "$MNT"; then
+  kill -TERM "$BR" 2>/dev/null
+  i=0; while kill -0 "$BR" 2>/dev/null && [ $i -lt 8 ]; do sleep 1; i=$((i+1)); done
+  kill -KILL "$BR" 2>/dev/null
+fi
+for n in 1 2 3; do
+  /usr/bin/hdiutil detach "$MNT" -force >/dev/null 2>&1 && exit 0
+  mounted || exit 0
+  sleep 1
+done
+"#;
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(SCRIPT)
+        .arg("bv-crash-guard")
+        .arg(app_pid.to_string())
+        .arg(browser_pid.to_string())
+        .arg(mnt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Own process group: not killed together with the app.
+        .process_group(0)
+        .spawn()?;
+    crate::trace::emit(&format!("crash guard started for {}", mnt.display()));
+    Ok(())
+}
+
 /// SPEC §6: at startup, detach leftover `BV-*` volumes from a crash.
 /// Returns the vault ids that were recovered.
 ///

@@ -540,6 +540,35 @@ pub fn apply_password_change(
     header.seal_mac(key.vmk())
 }
 
+/// Whether ANY FIDO security key is attached, from the IOKit registry
+/// (`ioreg`, HID primary usage page 0xF1D0 = FIDO). Never opens the device:
+/// polling through hidapi crashed the app when the key was pulled out
+/// mid-probe. Used for the removal trigger (present → absent locks).
+#[cfg(target_os = "macos")]
+pub fn fido_hid_present() -> bool {
+    std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-r", "-c", "IOHIDDevice", "-d", "1"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| ioreg_has_fido(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn fido_hid_present() -> bool {
+    false
+}
+
+/// `ioreg` output contains a HID device with the FIDO usage page.
+pub fn ioreg_has_fido(out: &str) -> bool {
+    out.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with("\"PrimaryUsagePage\"") && l.ends_with("= 61904")
+            || l.starts_with("\"DeviceUsagePairs\"") && l.contains("\"DeviceUsagePage\"=61904")
+    })
+}
+
 /// SPEC §6 trigger 4: whether one of the vault's registered keys is plugged
 /// in. Uses a silent probe (no PIN, no touch). The app polls this (about
 /// every 2 s) while a fido2 vault is unlocked and locks when it turns
@@ -1098,6 +1127,24 @@ mod tests {
 
     fn failed<T: fmt::Debug>(r: Result<T>) -> bool {
         matches!(r, Err(Error::UnlockFailed))
+    }
+
+    #[test]
+    fn ioreg_fido_detection() {
+        let with = r#"+-o IOHIDDevice  <class IOHIDDevice>
+    {
+      "Product" = "YubiKey OTP+FIDO+CCID"
+      "PrimaryUsagePage" = 61904
+      "VendorID" = 4176
+    }"#;
+        let without = r#"+-o IOHIDDevice  <class IOHIDDevice>
+    {
+      "Product" = "Apple Internal Keyboard"
+      "PrimaryUsagePage" = 1
+    }"#;
+        assert!(ioreg_has_fido(with));
+        assert!(!ioreg_has_fido(without));
+        assert!(!ioreg_has_fido(""));
     }
 
     #[test]

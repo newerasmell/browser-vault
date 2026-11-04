@@ -308,3 +308,45 @@ fn brave_mock_keychain_cookie_uses_portable_key() {
     // Newer Chromium prefixes SHA-256(host) (32 bytes) to the value.
     assert!(pt.ends_with(b"portable-hello"), "decrypted value");
 }
+
+/// SPEC §6 crash safety: if the app dies while a vault is open, the detached
+/// crash guard stops the vault's browser and detaches the volume.
+#[test]
+#[ignore = "needs macOS hdiutil; run manually (see file header)"]
+fn crash_guard_locks_vault_when_app_dies() {
+    let (_d, s) = store();
+    let (id, _phrase) = create(&s, "Guard", Browser::Brave);
+    let u = s.unlock(&id, Credential::Password(PW), &devs()).unwrap();
+    let mnt = u.mountpoint.clone();
+    assert!(hdiutil::is_mounted(&mnt));
+
+    // Stand-ins: an "app" process and a "browser" whose command line points
+    // into the vault (like the real one: --user-data-dir=<mnt>/profile).
+    let mut app = Command::new("sleep").arg("600").spawn().unwrap();
+    let mut br = Command::new("/bin/sh")
+        .args(["-c", "sleep 600; :"])
+        .arg(mnt.join("profile"))
+        .spawn()
+        .unwrap();
+    vault_core::lock::spawn_crash_guard(app.id(), br.id(), &mnt).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(hdiutil::is_mounted(&mnt), "guard waits while the app lives");
+
+    // "Crash" the app.
+    app.kill().unwrap();
+    let _ = app.wait();
+    let reaper = std::thread::spawn(move || br.wait());
+    let start = std::time::Instant::now();
+    while hdiutil::is_mounted(&mnt) && start.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        !hdiutil::is_mounted(&mnt),
+        "volume detached after the app died"
+    );
+    assert!(
+        reaper.join().unwrap().is_ok(),
+        "browser stand-in was stopped"
+    );
+    drop(u);
+}

@@ -402,6 +402,13 @@ fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
         },
     );
     lock(&st.errors).remove(id);
+    // If this app ever dies while the vault is open, a detached guard
+    // stops the vault's browser and detaches the volume (SPEC §6).
+    if let Err(e) =
+        vault_core::lock::spawn_crash_guard(std::process::id(), pid, &st.store.mountpoint(id))
+    {
+        crate::applog::log(&format!("crash guard not started: {e}"));
+    }
     triggers::watch_browser(app.clone(), id.to_string(), generation, child);
     lockctl::vaults_changed(app);
     // An action that asked for this unlock (cleanup, keep, delete) resumes
