@@ -251,8 +251,14 @@ async function viewUnlock(params) {
   return el;
 }
 
+// Import of every Brave profile: importProfileId '*'; the core records
+// profileName "All profiles (N)" (profiles::all_profiles_name).
+const ALL_PROFILES = '*';
+const allCount = (name) => +(/^All profiles \((\d+)\)$/.exec(name || '') || [])[1] || 0;
+const profileLabel = (name) => (allCount(name) ? t('all_profiles', { n: allCount(name) }) : name);
+
 // ---------- WIZARD ----------
-const STEPS = ['basics', 'password', 'factor', 'recovery', 'options', 'create'];
+const STEPS =['basics', 'password', 'factor', 'recovery', 'options', 'create'];
 
 async function viewWizard() {
   const browsers = await api('detect_browsers');
@@ -460,7 +466,20 @@ async function viewWizard() {
   }
 
   // 5. options
+  // Brave with ≥2 profiles: first choice imports all of them into this vault.
+  function importChoices() {
+    const list = profiles[w.browser];
+    const out = list.map((pr) => ({ id: pr.id, label: `${pr.name} · ${fmtSize(pr.sizeMb)}` }));
+    if (w.browser === 'brave' && list.length >= 2) {
+      const total = list.reduce((s, pr) => s + pr.sizeMb, 0);
+      out.unshift({ id: ALL_PROFILES, label: `${t('import_all_option', { n: list.length })} · ${fmtSize(total)}` });
+    }
+    return out;
+  }
+
   function options() {
+    const choices = importChoices();
+    if (!choices.some((c) => c.id === w.importProfileId)) w.importProfileId = choices[0]?.id ?? null;
     const sizeVal = h('output', {}, w.sizeGb + ' GB');
     return h('form', { class: 'form' },
       h('div', { class: 'field' },
@@ -474,11 +493,12 @@ async function viewWizard() {
         w.mode === 'fido2' && toggle(t('lock_key_removal'), w.lockOnKeyRemoval, (v) => (w.lockOnKeyRemoval = v)),
         w.browser === 'firefox' && toggle(t('disable_fxa'), w.disableFxa, (v) => (w.disableFxa = v)),
         toggle(t('import_profile', { browser: BROWSERS[w.browser] }), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_hint')),
-        w.importProfile && profiles[w.browser].length && h('div', { class: 'toggle-row' },
+        w.importProfile && choices.length && h('div', { class: 'toggle-row' },
           h('span', { class: 'toggle-text' }, t('import_which')),
-          h('select', { class: 'input select', onchange: (e) => (w.importProfileId = e.target.value) },
-            profiles[w.browser].map((pr) => h('option', { value: pr.id, selected: pr.id === (w.importProfileId ||= profiles[w.browser][0].id) },
-              `${pr.name} · ${fmtSize(pr.sizeMb)}`))))),
+          h('select', { class: 'input select', onchange: (e) => { w.importProfileId = e.target.value; render(); } },
+            choices.map((c) => h('option', { value: c.id, selected: c.id === w.importProfileId }, c.label)))),
+        w.importProfile && w.importProfileId === ALL_PROFILES &&
+          h('small', { class: 'muted block', style: 'padding:0 12px 10px;margin-top:-4px' }, t('import_all_hint', { browser: BROWSERS[w.browser] }))),
       h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('sync_warn_title')), ' ', t('sync_warn_body'))),
       nav(true, (e) => { e.preventDefault(); go(5); }, t('create_vault')));
   }
@@ -490,7 +510,10 @@ async function viewWizard() {
         h('div', { class: 'finish-art' }, icon('check', 'xl')),
         h('h2', {}, t('done_title')),
         h('p', { class: 'muted' }, t('done_body', { name: w.name })),
-        w.importProfile && h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, t('done_import_note'))),
+        w.importProfile && h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {},
+          w.importProfileId === ALL_PROFILES
+            ? t('done_import_all_note', { n: profiles[w.browser].length, browser: BROWSERS[w.browser] })
+            : t('done_import_note'))),
         h('div', { class: 'wiz-nav center' },
           h('button', { class: 'btn ghost', onclick: () => api('close_window') }, t('close')),
           h('button', { class: 'btn primary', onclick: () => api('open_window', { view: 'unlock', params: { id: w.vaultId } }) }, t('open_now'))));
@@ -613,7 +636,8 @@ async function viewSettings(params) {
     }
     return h('div', { class: 'callout warn col' },
       h('div', { class: 'row' }, icon('alert', 'sm'), h('strong', {}, t('original_pending'))),
-      h('p', {}, t('original_pending_body', { browser: BROWSERS[v.browser], profile: o.profileName, size: fmtSize(o.sizeMb) })),
+      h('p', {}, t(allCount(o.profileName) ? 'original_pending_all_body' : 'original_pending_body',
+        { browser: BROWSERS[v.browser], profile: o.profileName, n: allCount(o.profileName), size: fmtSize(o.sizeMb) })),
       !o.reviewed && h('p', { class: 'muted' }, t('not_reviewed_hint')),
       h('div', { class: 'row' }, del,
         h('button', { class: 'btn sm ghost', onclick: async () => { await api('keep_original', { id: v.id }); route(); } }, t('keep_original'))));
@@ -1065,11 +1089,11 @@ async function viewCleanup(params) {
       }
     } },
       h('div', { class: 'row' }, h('div', { class: 'lock-art danger' }, icon('alert', 'lg')),
-        h('div', {}, h('h1', {}, t('cleanup_title')), h('p', { class: 'vault-chip' }, badge(v.browser), `${B} · ${info.profileName}`))),
+        h('div', {}, h('h1', {}, t('cleanup_title')), h('p', { class: 'vault-chip' }, badge(v.browser), `${B} · ${profileLabel(info.profileName)}`))),
       h('p', {}, t('cleanup_intro')),
       h('div', { class: 'field' }, h('span', {}, t('will_delete', { size: fmtSize(info.sizeMb) })),
         h('ul', { class: 'paths' }, info.items.map((p) => h('li', {}, p))),
-        h('small', { class: 'muted' }, t('other_profiles_safe', { browser: B }))),
+        h('small', { class: 'muted' }, t(allCount(info.profileName) ? 'other_profiles_later_safe' : 'other_profiles_safe', { browser: B }))),
       h('ul', { class: 'checklist' },
         req(info.reviewed, t('req_reviewed'), !info.reviewed && h('small', { class: 'muted block' }, t('not_reviewed_hint'))),
         req(!running, t('req_closed', { browser: B }), running && h('button', { class: 'btn sm ghost', type: 'button', onclick: async () => {

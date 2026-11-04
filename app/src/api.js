@@ -39,6 +39,11 @@ let settings = {
 const WORDS = 'orbit velvet canyon mirror stable pepper ladder violin thunder cotton harbor magnet ' +
   'silver planet frozen meadow rocket island garden copper winter shadow bamboo lantern';
 let fails = 0;
+const MOCK_PROFILES = {
+  brave: [{ id: 'Default', name: 'Default', sizeMb: 842 }, { id: 'Profile 1', name: 'Work', sizeMb: 311 },
+    { id: 'Profile 2', name: 'Ads', sizeMb: 204 }],
+  firefox: [{ id: 'default-release', name: 'default-release', sizeMb: 516 }]
+};
 // Spec 5.1: "reviewed" becomes true after the vault was opened and closed once after import.
 const markLocked = (v) => { if (v.status === 'unlocked' && v.original) v.original.reviewed = true; v.status = 'locked'; };
 
@@ -100,8 +105,14 @@ const mock = {
     }
     emit('create_progress', { stage: 'done', pct: 100 });
     const id = 'v' + (vaults.length + 1);
+    // Mirrors vault-core: '*' = every Brave profile, recorded as "All profiles (N)".
+    const all = options.importProfileId === '*';
+    const found = all ? MOCK_PROFILES.brave : [];
     vaults.push({ id, name, browser, mode, status: 'locked', sizeGb,
-      original: options.importProfile ? { profileName: options.importProfileId, sizeMb: 300, reviewed: false, state: 'pending' } : null });
+      original: options.importProfile ? {
+        profileName: all ? `All profiles (${found.length})` : options.importProfileId,
+        profileIds: all ? found.map((p) => p.id) : [options.importProfileId],
+        sizeMb: all ? found.reduce((s, p) => s + p.sizeMb, 0) : 300, reviewed: false, state: 'pending' } : null });
     emit('vaults_changed');
     return { vaultId: id };
   },
@@ -139,16 +150,15 @@ const mock = {
   action_make_portable: async () => { await wait(800); return { converted: 42, failed: 0 }; },
   action_end: async () => {},
 
-  detect_profiles: async ({ browser }) => browser === 'brave'
-    ? [{ id: 'Default', name: 'Default', sizeMb: 842 }, { id: 'Profile 1', name: 'Work', sizeMb: 311 }]
-    : [{ id: 'default-release', name: 'default-release', sizeMb: 516 }],
+  detect_profiles: async ({ browser }) => structuredClone(MOCK_PROFILES[browser] || []),
   browser_running: async () => ({ running: false }),
   cleanup_preview: async ({ id }) => {
     const v = vaults.find((x) => x.id === id);
     const home = '/Users/you/Library';
     const items = v.browser === 'brave'
-      ? [`${home}/Application Support/BraveSoftware/Brave-Browser/${v.original.profileName}`,
-         `${home}/Caches/BraveSoftware/Brave-Browser/${v.original.profileName}`,
+      ? [...(v.original.profileIds || [v.original.profileName]).flatMap((p) => [
+          `${home}/Application Support/BraveSoftware/Brave-Browser/${p}`,
+          `${home}/Caches/BraveSoftware/Brave-Browser/${p}`]),
          `${home}/Saved Application State/com.brave.Browser.savedState`]
       : [`${home}/Application Support/Firefox/Profiles/x7k2.${v.original.profileName}`,
          `${home}/Caches/Firefox/Profiles/x7k2.${v.original.profileName}`,

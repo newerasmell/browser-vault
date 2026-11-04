@@ -46,6 +46,17 @@ pub struct DetectedProfile {
     pub path: PathBuf,
 }
 
+/// `profile_id` meaning "every Brave profile into one vault" (Brave only).
+/// Each profile keeps its directory name inside the vault, and a reduced
+/// `Local State` is written so Brave's profile switcher knows them all.
+pub const ALL_PROFILES: &str = "*";
+
+/// `original.profile_name` for an import of all profiles. The UI recognises
+/// this exact form to show a translated label.
+pub fn all_profiles_name(n: usize) -> String {
+    format!("All profiles ({n})")
+}
+
 /// Where the regular browsers keep their data, plus the live probes. The
 /// app uses [`Roots::system`]; tests point `home` at a temp dir and replace
 /// the probes.
@@ -181,7 +192,7 @@ fn find_profile(roots: &Roots, browser: Browser, id: &str) -> Result<DetectedPro
 fn check_brave_id(id: &str) -> Result<()> {
     let mut c = Path::new(id).components();
     match (c.next(), c.next()) {
-        (Some(Component::Normal(_)), None) if !id.starts_with('.') => Ok(()),
+        (Some(Component::Normal(_)), None) if !id.starts_with('.') && id != ALL_PROFILES => Ok(()),
         _ => Err(Error::Invalid("bad profile id")),
     }
 }
@@ -345,8 +356,14 @@ pub(crate) fn import_with_hook(
     notify: Notify<'_>,
     after_copy: &dyn Fn(&Path),
 ) -> Result<Original> {
+    if profile_id == ALL_PROFILES && browser != Browser::Brave {
+        return Err(Error::Invalid("only Brave can import all profiles"));
+    }
     if (roots.browser_running)(browser) {
         return Err(Error::BrowserRunning);
+    }
+    if profile_id == ALL_PROFILES {
+        return import_all_brave(roots, mnt, notify, after_copy);
     }
     let src = find_profile(roots, browser, profile_id)?;
     let dst = import_destination(browser, mnt);
@@ -380,10 +397,19 @@ pub(crate) fn import_with_hook(
         return Err(e);
     }
     let targets = targets(roots, browser, profile_id)?;
-    Ok(Original {
+    Ok(pending_original(browser, profile_id, src.name, &targets))
+}
+
+fn pending_original(
+    browser: Browser,
+    profile_id: &str,
+    profile_name: String,
+    targets: &CleanupTargets,
+) -> Original {
+    Original {
         browser,
         profile_id: profile_id.to_string(),
-        profile_name: src.name,
+        profile_name,
         paths: targets
             .items()
             .iter()
@@ -394,7 +420,146 @@ pub(crate) fn import_with_hook(
         reviewed: false,
         state: OriginalState::Pending,
         deleted_at: None,
-    })
+    }
+}
+
+/// [`ALL_PROFILES`]: copy every Brave profile listed in `Local State` (and
+/// present on disk) to `<mnt>/profile/<same dir name>`, verify each copy like
+/// a single import, and write a reduced vault `Local State` (see
+/// [`vault_local_state`]). Any mismatch aborts the whole import and empties
+/// the vault profile again.
+fn import_all_brave(
+    roots: &Roots,
+    mnt: &Path,
+    notify: Notify<'_>,
+    after_copy: &dyn Fn(&Path),
+) -> Result<Original> {
+    let found = detect_profiles_in(roots, Browser::Brave)?;
+    if found.is_empty() {
+        return Err(Error::NotFound);
+    }
+    let root = browser::profile_dir(mnt);
+    if fs::read_dir(&root)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false)
+    {
+        return Err(Error::Invalid("the vault profile is not empty"));
+    }
+    let keys = key_files(Browser::Brave);
+    let want = found
+        .iter()
+        .map(|p| Manifest::of(&p.path, keys))
+        .collect::<Result<Vec<_>>>()?;
+    let total = want.iter().map(|m| m.size).sum::<u64>().max(1);
+    let ids: Vec<String> = found.iter().map(|p| p.id.clone()).collect();
+    let mut copied = 0u64;
+    let result = (|| {
+        for p in &found {
+            copy_tree(&p.path, &root.join(&p.id), &mut |n| {
+                copied += n;
+                notify(Event::CreateProgress {
+                    stage: CreateStage::Import,
+                    pct: 80 + (copied.min(total) * 15 / total) as u8,
+                });
+            })?;
+        }
+        after_copy(&root);
+        for (p, w) in found.iter().zip(&want) {
+            if Manifest::of(&root.join(&p.id), keys)? != *w {
+                return Err(Error::Invalid("imported copy does not match the original"));
+            }
+        }
+        let ls = read_json(&roots.brave_data().join("Local State"))?.ok_or(Error::NotFound)?;
+        write_private(
+            &root.join("Local State"),
+            &serde_json::to_vec_pretty(&vault_local_state(&ls, &ids))?,
+        )
+    })();
+    if let Err(e) = result {
+        clear_dir(&root)?;
+        return Err(e);
+    }
+    let targets = brave_targets(roots, &ids)?;
+    Ok(pending_original(
+        Browser::Brave,
+        ALL_PROFILES,
+        all_profiles_name(ids.len()),
+        &targets,
+    ))
+}
+
+/// `Local State` for a vault that holds several Brave profiles: only the
+/// `profile` keys the profile switcher needs, restricted to `ids`:
+/// `info_cache` (names, avatars …), `profiles_order`, `last_used`,
+/// `last_active_profiles` and `profiles_created` (so a profile added later
+/// in the vault gets a fresh `Profile N`). Everything else is dropped on
+/// purpose: `os_crypt` (on macOS the key is in the Keychain anyway),
+/// `variations_*` seeds, `user_experience_metrics` / `uninstall_metrics`
+/// client ids, `brave.stats` / referral / P3A ids, hardware and
+/// install-specific state, flags (`browser.enabled_labs_experiments`).
+/// Brave recreates whatever it needs with fresh values.
+fn vault_local_state(ls: &serde_json::Value, ids: &[String]) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let kept = |id: &str| ids.iter().any(|i| i == id);
+    let src = ls.get("profile").and_then(Value::as_object);
+    let get = |k: &str| src.and_then(|p| p.get(k));
+    let mut profile = Map::new();
+    let cache: Map<String, Value> = get("info_cache")
+        .and_then(Value::as_object)
+        .map(|c| {
+            c.iter()
+                .filter(|(k, _)| kept(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    profile.insert("info_cache".into(), Value::Object(cache));
+    for k in ["profiles_order", "last_active_profiles"] {
+        if let Some(a) = get(k).and_then(Value::as_array) {
+            let a: Vec<Value> = a
+                .iter()
+                .filter(|v| v.as_str().is_some_and(kept))
+                .cloned()
+                .collect();
+            profile.insert(k.into(), Value::Array(a));
+        }
+    }
+    let last_used = get("last_used")
+        .and_then(Value::as_str)
+        .filter(|s| kept(s))
+        .map(str::to_string)
+        .or_else(|| ids.iter().find(|i| *i == "Default").cloned())
+        .or_else(|| ids.first().cloned());
+    if let Some(l) = last_used {
+        profile.insert("last_used".into(), l.into());
+    }
+    let highest = ids
+        .iter()
+        .filter_map(|i| i.strip_prefix("Profile ")?.parse::<u64>().ok())
+        .map(|n| n + 1)
+        .max()
+        .unwrap_or(1);
+    let created = get("profiles_created")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .max(highest)
+        .max(ids.len() as u64);
+    profile.insert("profiles_created".into(), created.into());
+    serde_json::json!({ "profile": profile })
+}
+
+/// Write a new file readable only by the user (inside the vault).
+fn write_private(p: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(p)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// Relative path → size of every regular file, plus SHA-256 of key files.
@@ -617,24 +782,23 @@ pub fn undo_keep_original(store: &Store, session: &mut Unlocked) -> Result<()> {
 /// Exactly what [`cleanup_original`] deletes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupTargets {
-    pub profile_dir: PathBuf,
-    pub cache_dir: Option<PathBuf>,
+    /// Each profile dir with its cache dir (when the cache lives outside it).
+    /// One entry, or every imported profile for [`ALL_PROFILES`].
+    pub profiles: Vec<(PathBuf, Option<PathBuf>)>,
     pub saved_state: PathBuf,
 }
 
 impl CleanupTargets {
     /// Paths that currently exist and will be deleted.
     pub fn items(&self) -> Vec<PathBuf> {
-        [
-            Some(&self.profile_dir),
-            self.cache_dir.as_ref(),
-            Some(&self.saved_state),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|p| fs::symlink_metadata(p).is_ok())
-        .cloned()
-        .collect()
+        self.profiles
+            .iter()
+            .flat_map(|(p, c)| [Some(p), c.as_ref()])
+            .chain([Some(&self.saved_state)])
+            .flatten()
+            .filter(|p| fs::symlink_metadata(p).is_ok())
+            .cloned()
+            .collect()
     }
 
     pub fn size(&self) -> u64 {
@@ -643,19 +807,16 @@ impl CleanupTargets {
 }
 
 /// Recomputed from the browser's own config + `profile_id` every time (not
-/// from `original.paths`), with the id validated.
+/// from `original.paths`), with the id validated. For [`ALL_PROFILES`] see
+/// [`targets_of`]: the ids are the dir names recorded in `paths`.
 pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<CleanupTargets> {
     let saved_state = roots.saved_state(browser);
     match browser {
-        Browser::Brave => {
-            check_brave_id(profile_id)?;
-            Ok(CleanupTargets {
-                profile_dir: roots.brave_data().join(profile_id),
-                cache_dir: Some(roots.brave_cache().join(profile_id)),
-                saved_state,
-            })
-        }
+        Browser::Brave => brave_targets(roots, &[profile_id.to_string()]),
         Browser::Firefox => {
+            if profile_id == ALL_PROFILES {
+                return Err(Error::Invalid("bad profile path"));
+            }
             let rel = firefox_is_relative(roots, profile_id)?;
             let profile_dir = firefox_profile_dir(roots, profile_id, rel.as_deref())?;
             // Relative profiles keep their cache under Caches/Firefox/<Path>;
@@ -663,8 +824,7 @@ pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<Clea
             let cache_dir = (rel.as_deref().map(str::trim) != Some("0"))
                 .then(|| roots.firefox_cache().join(profile_id));
             Ok(CleanupTargets {
-                profile_dir,
-                cache_dir,
+                profiles: vec![(profile_dir, cache_dir)],
                 saved_state,
             })
         }
@@ -674,6 +834,72 @@ pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<Clea
 /// The vault was added from a backup: its imported original lives on
 /// another Mac; nothing on this Mac may be deleted for it.
 pub const ERR_ORIGINAL_ELSEWHERE: &str = "the original profile is on another Mac";
+
+/// Brave profile dirs + their caches for validated ids.
+fn brave_targets(roots: &Roots, ids: &[String]) -> Result<CleanupTargets> {
+    let profiles = ids
+        .iter()
+        .map(|id| {
+            check_brave_id(id)?;
+            Ok((
+                roots.brave_data().join(id),
+                Some(roots.brave_cache().join(id)),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    Ok(CleanupTargets {
+        profiles,
+        saved_state: roots.saved_state(Browser::Brave),
+    })
+}
+
+/// Brave profile ids an [`ALL_PROFILES`] import copied: the dir names of the
+/// recorded `paths` that sit directly in the Brave data dir (caches and
+/// Saved Application State are elsewhere and ignored). Each id is validated
+/// like a single one, and an entry that exists but is not a directory (e.g.
+/// `Local State`) is refused. Profiles created after the import are not in
+/// `paths`, so they are never targets.
+fn imported_brave_ids(roots: &Roots, o: &Original) -> Result<Vec<String>> {
+    let data = roots.brave_data();
+    let mut ids: Vec<String> = vec![];
+    for p in &o.paths {
+        let p = Path::new(p);
+        if p.parent() != Some(data.as_path()) {
+            continue;
+        }
+        let Some(id) = p.file_name().and_then(|n| n.to_str()) else {
+            return Err(Error::Invalid("bad profile id"));
+        };
+        check_brave_id(id)?;
+        if fs::symlink_metadata(p).is_ok() && !is_real_dir(p) {
+            return Err(Error::Invalid("bad profile id"));
+        }
+        if !ids.iter().any(|i| i == id) {
+            ids.push(id.to_string());
+        }
+    }
+    if ids.is_empty() {
+        return Err(Error::Invalid("no imported profiles recorded"));
+    }
+    Ok(ids)
+}
+
+/// Profile ids an original record covers (one, or all imported ones).
+fn original_ids(roots: &Roots, o: &Original) -> Result<Vec<String>> {
+    match (o.browser, o.profile_id.as_str()) {
+        (Browser::Brave, ALL_PROFILES) => imported_brave_ids(roots, o),
+        (Browser::Firefox, ALL_PROFILES) => Err(Error::Invalid("bad profile path")),
+        _ => Ok(vec![o.profile_id.clone()]),
+    }
+}
+
+/// [`targets`] for an original record, including [`ALL_PROFILES`].
+pub fn targets_of(roots: &Roots, o: &Original) -> Result<CleanupTargets> {
+    if o.profile_id == ALL_PROFILES {
+        return brave_targets(roots, &original_ids(roots, o)?);
+    }
+    targets(roots, o.browser, &o.profile_id)
+}
 
 /// `cleanup_preview` (UI.md).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,7 +923,7 @@ pub fn cleanup_preview(store: &Store, roots: &Roots, id: &str) -> Result<Cleanup
     let o = h
         .original
         .ok_or(Error::Invalid("this vault has no imported profile"))?;
-    let t = targets(roots, o.browser, &o.profile_id)?;
+    let t = targets_of(roots, &o)?;
     Ok(CleanupPreview {
         items: t.items(),
         size_bytes: t.size(),
@@ -715,8 +941,10 @@ pub fn cleanup_preview(store: &Store, roots: &Roots, id: &str) -> Result<Cleanup
 /// `reviewed` (`NotReviewed`), regular browser closed (`BrowserRunning`),
 /// vault password via the session's [`PasswordVerifier`] (`UnlockFailed`).
 /// Then backs up and edits `Local State` / `profiles.ini` + `installs.ini`,
-/// deletes the profile dir, its cache and the browser's Saved Application
-/// State permanently, and records `state: deleted`, `deleted_at`.
+/// deletes the profile dir(s) (every imported one for [`ALL_PROFILES`],
+/// never a profile created after the import), their caches and the
+/// browser's Saved Application State permanently, and records
+/// `state: deleted`, `deleted_at`.
 pub fn cleanup_original(
     store: &Store,
     roots: &Roots,
@@ -745,19 +973,24 @@ pub fn cleanup_original(
         Some(v) if v.verify(password) => {}
         _ => return Err(Error::UnlockFailed),
     }
-    let t = targets(roots, o.browser, &o.profile_id)?;
+    let ids = original_ids(roots, &o)?;
+    let t = targets_of(roots, &o)?;
     notify(Event::CleanupProgress { pct: 5 });
     match o.browser {
-        Browser::Brave => brave_forget_profile(roots, &o.profile_id)?,
+        Browser::Brave => brave_forget_profiles(roots, &ids)?,
         Browser::Firefox => firefox_forget_profile(roots, &o.profile_id)?,
     }
     notify(Event::CleanupProgress { pct: 20 });
-    remove_path(&t.profile_dir)?;
-    notify(Event::CleanupProgress { pct: 70 });
-    if let Some(c) = &t.cache_dir {
-        remove_path(c)?;
+    let n = t.profiles.len().max(1);
+    for (i, (dir, cache)) in t.profiles.iter().enumerate() {
+        remove_path(dir)?;
+        if let Some(c) = cache {
+            remove_path(c)?;
+        }
+        notify(Event::CleanupProgress {
+            pct: 20 + (65 * (i + 1) / n) as u8,
+        });
     }
-    notify(Event::CleanupProgress { pct: 85 });
     remove_path(&t.saved_state)?;
     notify(Event::CleanupProgress { pct: 95 });
     if let Some(orig) = &mut h.original {
@@ -803,10 +1036,12 @@ fn read_json(p: &Path) -> Result<Option<serde_json::Value>> {
     }
 }
 
-/// Remove `id` from `Local State`: `profile.info_cache`, `profile.last_used`
-/// (moved to a remaining profile, `Default` preferred) and
-/// `profile.last_active_profiles`. Other profiles are untouched.
-fn brave_forget_profile(roots: &Roots, id: &str) -> Result<()> {
+/// Remove `ids` from `Local State` (one backup): `profile.info_cache`,
+/// `profile.last_used` (moved to a remaining profile, `Default` preferred;
+/// dropped if none remains, Brave then recreates `Default`),
+/// `profile.last_active_profiles` and `profile.profiles_order`. Other
+/// profiles and keys are untouched.
+fn brave_forget_profiles(roots: &Roots, ids: &[String]) -> Result<()> {
     let path = roots.brave_data().join("Local State");
     let Some(mut ls) = read_json(&path)? else {
         return Ok(());
@@ -814,15 +1049,18 @@ fn brave_forget_profile(roots: &Roots, id: &str) -> Result<()> {
     let Some(profile) = ls.get_mut("profile").and_then(|p| p.as_object_mut()) else {
         return Ok(());
     };
+    let gone = |v: &serde_json::Value| v.as_str().is_some_and(|s| ids.iter().any(|i| i == s));
     let mut remaining: Vec<String> = vec![];
     if let Some(cache) = profile
         .get_mut("info_cache")
         .and_then(|c| c.as_object_mut())
     {
-        cache.remove(id);
+        for id in ids {
+            cache.remove(id);
+        }
         remaining = cache.keys().cloned().collect();
     }
-    if profile.get("last_used").and_then(|v| v.as_str()) == Some(id) {
+    if profile.get("last_used").is_some_and(gone) {
         let next = remaining
             .iter()
             .find(|k| *k == "Default")
@@ -837,11 +1075,10 @@ fn brave_forget_profile(roots: &Roots, id: &str) -> Result<()> {
             }
         }
     }
-    if let Some(a) = profile
-        .get_mut("last_active_profiles")
-        .and_then(|a| a.as_array_mut())
-    {
-        a.retain(|v| v.as_str() != Some(id));
+    for k in ["last_active_profiles", "profiles_order"] {
+        if let Some(a) = profile.get_mut(k).and_then(|a| a.as_array_mut()) {
+            a.retain(|v| !gone(v));
+        }
     }
     rewrite_with_backup(&path, &serde_json::to_vec(&ls)?)
 }

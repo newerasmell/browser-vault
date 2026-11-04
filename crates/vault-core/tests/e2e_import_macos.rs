@@ -224,6 +224,95 @@ fn m7b_brave_import_and_cleanup() {
 }
 
 #[test]
+#[ignore = "needs macOS + Brave; opens browser windows (see file header)"]
+fn m7b_brave_import_all_profiles_and_cleanup() {
+    let brave = browser::detect(Browser::Brave).expect("Brave must be installed");
+    assert!(
+        !profiles::regular_browser_running(Browser::Brave),
+        "quit Brave first"
+    );
+    let d = tempfile::tempdir().unwrap();
+    let roots = Roots::for_home(d.path().join("home"));
+    let udd = roots.brave_data();
+    fs::create_dir_all(&udd).unwrap();
+    let mut udd_arg = std::ffi::OsString::from("--user-data-dir=");
+    udd_arg.push(&udd);
+    let run_profile = |p: &str| {
+        let pd = format!("--profile-directory={p}");
+        run_for(
+            &brave,
+            &[
+                udd_arg.as_os_str(),
+                pd.as_ref(),
+                "--no-first-run".as_ref(),
+                "--no-default-browser-check".as_ref(),
+                "--disable-crash-reporter".as_ref(),
+            ],
+            &[],
+            Browser::Brave,
+            8,
+        );
+    };
+    run_profile("Default");
+    run_profile("Profile 1");
+    let ids: Vec<String> = profiles::detect_profiles_in(&roots, Browser::Brave)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(ids, ["Default", "Profile 1"]);
+
+    let s = Store::new(d.path().join("BrowserVault"));
+    let id = create_with_import(&s, &roots, Browser::Brave, profiles::ALL_PROFILES);
+    assert_eq!(
+        s.load(&id).unwrap().original.unwrap().profile_name,
+        "All profiles (2)"
+    );
+    // Created in regular Brave after the import: cleanup must not touch it.
+    run_profile("Profile 2");
+    assert!(udd.join("Profile 2/Preferences").is_file());
+
+    review_and_delete(&s, &roots, &id, &brave, |mnt| {
+        for p in ["Default", "Profile 1"] {
+            assert!(mnt.join("profile").join(p).join("Preferences").is_file());
+        }
+        let ls: serde_json::Value =
+            serde_json::from_slice(&fs::read(mnt.join("profile/Local State")).unwrap()).unwrap();
+        eprintln!("vault Local State: {ls:#}");
+        let cache = ls["profile"]["info_cache"].as_object().unwrap();
+        assert!(cache.contains_key("Default") && cache.contains_key("Profile 1"));
+        assert!(ls.get("os_crypt").is_none());
+    });
+
+    assert!(!udd.join("Default").exists());
+    assert!(!udd.join("Profile 1").exists());
+    assert!(udd.join("Profile 2/Preferences").is_file());
+    let ls: serde_json::Value =
+        serde_json::from_slice(&fs::read(udd.join("Local State")).unwrap()).unwrap();
+    let cache = ls["profile"]["info_cache"].as_object().unwrap();
+    assert_eq!(cache.keys().collect::<Vec<_>>(), ["Profile 2"]);
+    assert_eq!(ls["profile"]["last_used"], "Profile 2");
+    assert!(has_backup(&udd, "Local State"));
+
+    // Brave still starts on the regular install, with the remaining profile.
+    run_for(
+        &brave,
+        &[
+            udd_arg.as_os_str(),
+            "--no-first-run".as_ref(),
+            "--no-default-browser-check".as_ref(),
+            "--disable-crash-reporter".as_ref(),
+        ],
+        &[],
+        Browser::Brave,
+        8,
+    );
+    let ls: serde_json::Value =
+        serde_json::from_slice(&fs::read(udd.join("Local State")).unwrap()).unwrap();
+    assert!(ls["profile"]["info_cache"].get("Profile 2").is_some());
+}
+
+#[test]
 #[ignore = "needs macOS + Firefox; opens browser windows (see file header)"]
 fn m7b_firefox_import_and_cleanup() {
     let firefox = browser::detect(Browser::Firefox).expect("Firefox must be installed");
