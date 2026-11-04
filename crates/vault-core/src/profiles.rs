@@ -67,6 +67,16 @@ pub struct Roots {
     pub browser_running: fn(Browser) -> bool,
     /// FileVault on? `None` = unknown. Default: [`file_vault_enabled`].
     pub file_vault: fn() -> Option<bool>,
+    /// This Mac's Brave key, for converting an imported profile's logins to
+    /// the portable key. [`Roots::system`] reads the Keychain (macOS asks the
+    /// user once); [`Roots::for_home`] has none, so tests and fake homes
+    /// never trigger a Keychain prompt (the import then stays non-portable).
+    pub brave_key: fn() -> Result<crate::chromium::ChromiumKey>,
+}
+
+/// No Keychain access (fake homes / tests).
+pub fn no_brave_key() -> Result<crate::chromium::ChromiumKey> {
+    Err(Error::Unsupported("Keychain access disabled"))
 }
 
 impl Roots {
@@ -75,13 +85,17 @@ impl Roots {
             home: home.into(),
             browser_running: regular_browser_running,
             file_vault: file_vault_enabled,
+            brave_key: no_brave_key,
         }
     }
 
     /// The real home (`$HOME`).
     pub fn system() -> Result<Roots> {
         let home = std::env::var_os("HOME").ok_or(Error::Invalid("HOME is not set"))?;
-        Ok(Roots::for_home(home))
+        Ok(Roots {
+            brave_key: crate::portable::brave_keychain_key,
+            ..Roots::for_home(home)
+        })
     }
 
     pub fn brave_data(&self) -> PathBuf {

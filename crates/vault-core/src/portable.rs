@@ -181,7 +181,12 @@ pub fn convert_user_data(user_data: &Path, from: &ChromiumKey, to: &ChromiumKey)
 /// Convert the Brave profile(s) of a MOUNTED vault from this Mac's Keychain
 /// key to the portable key. The vault's browser must not be running.
 pub fn convert_mount(mnt: &Path) -> Result<Stats> {
-    let from = brave_keychain_key()?;
+    convert_mount_with(mnt, brave_keychain_key)
+}
+
+/// [`convert_mount`] with an explicit source-key provider (see `Roots::brave_key`).
+pub fn convert_mount_with(mnt: &Path, source_key: fn() -> Result<ChromiumKey>) -> Result<Stats> {
+    let from = source_key()?;
     let to = ChromiumKey::mock();
     if from.same_as(&to) {
         return Ok(Stats::default());

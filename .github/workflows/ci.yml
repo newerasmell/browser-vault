@@ -45,11 +45,14 @@ jobs:
       # The macos-14 (Apple Silicon) runner has a working Secure Enclave for
       # non-permanent keys, unsigned binary included.
       - name: E2E Secure Enclave (TOTP)
+        timeout-minutes: 10
         run: cargo test -p vault-core --all-features --test e2e_se -- --ignored --nocapture --test-threads=1
       - name: Install browsers
         run: brew install --cask brave-browser firefox
       - name: E2E (ignored tests)
+        timeout-minutes: 10
         run: cargo test -p vault-core --all-features --test e2e_macos -- --ignored --nocapture --test-threads=1
       - name: E2E import / cleanup (M7b, ignored tests)
+        timeout-minutes: 10
         if: success() || failure()
         run: cargo test -p vault-core --all-features --test e2e_import_macos -- --ignored --nocapture --test-threads=1

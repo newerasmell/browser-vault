@@ -311,7 +311,8 @@ impl Store {
                         // Keychain can't be read (user clicked Deny), the
                         // vault stays tied to this Mac and still works here.
                         let portable = header.browser == Browser::Brave
-                            && match crate::portable::convert_mount(&mnt) {
+                            && match crate::portable::convert_mount_with(&mnt, req.roots.brave_key)
+                            {
                                 Ok(st) => {
                                     crate::trace::emit(&format!(
                                         "portable: converted {} values ({} unreadable) in {} dbs",
