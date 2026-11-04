@@ -903,6 +903,74 @@ async function viewSettings(params) {
     authStep();
   }
 
+  // Backup to a drive / add a vault from a drive. Results stay in this
+  // window (callouts + toasts); only the folder picker is native.
+  const bk = {};        // vault id -> { busy, pct, path, err }
+  let driveNote = null; // { busy, pct } | { err } | { name, totp }
+  const bkErr = (e) => { const k = 'err_' + (e && e.code); return t(k) !== k ? t(k) : t('err_backup_io'); };
+  const bar = (pct) => { const b = h('div', { class: 'progress' }, h('i')); b.firstChild.style.width = (pct || 0) + '%'; return b; };
+
+  function backupBlock(v) {
+    const box = h('div', { class: 'backup-box' });
+    const paint = () => {
+      const st = bk[v.id] || {};
+      const locked = v.status === 'locked';
+      const btn = h('button', { class: 'btn sm ghost', disabled: !locked || st.busy, onclick: run },
+        st.busy ? t('backing_up') : t('backup_to_drive'));
+      box.replaceChildren(...[
+        h('div', { class: 'row' }, btn,
+          !locked && h('small', { class: 'muted' }, t('backup_lock_first')),
+          st.busy && st.pct == null && h('small', { class: 'muted' }, t('pick_folder_hint')),
+          st.busy && st.pct != null && h('span', { class: 'row grow' }, bar(st.pct), h('small', { class: 'muted' }, st.pct + '%'))),
+        st.path && h('div', { class: 'callout ok' }, icon('check', 'sm'),
+          h('div', { class: 'grow' }, h('p', {}, t('backup_done')), h('small', { class: 'path' }, st.path))),
+        st.err && h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', {}, st.err))].filter(Boolean));
+    };
+    async function run() {
+      bk[v.id] = { busy: true, pct: null }; paint();
+      const off = on('backup_progress', (p) => { if (p.id === v.id) { bk[v.id].pct = p.pct; paint(); } });
+      cleanup.push(off);
+      try {
+        const r = await api('backup_vault', { id: v.id });
+        bk[v.id] = r.cancelled ? {} : { path: r.path };
+        if (!r.cancelled) toast(t('backup_done_toast'));
+      } catch (e) { bk[v.id] = { err: bkErr(e) }; }
+      off(); paint();
+    }
+    paint();
+    return box;
+  }
+
+  async function addFromDrive() {
+    driveNote = { busy: true, pct: null }; render();
+    const off = on('backup_progress', (p) => { if (!p.id && driveNote?.busy) { driveNote.pct = p.pct; render(); } });
+    cleanup.push(off);
+    try {
+      const r = await api('add_vault_from_drive');
+      if (r.cancelled) driveNote = null;
+      else {
+        vaults.splice(0, vaults.length, ...(await api('list_vaults')));
+        driveNote = { name: r.name, totp: r.mode === 'totp' };
+        toast(t('add_done', { name: r.name }));
+      }
+    } catch (e) { driveNote = { err: bkErr(e) }; }
+    off(); render();
+  }
+
+  function driveCallout() {
+    const n = driveNote;
+    if (!n) return null;
+    const dismiss = h('button', { class: 'btn sm ghost', onclick: () => { driveNote = null; render(); } }, t('close'));
+    if (n.busy) {
+      return h('div', { class: 'callout col' }, h('strong', {}, t('adding_from_drive')),
+        n.pct == null ? h('small', { class: 'muted' }, t('pick_backup_hint')) : bar(n.pct));
+    }
+    if (n.err) return h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', { class: 'grow' }, n.err), dismiss);
+    return h('div', { class: 'callout ok col' },
+      h('div', { class: 'row' }, icon('check', 'sm'), h('strong', { class: 'grow' }, t('add_done', { name: n.name })), dismiss),
+      n.totp && h('p', {}, t('add_totp_note')));
+  }
+
   async function vaultsTab() {
     const cards = await Promise.all(vaults.map(async (v) => {
       const factors = await api('list_factors', { id: v.id });
@@ -923,12 +991,15 @@ async function viewSettings(params) {
           act('new_recovery', t('new_recovery')),
           v.browser === 'brave' && !v.portable && act('make_portable', t('act_portable_btn')),
           act('recovery_reset', t('act_recovery_link')),
-          act('delete', t('delete_vault'), 'danger push')));
+          act('delete', t('delete_vault'), 'danger push')),
+        backupBlock(v));
     }));
     return h('div', { class: 'form' },
       h('div', { class: 'row' }, h('h2', {}, t('tab_vaults')),
-        h('button', { class: 'btn sm primary push', onclick: () => api('open_window', { view: 'wizard' }) }, icon('plus', 'sm'), t('new_vault'))),
+        h('button', { class: 'btn sm ghost push', disabled: !!driveNote?.busy, onclick: addFromDrive }, t('add_from_drive')),
+        h('button', { class: 'btn sm primary', onclick: () => api('open_window', { view: 'wizard' }) }, icon('plus', 'sm'), t('new_vault'))),
       h('p', { class: 'muted' }, t('auth_required')),
+      driveCallout(),
       cards);
   }
 

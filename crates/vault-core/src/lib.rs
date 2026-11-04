@@ -1,6 +1,7 @@
 //! Browser Vault core: keys, header, encrypted container and browser process
 //! control. See `docs/SPEC.md` — it is the source of truth.
 
+pub mod backup;
 pub mod browser;
 pub mod chromium;
 pub mod crypto;

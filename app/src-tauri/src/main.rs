@@ -94,6 +94,8 @@ fn main() {
             commands::pick_browser_path,
             commands::app_info,
             commands::tray_fit,
+            commands::backup_vault,
+            commands::add_vault_from_drive,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
