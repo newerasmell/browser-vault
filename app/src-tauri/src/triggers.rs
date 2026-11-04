@@ -38,10 +38,43 @@ pub fn watch_browser(app: AppHandle, id: String, generation: u64, mut child: Chi
     thread::spawn(move || {
         let _ = child.wait();
         let st = state::get(&app);
-        let current = lock(&st.sessions)
+        let mnt = st.store.mountpoint(&id);
+        // A browser may quit and relaunch itself under a new PID (Firefox
+        // after installing an update). Keep the vault open while any process
+        // still uses it; lock only when none appears within a few seconds.
+        loop {
+            let current = || {
+                lock(&st.sessions)
+                    .get(&id)
+                    .is_some_and(|s| s.generation == generation)
+            };
+            if !current() {
+                return; // locked meanwhile by another trigger
+            }
+            let mut next = None;
+            for _ in 0..12 {
+                if let Some(pid) = vault_core::lock::browser_pids_in(&mnt).first() {
+                    next = Some(*pid);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            let Some(pid) = next else { break };
+            crate::applog::log(&format!(
+                "browser for {id} relaunched as pid {pid}; still watching"
+            ));
+            let _ = st.store.set_browser_pid(&id, pid);
+            if let Some(s) = lock(&st.sessions).get_mut(&id) {
+                s.browser_pid = Some(pid as u32);
+            }
+            while vault_core::browser::is_alive(pid) {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+        if lock(&st.sessions)
             .get(&id)
-            .is_some_and(|s| s.generation == generation);
-        if current {
+            .is_some_and(|s| s.generation == generation)
+        {
             let _ = lockctl::lock_one(&app, &id, Reason::BrowserExit);
         }
     });

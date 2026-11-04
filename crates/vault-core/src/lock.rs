@@ -268,6 +268,45 @@ fn pid_file(store: &Store, id: &str) -> PathBuf {
     store.root().join("run").join(format!("{id}.pid"))
 }
 
+/// PIDs of processes (other than ours, the crash guard and tooling) whose
+/// command line points into the vault mount: the vault's browser, including
+/// one that relaunched itself under a new PID.
+pub fn browser_pids_in(mnt: &Path) -> Vec<i32> {
+    let Ok(out) = Command::new("/bin/ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return vec![];
+    };
+    let real = std::fs::canonicalize(mnt).unwrap_or_else(|_| mnt.to_path_buf());
+    pids_matching(
+        &String::from_utf8_lossy(&out.stdout),
+        mnt,
+        &real,
+        std::process::id() as i32,
+    )
+}
+
+/// [`browser_pids_in`] on a given `ps -o pid=,command=` listing.
+pub fn pids_matching(ps: &str, mnt: &Path, real: &Path, own_pid: i32) -> Vec<i32> {
+    let (a, b) = (mnt.to_string_lossy(), real.to_string_lossy());
+    ps.lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            let (pid, cmd) = l.split_once(char::is_whitespace)?;
+            let pid: i32 = pid.parse().ok()?;
+            let hit = (!a.is_empty() && cmd.contains(a.as_ref()))
+                || (!b.is_empty() && cmd.contains(b.as_ref()));
+            let tooling = ["bv-crash-guard", "hdiutil", "mdutil", "/bin/ps"]
+                .iter()
+                .any(|t| cmd.contains(t));
+            (hit && !tooling && pid != own_pid).then_some(pid)
+        })
+        .collect()
+}
+
 /// Crash guard: a tiny detached shell process that outlives the app. While
 /// the vault stays mounted it waits; if the app process dies first (crash,
 /// force quit), it stops the vault's browser (only if that PID's command
@@ -285,11 +324,13 @@ while kill -0 "$APP" 2>/dev/null; do
   sleep 1
 done
 mounted || exit 0
-if /bin/ps -p "$BR" -o command= 2>/dev/null | /usr/bin/grep -qF -e "$MNT" -e "$ORIG"; then
-  kill -TERM "$BR" 2>/dev/null
-  i=0; while kill -0 "$BR" 2>/dev/null && [ $i -lt 8 ]; do sleep 1; i=$((i+1)); done
-  kill -KILL "$BR" 2>/dev/null
-fi
+# Every process using the vault (the browser may have relaunched itself
+# under a new PID), never this guard itself.
+users() { /bin/ps -axww -o pid=,command= | /usr/bin/grep -F -e "$MNT" -e "$ORIG" | /usr/bin/grep -v -e bv-crash-guard -e grep | /usr/bin/awk '{print $1}'; }
+kill -TERM "$BR" 2>/dev/null
+for p in $(users); do kill -TERM "$p" 2>/dev/null; done
+i=0; while [ -n "$(users)" ] && [ $i -lt 8 ]; do sleep 1; i=$((i+1)); done
+for p in $(users); do kill -KILL "$p" 2>/dev/null; done
 for n in 1 2 3; do
   /usr/bin/hdiutil detach "$MNT" -force >/dev/null 2>&1 && exit 0
   mounted || exit 0
@@ -369,6 +410,25 @@ pub fn recover_after_crash(store: &Store) -> Result<Vec<String>> {
         }
     }
     first_err.map_or(Ok(recovered), Err)
+}
+
+#[cfg(test)]
+mod relaunch_tests {
+    use super::*;
+
+    #[test]
+    fn finds_relaunched_browser_but_not_tooling() {
+        let mnt = Path::new("/Users/a/Library/Application Support/BrowserVault/mnt/x");
+        let real = mnt;
+        let ps = "  101 /Applications/Firefox.app/Contents/MacOS/firefox --new-instance -profile /Users/a/Library/Application Support/BrowserVault/mnt/x/profile
+  102 /bin/sh -c ... bv-crash-guard 1 2 /Users/a/Library/Application Support/BrowserVault/mnt/x
+  103 /usr/bin/hdiutil detach /Users/a/Library/Application Support/BrowserVault/mnt/x
+  104 /Applications/Firefox.app/Contents/MacOS/firefox -profile /Users/a/Other/profile
+  105 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser --user-data-dir=/Users/a/Library/Application Support/BrowserVault/mnt/x/profile
+";
+        assert_eq!(pids_matching(ps, mnt, real, 999), vec![101, 105]);
+        assert_eq!(pids_matching(ps, mnt, real, 101), vec![105]);
+    }
 }
 
 #[cfg(test)]

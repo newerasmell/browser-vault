@@ -459,6 +459,14 @@ impl Store {
         Ok(child)
     }
 
+    /// Record a new browser PID for an open vault (the browser relaunched
+    /// itself, e.g. Firefox after an update), so locking stops the right one.
+    pub fn set_browser_pid(&self, id: &str, pid: i32) -> Result<()> {
+        check_id(id)?;
+        fs::write(self.pid_path(id), pid.to_string())?;
+        Ok(())
+    }
+
     pub fn browser_pid(&self, id: &str) -> Option<i32> {
         fs::read_to_string(self.pid_path(id))
             .ok()?
