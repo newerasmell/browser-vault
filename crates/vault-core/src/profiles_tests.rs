@@ -281,7 +281,17 @@ struct Fixture {
 /// A store with one vault whose header records an import of `profile_id`,
 /// plus an unlocked session for it (as `Store::unlock` would build it).
 fn fixture(browser: Browser, profile_id: &str, reviewed: bool) -> Fixture {
+    fixture_with(browser, profile_id, reviewed, |_| {})
+}
+
+fn fixture_with(
+    browser: Browser,
+    profile_id: &str,
+    reviewed: bool,
+    setup: impl Fn(&Roots),
+) -> Fixture {
     let (d, roots) = fake_home();
+    setup(&roots);
     let store = Store::new(d.path().join("BrowserVault"));
     let nv = new_vault("V", browser, PW, KdfCost::FAST).unwrap().0;
     let m = mnt(&d);
@@ -584,4 +594,368 @@ fn ps_parsing_ignores_vault_instances_and_helpers() {
     ));
     assert!(!regular_running_in(Browser::Firefox, "/usr/bin/firefoxish"));
     assert!(!is_vault_command("/mnt/not-a-uuid/profile"));
+}
+
+// --- all Brave profiles into one vault ----------------------------------------
+
+fn read_ls(p: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(p).unwrap()).unwrap()
+}
+
+fn write_ls(roots: &Roots, ls: &serde_json::Value) {
+    write(
+        &roots.brave_data().join("Local State"),
+        &serde_json::to_vec_pretty(ls).unwrap(),
+    );
+}
+
+/// Add a regular Brave profile: its dir and its `Local State` entry.
+fn add_brave_profile(roots: &Roots, id: &str, name: &str) {
+    let b = roots.brave_data();
+    write(
+        &b.join(id).join("Preferences"),
+        format!("{{\"{id}\":1}}").as_bytes(),
+    );
+    write(
+        &b.join(id).join("Bookmarks"),
+        format!("{name} bookmarks").as_bytes(),
+    );
+    write(&roots.brave_cache().join(id).join("Cache/data_0"), b"cx");
+    let mut ls = read_ls(&b.join("Local State"));
+    ls["profile"]["info_cache"][id] =
+        serde_json::json!({ "name": name, "avatar_icon": "chrome://theme/IDR_PROFILE_AVATAR_26" });
+    if let Some(a) = ls["profile"]["last_active_profiles"].as_array_mut() {
+        a.push(id.into());
+    }
+    if let Some(a) = ls["profile"]["profiles_order"].as_array_mut() {
+        a.push(id.into());
+    }
+    write_ls(roots, &ls);
+}
+
+/// Three profiles, plus machine-specific / sensitive keys that must not
+/// reach the vault, and a stale `info_cache` entry without a directory.
+fn three_profiles(roots: &Roots) {
+    let mut ls = read_ls(&roots.brave_data().join("Local State"));
+    ls["profile"]["profiles_order"] = serde_json::json!(["Default", "Profile 1"]);
+    ls["profile"]["info_cache"]["Profile 7"] = serde_json::json!({ "name": "Gone" });
+    ls["os_crypt"] = serde_json::json!({ "portal": { "prev_init_success": true } });
+    ls["variations_compressed_seed"] = "c2VlZA==".into();
+    ls["user_experience_metrics"] =
+        serde_json::json!({ "client_id2": "1234-abcd", "low_entropy_source3": 42 });
+    ls["brave"] = serde_json::json!({ "stats": { "week_of_installation": "2026-01-05" } });
+    write_ls(roots, &ls);
+    add_brave_profile(roots, "Profile 2", "Ads");
+}
+
+#[test]
+fn import_all_brave_copies_every_profile_and_writes_local_state() {
+    let (d, roots) = fake_home();
+    three_profiles(&roots);
+    let before = fs::read(roots.brave_data().join("Local State")).unwrap();
+    let m = mnt(&d);
+    let o = import_profile(&roots, Browser::Brave, ALL_PROFILES, &m, &ignore).unwrap();
+    let p = m.join("profile");
+    // Same dir names as in the regular install.
+    assert_eq!(
+        fs::read(p.join("Default/Bookmarks")).unwrap(),
+        b"default bookmarks"
+    );
+    assert_eq!(
+        fs::read(p.join("Profile 1/Network/Cookies")).unwrap(),
+        b"cookies"
+    );
+    assert_eq!(
+        fs::read(p.join("Profile 2/Bookmarks")).unwrap(),
+        b"Ads bookmarks"
+    );
+    assert!(!p.join("Profile 7").exists());
+    assert!(
+        !p.join("Profile 1/link").exists(),
+        "symlinks are not copied"
+    );
+
+    let ls = read_ls(&p.join("Local State"));
+    let keys: Vec<&String> = ls.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["profile"], "only the profile switcher state");
+    let pr = &ls["profile"];
+    let ids: Vec<&String> = pr["info_cache"].as_object().unwrap().keys().collect();
+    assert_eq!(ids, ["Default", "Profile 1", "Profile 2"]);
+    assert_eq!(pr["info_cache"]["Profile 1"]["name"], "Work");
+    assert_eq!(pr["info_cache"]["Profile 1"]["active_time"], 2.0);
+    assert_eq!(
+        pr["info_cache"]["Profile 2"]["avatar_icon"],
+        "chrome://theme/IDR_PROFILE_AVATAR_26"
+    );
+    assert_eq!(pr["last_used"], "Profile 1");
+    assert_eq!(
+        pr["last_active_profiles"],
+        serde_json::json!(["Default", "Profile 1", "Profile 2"])
+    );
+    assert_eq!(
+        pr["profiles_order"],
+        serde_json::json!(["Default", "Profile 1", "Profile 2"])
+    );
+    assert_eq!(pr["profiles_created"], 3);
+    let text = String::from_utf8(fs::read(p.join("Local State")).unwrap()).unwrap();
+    for secret in [
+        "os_crypt",
+        "variations",
+        "client_id",
+        "week_of_installation",
+        "Gone",
+    ] {
+        assert!(!text.contains(secret), "{secret}");
+    }
+
+    assert_eq!(o.profile_id, ALL_PROFILES);
+    assert_eq!(o.profile_name, "All profiles (3)");
+    assert_eq!(o.state, OriginalState::Pending);
+    assert!(!o.reviewed);
+    let b = roots.brave_data();
+    let c = roots.brave_cache();
+    assert_eq!(
+        o.paths,
+        [
+            b.join("Default"),
+            c.join("Default"),
+            b.join("Profile 1"),
+            c.join("Profile 1"),
+            b.join("Profile 2"),
+            c.join("Profile 2"),
+            roots.saved_state(Browser::Brave),
+        ]
+        .map(|p| p.to_string_lossy().into_owned())
+    );
+    assert_eq!(o.size_bytes, (7 + 17 + 2) + (36 + 2) + (15 + 13 + 2) + 1);
+    // The regular install is only read.
+    assert_eq!(fs::read(b.join("Local State")).unwrap(), before);
+    assert!(b.join("Profile 2/Bookmarks").is_file());
+}
+
+#[test]
+fn import_all_corrupted_profile_aborts_everything() {
+    let (d, roots) = fake_home();
+    three_profiles(&roots);
+    let hooks: [&dyn Fn(&Path); 3] = [
+        // Same size, different content: only the SHA-256 catches it.
+        &|r| fs::write(r.join("Profile 2/Bookmarks"), b"Adz bookmarks").unwrap(),
+        &|r| fs::remove_file(r.join("Profile 1/Local Storage/leveldb/000003.log")).unwrap(),
+        &|r| fs::write(r.join("Default/extra"), b"x").unwrap(),
+    ];
+    for corrupt in hooks {
+        let m = mnt(&d);
+        let r = import_with_hook(&roots, Browser::Brave, ALL_PROFILES, &m, &ignore, corrupt);
+        assert!(matches!(r, Err(Error::Invalid(_))));
+        assert_eq!(
+            fs::read_dir(m.join("profile")).unwrap().count(),
+            0,
+            "vault left empty"
+        );
+        fs::remove_dir_all(&m).unwrap();
+    }
+    assert_eq!(
+        fs::read(roots.brave_data().join("Profile 2/Bookmarks")).unwrap(),
+        b"Ads bookmarks"
+    );
+    // A non-empty vault profile is refused before anything is copied.
+    let m = mnt(&d);
+    write(&m.join("profile/x"), b"x");
+    assert!(matches!(
+        import_profile(&roots, Browser::Brave, ALL_PROFILES, &m, &ignore),
+        Err(Error::Invalid(_))
+    ));
+    assert!(!m.join("profile/Default").exists());
+}
+
+#[test]
+fn import_all_refused_for_firefox_and_while_brave_runs() {
+    let (d, mut roots) = fake_home();
+    let m = mnt(&d);
+    assert!(matches!(
+        import_profile(&roots, Browser::Firefox, ALL_PROFILES, &m, &ignore),
+        Err(Error::Invalid(_))
+    ));
+    assert!(targets(&roots, Browser::Firefox, ALL_PROFILES).is_err());
+    assert!(targets(&roots, Browser::Brave, ALL_PROFILES).is_err());
+    roots.browser_running = running;
+    assert!(matches!(
+        import_profile(&roots, Browser::Brave, ALL_PROFILES, &m, &ignore),
+        Err(Error::BrowserRunning)
+    ));
+    assert_eq!(fs::read_dir(m.join("profile")).unwrap().count(), 0);
+    // No profiles at all.
+    roots.browser_running = not_running;
+    let empty = Roots {
+        home: d.path().join("nobody"),
+        ..roots
+    };
+    assert!(matches!(
+        import_profile(&empty, Browser::Brave, ALL_PROFILES, &m, &ignore),
+        Err(Error::NotFound)
+    ));
+}
+
+fn all_originals_exist(f: &Fixture) -> bool {
+    ["Default", "Profile 1", "Profile 2"]
+        .iter()
+        .all(|id| f.roots.brave_data().join(id).is_dir() && f.roots.brave_cache().join(id).is_dir())
+}
+
+#[test]
+fn cleanup_all_refused_when_not_reviewed_running_or_wrong_password() {
+    let mut f = fixture_with(Browser::Brave, ALL_PROFILES, false, three_profiles);
+    let ls = fs::read(f.roots.brave_data().join("Local State")).unwrap();
+    let r = cleanup_original(&f.store, &f.roots, &mut f.session, PW, &ignore);
+    assert!(matches!(r, Err(Error::NotReviewed)));
+
+    let mut f2 = fixture_with(Browser::Brave, ALL_PROFILES, true, three_profiles);
+    f2.roots.browser_running = running;
+    let r = cleanup_original(&f2.store, &f2.roots, &mut f2.session, PW, &ignore);
+    assert!(matches!(r, Err(Error::BrowserRunning)));
+    f2.roots.browser_running = not_running;
+    let r = cleanup_original(
+        &f2.store,
+        &f2.roots,
+        &mut f2.session,
+        "wrong password!!",
+        &ignore,
+    );
+    assert!(matches!(r, Err(Error::UnlockFailed)));
+
+    for f in [&f, &f2] {
+        assert!(all_originals_exist(f));
+        assert!(f.roots.saved_state(Browser::Brave).is_dir());
+        assert_eq!(
+            fs::read(f.roots.brave_data().join("Local State")).unwrap(),
+            ls
+        );
+        assert_eq!(state(f).state, OriginalState::Pending);
+    }
+}
+
+#[test]
+fn cleanup_all_removes_exactly_the_imported_profiles() {
+    let mut f = fixture_with(Browser::Brave, ALL_PROFILES, true, three_profiles);
+    // Created in regular Brave after the import: must survive.
+    add_brave_profile(&f.roots, "Profile 3", "Later");
+    let b = f.roots.brave_data();
+    let c = f.roots.brave_cache();
+    let ls_before = fs::read(b.join("Local State")).unwrap();
+
+    let preview = cleanup_preview(&f.store, &f.roots, &f.session.header.vault_id).unwrap();
+    assert_eq!(
+        preview.items,
+        [
+            b.join("Default"),
+            c.join("Default"),
+            b.join("Profile 1"),
+            c.join("Profile 1"),
+            b.join("Profile 2"),
+            c.join("Profile 2"),
+            f.roots.saved_state(Browser::Brave),
+        ]
+    );
+    assert_eq!(preview.profile_name, "All profiles (3)");
+
+    cleanup_original(&f.store, &f.roots, &mut f.session, PW, &ignore).unwrap();
+    for id in ["Default", "Profile 1", "Profile 2"] {
+        assert!(!b.join(id).exists(), "{id}");
+        assert!(!c.join(id).exists(), "{id}");
+    }
+    assert!(!f.roots.saved_state(Browser::Brave).exists());
+    assert_eq!(
+        fs::read(b.join("Profile 3/Bookmarks")).unwrap(),
+        b"Later bookmarks"
+    );
+    assert!(c.join("Profile 3/Cache/data_0").is_file());
+
+    let ls = read_ls(&b.join("Local State"));
+    let p = &ls["profile"];
+    let ids: Vec<&String> = p["info_cache"].as_object().unwrap().keys().collect();
+    // The stale entry without a dir was never imported, so it stays as well.
+    assert_eq!(ids, ["Profile 3", "Profile 7"]);
+    assert_eq!(p["last_used"], "Profile 3");
+    assert_eq!(p["last_active_profiles"], serde_json::json!(["Profile 3"]));
+    assert_eq!(p["profiles_order"], serde_json::json!(["Profile 3"]));
+    assert_eq!(
+        ls["os_crypt"]["portal"]["prev_init_success"], true,
+        "other keys kept"
+    );
+
+    let backups: Vec<_> = fs::read_dir(&b)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("Local State.bvault-") && n.ends_with(".bak")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(fs::read(backups[0].path()).unwrap(), ls_before);
+
+    let o = state(&f);
+    assert_eq!(o.state, OriginalState::Deleted);
+    assert!(o.deleted_at.is_some());
+}
+
+#[test]
+fn forgetting_every_profile_leaves_local_state_brave_can_start_from() {
+    let (_d, roots) = fake_home();
+    let ids = ["Default".to_string(), "Profile 1".to_string()];
+    brave_forget_profiles(&roots, &ids).unwrap();
+    let ls = read_ls(&roots.brave_data().join("Local State"));
+    let p = &ls["profile"];
+    assert_eq!(p["info_cache"], serde_json::json!({}));
+    assert!(
+        p.get("last_used").is_none(),
+        "Brave falls back to a new Default"
+    );
+    assert_eq!(p["last_active_profiles"], serde_json::json!([]));
+    assert_eq!(p["profiles_created"], 2);
+}
+
+#[test]
+fn all_profiles_ids_come_only_from_recorded_brave_dirs() {
+    let (_d, roots) = fake_home();
+    let b = roots.brave_data();
+    let s = |p: PathBuf| p.to_string_lossy().into_owned();
+    let mut o = Original {
+        browser: Browser::Brave,
+        profile_id: ALL_PROFILES.into(),
+        profile_name: all_profiles_name(1),
+        paths: vec![
+            s(b.join("Profile 1")),
+            s(roots.brave_cache().join("Default")),
+            s(roots.saved_state(Browser::Brave)),
+        ],
+        size_bytes: 0,
+        imported_at: now_rfc3339(),
+        reviewed: true,
+        state: OriginalState::Pending,
+        deleted_at: None,
+    };
+    let t = targets_of(&roots, &o).unwrap();
+    assert_eq!(
+        t.profiles,
+        [(
+            b.join("Profile 1"),
+            Some(roots.brave_cache().join("Profile 1"))
+        )]
+    );
+    for bad in [
+        b.join("Local State"),
+        b.join(".."),
+        b.join("*"),
+        b.join(".hidden"),
+    ] {
+        o.paths = vec![s(bad.clone())];
+        assert!(targets_of(&roots, &o).is_err(), "{bad:?}");
+    }
+    // Nothing under the Brave data dir: refused, never "delete everything".
+    o.paths = vec![s(roots.home.join("Documents"))];
+    assert!(targets_of(&roots, &o).is_err());
+    o.browser = Browser::Firefox;
+    o.paths = vec![s(b.join("Profile 1"))];
+    assert!(targets_of(&roots, &o).is_err());
 }
