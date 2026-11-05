@@ -346,9 +346,33 @@ enum Secret {
 
 fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
     let st = state::get(app);
-    if let Some(pid) = lock(&st.sessions).get(id).and_then(|s| s.browser_pid) {
-        activate_pid(pid);
-        return Ok(json!(OK));
+    // Already unlocked: bring its browser to the front, or start it again
+    // if it was closed while the vault stayed open.
+    {
+        let mut sessions = lock(&st.sessions);
+        if let Some(s) = sessions.get_mut(id) {
+            if let Some(pid) = s.browser_pid.filter(|p| browser::is_alive(*p as i32)) {
+                drop(sessions);
+                activate_pid(pid);
+                return Ok(json!(OK));
+            }
+            let bin = browser_binary(&st, s.unlocked.header.browser);
+            let child = st.store.launch(&s.unlocked, bin.as_deref())?;
+            let pid = child.id();
+            s.browser_pid = Some(pid);
+            let generation = s.generation;
+            drop(sessions);
+            crate::applog::log(&format!("browser for {id} reopened as pid {pid}"));
+            if let Err(e) = vault_core::lock::spawn_crash_guard(
+                std::process::id(),
+                pid,
+                &st.store.mountpoint(id),
+            ) {
+                crate::applog::log(&format!("crash guard not started: {e}"));
+            }
+            triggers::watch_browser(app.clone(), id.to_string(), generation, child);
+            return Ok(json!(OK));
+        }
     }
     if lock(&st.locking).contains(id) {
         return Err(CmdError::new("io"));

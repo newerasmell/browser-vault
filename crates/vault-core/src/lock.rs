@@ -299,10 +299,16 @@ pub fn pids_matching(ps: &str, mnt: &Path, real: &Path, own_pid: i32) -> Vec<i32
             let pid: i32 = pid.parse().ok()?;
             let hit = (!a.is_empty() && cmd.contains(a.as_ref()))
                 || (!b.is_empty() && cmd.contains(b.as_ref()));
-            let tooling = ["bv-crash-guard", "hdiutil", "mdutil", "/bin/ps"]
+            // Only the browser itself (its main binary or helpers inside an
+            // .app bundle) counts. Tools that merely mention the mount path
+            // — the crash guard's `grep`/`mount`/`sh`, hdiutil, ps — must
+            // never keep a vault open after its browser quit.
+            let exe = cmd.split(" --").next().unwrap_or(cmd);
+            let browser = exe.contains(".app/Contents/");
+            let tooling = ["bv-crash-guard", "hdiutil", "mdutil", "/bin/ps", "grep"]
                 .iter()
-                .any(|t| cmd.contains(t));
-            (hit && !tooling && pid != own_pid).then_some(pid)
+                .any(|t| exe.contains(t));
+            (hit && browser && !tooling && pid != own_pid).then_some(pid)
         })
         .collect()
 }
@@ -427,6 +433,12 @@ mod relaunch_tests {
   105 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser --user-data-dir=/Users/a/Library/Application Support/BrowserVault/mnt/x/profile
 ";
         assert_eq!(pids_matching(ps, mnt, real, 999), vec![101, 105]);
+        // The crash guard's helpers mention the path but are not browsers.
+        let tools =
+            "  201 /usr/bin/grep -qF  on /Users/a/Library/Application Support/BrowserVault/mnt/x (
+  202 /bin/sh -c x /Users/a/Library/Application Support/BrowserVault/mnt/x
+";
+        assert!(pids_matching(tools, mnt, real, 999).is_empty());
         assert_eq!(pids_matching(ps, mnt, real, 101), vec![105]);
     }
 }
