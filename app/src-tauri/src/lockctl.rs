@@ -55,6 +55,16 @@ pub fn lock_one(app: &AppHandle, id: &str, reason: Reason) -> CmdResult<()> {
     applog::log(&format!("lock {id} ({reason:?}): begin"));
     let session = lock(&st.sessions).remove(id);
     let was_open = session.is_some() || st.store.is_unlocked(id);
+    // Ask the browser to quit like ⌘Q first, so it shuts down cleanly
+    // (Firefox treats SIGTERM as a crash and offers "Restore session").
+    // Store::lock still sends SIGTERM/SIGKILL if it doesn't exit in time.
+    if let Some(pid) = session
+        .as_ref()
+        .and_then(|s| s.browser_pid)
+        .or_else(|| st.store.browser_pid(id).map(|p| p as u32))
+    {
+        graceful_quit(pid);
+    }
     // With a session: Store::close (also flips SPEC §5.1 `reviewed`).
     // Keys are wiped when the session is dropped inside (SPEC §6 step 3).
     let result = match session {
@@ -152,3 +162,27 @@ pub fn spawn_lock_all(app: &AppHandle, reason: Reason) {
         let _ = lock_all(&app, reason);
     });
 }
+
+/// Send the standard macOS "quit" (as ⌘Q would) to one process and wait up
+/// to 8 s for it to exit. Only that PID is addressed, never other windows
+/// of the same browser outside the vault.
+#[cfg(target_os = "macos")]
+fn graceful_quit(pid: u32) {
+    use objc2_app_kit::NSRunningApplication;
+    use std::time::{Duration, Instant};
+    let pid_i = pid as i32;
+    if !vault_core::browser::is_alive(pid_i) {
+        return;
+    }
+    if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid_i) {
+        let sent = app.terminate();
+        applog::log(&format!("graceful quit sent to pid {pid}: {sent}"));
+    }
+    let start = Instant::now();
+    while vault_core::browser::is_alive(pid_i) && start.elapsed() < Duration::from_secs(8) {
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn graceful_quit(_pid: u32) {}

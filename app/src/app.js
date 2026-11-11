@@ -1044,7 +1044,7 @@ async function viewSettings(params) {
   function about() {
     return h('div', { class: 'form' },
       h('div', { class: 'about-head' }, h('div', { class: 'brand on lg' }, icon('shield', 'lg')),
-        h('div', {}, h('h2', {}, t('app_name')), h('small', { class: 'muted' }, `${t('version')} ${info.version}`))),
+        h('div', {}, h('h2', {}, t('app_name')), h('small', { class: 'muted' }, `${t('version')} ${info.version}${info.build ? ' · build ' + info.build : ''}`))),
       h('h3', {}, t('limits_title')),
       h('ul', { class: 'limits' }, t('limits').map((l, i) => h('li', { class: i === 0 ? 'good' : '' }, icon(i === 0 ? 'check' : 'alert', 'sm'), l))));
   }

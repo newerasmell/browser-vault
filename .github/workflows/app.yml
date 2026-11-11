@@ -38,7 +38,10 @@ jobs:
 
       - name: tauri build (universal-apple-darwin)
         working-directory: app/src-tauri
-        run: npx --yes "@tauri-apps/cli@${TAURI_CLI_VERSION}" build --target universal-apple-darwin --bundles app,dmg --ci
+        env:
+          # Shown in Settings → About so builds can be told apart.
+          BV_BUILD: ${{ github.run_number }}-${{ github.sha }}
+        run: export BV_BUILD="${BV_BUILD:0:$(( ${#GITHUB_RUN_NUMBER} + 8 ))}" && npx --yes "@tauri-apps/cli@${TAURI_CLI_VERSION}" build --target universal-apple-darwin --bundles app,dmg --ci
 
       - name: Locate bundle
         id: bundle

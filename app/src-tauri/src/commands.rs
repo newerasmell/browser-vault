@@ -321,7 +321,11 @@ pub async fn quit_app(app: AppHandle) -> CmdResult<()> {
 
 #[tauri::command]
 pub fn app_info(app: AppHandle) -> Value {
-    json!({ "version": app.package_info().version.to_string() })
+    json!({
+        "version": app.package_info().version.to_string(),
+        // Set by the CI build ("<run number>-<commit>"); "dev" locally.
+        "build": option_env!("BV_BUILD").unwrap_or("dev"),
+    })
 }
 
 // ---------------------------------------------------------------- unlock / lock

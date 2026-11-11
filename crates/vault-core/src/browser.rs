@@ -175,6 +175,11 @@ pub fn write_firefox_user_js(mnt: &Path, disable_fxa: Option<bool>) -> Result<()
     ));
     out.push_str("user_pref(\"browser.shell.checkDefaultBrowser\", false);\n");
     out.push_str("user_pref(\"browser.sessionstore.resume_from_crash\", true);\n");
+    // The vault quits Firefox with a normal "quit" when it locks; a
+    // "close N tabs?" prompt would block that and force a hard stop.
+    out.push_str("user_pref(\"browser.warnOnQuit\", false);\n");
+    out.push_str("user_pref(\"browser.warnOnQuitShortcut\", false);\n");
+    out.push_str("user_pref(\"browser.tabs.warnOnClose\", false);\n");
     if fxa_off {
         out.push_str(FXA_OFF);
         out.push('\n');
