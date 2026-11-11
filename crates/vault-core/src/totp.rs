@@ -765,13 +765,13 @@ mod tests {
     #[test]
     fn setup_uri_qr_and_secret() {
         let se = MockSecureEnclave::new();
-        let mut d = Draft::new("Trade: Peak", Browser::Brave, KdfCost::FAST).unwrap();
+        let mut d = Draft::new("Acme: Work", Browser::Brave, KdfCost::FAST).unwrap();
         assert!(begin(&mut d, &se).is_err(), "password first");
         d.set_password(PW).unwrap();
         let s = begin(&mut d, &se).unwrap();
         assert!(s
             .uri
-            .starts_with("otpauth://totp/BrowserVault:Trade-%20Peak?secret="));
+            .starts_with("otpauth://totp/BrowserVault:Acme-%20Work?secret="));
         assert!(s.uri.contains(&format!("secret={}", s.secret.as_str())));
         assert!(s.uri.ends_with("&issuer=BrowserVault"));
         // SHA1 / 6 digits / 30 s are the defaults and therefore implicit.

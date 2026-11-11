@@ -182,7 +182,7 @@ TOTP не може да участва в извеждането на ключа
 {
   "version": 1,
   "vault_id": "uuid",
-  "name": "Trade Peak – Brave",
+  "name": "Work – Brave",
   "browser": "brave",
   "created_at": "ISO8601",
   "kdf": { "alg": "argon2id", "m_kib": 262144, "t": 3, "p": 1, "salt": "b64" },

@@ -336,7 +336,7 @@ mod tests {
         Header {
             version: HEADER_VERSION,
             vault_id: "8b4c7f0e-7a63-4d55-9a1e-2f0d9d3b6a11".into(),
-            name: "Trade Peak – Brave".into(),
+            name: "Work – Brave".into(),
             browser: Browser::Brave,
             created_at: "2026-11-03T10:00:00Z".into(),
             kdf: Kdf {
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(Header::load(dir.path()).unwrap().name, "Renamed");
         let bak =
             Header::from_json(&fs::read(dir.path().join(HEADER_BACKUP_FILE)).unwrap()).unwrap();
-        assert_eq!(bak.name, "Trade Peak – Brave");
+        assert_eq!(bak.name, "Work – Brave");
         assert!(!dir.path().join(HEADER_TMP_FILE).exists());
         assert!(!dir.path().join("header.json.bak.tmp").exists());
 
