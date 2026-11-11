@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 use crate::browser::Browser;
 use crate::crypto::{self, Key};
 use crate::error::{Error, Redacted, Result};
-use crate::header::{Header, Kdf, Slot, VaultSettings, B64, HEADER_VERSION};
+use crate::header::{Header, Kdf, Meta, Slot, VaultSettings, B64};
 use crate::recovery;
 
 pub const MIN_PASSWORD_CHARS: usize = 12;
@@ -340,18 +340,18 @@ impl Draft {
         {
             return Err(Error::Invalid("generate the recovery phrase first"));
         }
-        let mut header = Header {
-            version: HEADER_VERSION,
-            vault_id: self.vault_id.clone(),
-            name: self.name.clone(),
-            browser: self.browser,
-            created_at: now_rfc3339(),
-            kdf: self.kdf.clone(),
-            slots: self.slots.clone(),
-            settings,
-            original: None,
-            mac: B64::default(),
-        };
+        let mut header = Header::new(
+            self.vault_id.clone(),
+            self.kdf.clone(),
+            self.slots.clone(),
+            Meta {
+                name: self.name.clone(),
+                browser: self.browser,
+                created_at: now_rfc3339(),
+                settings,
+                original: None,
+            },
+        );
         header.seal_mac(&self.vmk)?;
         Ok(NewVault {
             header,
@@ -550,7 +550,7 @@ mod tests {
     fn new_vault_shape() {
         let v = vault();
         let h = &v.header;
-        assert_eq!(h.version, HEADER_VERSION);
+        assert_eq!(h.version, crate::header::HEADER_VERSION);
         assert!(uuid::Uuid::parse_str(&h.vault_id).is_ok());
         assert_eq!(h.kdf.alg, "argon2id");
         assert_eq!(h.kdf.salt.0.len(), 16);
@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(kinds, ["password", "recovery"]);
         assert!(h.verify_mac(v.key.vmk()));
         assert_eq!(v.recovery_phrase.split(' ').count(), 24);
-        assert!(h.created_at.ends_with('Z'));
+        assert!(h.meta().unwrap().created_at.ends_with('Z'));
     }
 
     #[test]
@@ -697,8 +697,14 @@ mod tests {
     fn tampered_metadata_unlocks_but_is_flagged() {
         let v = vault();
         let mut h = v.header.clone();
-        h.settings.idle_minutes = 0;
-        h.name = "Evil".into();
+        h.tamper_sealed_meta();
+        let k = unlock_with_password(&h, PW).unwrap();
+        assert!(!k.header_intact);
+        // Same for a v1 header with edited plain metadata.
+        let mut h = v.header.clone();
+        h.downgrade_to_v1(v.key.vmk());
+        h.meta_mut().unwrap().settings.idle_minutes = 0;
+        h.meta_mut().unwrap().name = "Evil".into();
         let k = unlock_with_password(&h, PW).unwrap();
         assert!(!k.header_intact);
     }
@@ -748,7 +754,7 @@ mod tests {
         assert!(unlock_with_recovery(&v.header, &p).is_ok());
         assert!(unlock_with_recovery(&v.header, &v.recovery_phrase).is_err());
         let mut t = v.header.clone();
-        t.name = "evil".into();
+        t.tamper_sealed_meta();
         assert!(set_recovery(&mut t, &k, &p).is_err());
     }
 

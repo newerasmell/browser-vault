@@ -30,8 +30,13 @@ const vaults = [
     original: { profileName: 'Default', sizeMb: 842, reviewed: true, state: 'pending' } },
   { id: 'v2', name: 'Ads accounts – Firefox', browser: 'firefox', mode: 'totp', status: 'locked', sizeGb: 20,
     original: { profileName: 'default-release', sizeMb: 516, reviewed: false, state: 'pending' } },
-  { id: 'v3', name: 'Personal', browser: 'brave', mode: 'totp', status: 'locked', sizeGb: 10 }
+  { id: 'v3', name: 'Personal', browser: 'brave', mode: 'totp', status: 'locked', sizeGb: 10 },
+  // Encrypted header, no entry in this Mac's index (e.g. restored from a backup).
+  { id: 'v4', name: null, browser: null, mode: 'fido2', status: 'locked', sizeGb: 20, original: null, portable: true,
+    _real: { name: 'Archive', browser: 'firefox' } }
 ];
+// Unlocking reveals the encrypted name (Rust: decrypted metadata → local index).
+const reveal = (v) => { if (v._real) { Object.assign(v, v._real); delete v._real; } };
 let settings = {
   language: 'bg', launchAtLogin: true, idleMinutes: 15,
   lockOnScreenLock: true, lockOnKeyRemoval: true, panicHotkey: '⌃⌥⌘L'
@@ -70,13 +75,14 @@ const mock = {
     } else await wait(500);
     const ok = password && (v.mode === 'fido2' ? !!pin : code === '123456');
     if (!ok) { fails++; throw err('unlock_failed'); }
-    fails = 0; v.status = 'unlocked'; emit('vaults_changed');
+    fails = 0; v.status = 'unlocked'; reveal(v); emit('vaults_changed');
     return { ok: true };
   },
   unlock_with_recovery: async ({ id, phrase }) => {
     await wait(700);
     if (phrase.trim().split(/\s+/).length !== 24) throw err('unlock_failed');
-    vaults.find((x) => x.id === id).status = 'unlocked'; emit('vaults_changed');
+    const v = vaults.find((x) => x.id === id);
+    v.status = 'unlocked'; reveal(v); emit('vaults_changed');
     return { ok: true };
   },
   lock_vault: async ({ id }) => {
@@ -184,15 +190,16 @@ const mock = {
     if (v.status !== 'locked') throw err('backup_unlocked');
     await wait(500);
     for (const pct of [8, 30, 61, 87, 99, 100]) { emit('backup_progress', { id, pct }); await wait(300); }
-    return { path: `/Volumes/BACKUP/${v.name} (${id}).bvault`, copiedFiles: 42, unchangedFiles: 0 };
+    return { path: `/Volumes/BACKUP/vault-${id}.bvault`, copiedFiles: 42, unchangedFiles: 0 };
   },
   add_vault_from_drive: async () => {
     if (vaults.some((x) => x.id === 'v9')) throw err('backup_already_added');
     await wait(500);
     for (const pct of [12, 47, 80, 99, 100]) { emit('backup_progress', { id: null, pct }); await wait(300); }
-    vaults.push({ id: 'v9', name: 'Travel – Firefox', browser: 'firefox', mode: 'totp', status: 'locked', sizeGb: 20, original: null });
+    vaults.push({ id: 'v9', name: null, browser: null, mode: 'totp', status: 'locked', sizeGb: 20, original: null, portable: true,
+      _real: { name: 'Travel – Firefox', browser: 'firefox' } });
     emit('vaults_changed');
-    return { id: 'v9', name: 'Travel – Firefox', mode: 'totp' };
+    return { id: 'v9', name: null, mode: 'totp' };
   },
   app_info: async () => ({ version: '0.1.0-dev' })
 };

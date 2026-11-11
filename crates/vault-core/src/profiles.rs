@@ -736,10 +736,11 @@ impl PasswordVerifier {
 /// session's VMK (a tampered header must not steer deletion or get blessed
 /// by a re-seal).
 fn load_verified(store: &Store, session: &Unlocked) -> Result<Header> {
-    let h = store.load(&session.header.vault_id)?;
+    let mut h = store.load(&session.header.vault_id)?;
     if !h.verify_mac(session.key.vmk()) {
         return Err(Error::Format("header integrity check failed".into()));
     }
+    h.open_meta(session.key.vmk())?;
     Ok(h)
 }
 
@@ -755,7 +756,7 @@ fn save_sealed(store: &Store, session: &mut Unlocked, mut h: Header) -> Result<(
 /// header changed.
 pub fn mark_reviewed(store: &Store, session: &mut Unlocked) -> Result<bool> {
     let mut h = load_verified(store, session)?;
-    match &mut h.original {
+    match &mut h.meta_mut()?.original {
         Some(o) if o.state == OriginalState::Pending && !o.reviewed => o.reviewed = true,
         _ => return Ok(false),
     }
@@ -770,7 +771,7 @@ fn set_state(
     to: OriginalState,
 ) -> Result<()> {
     let mut h = load_verified(store, session)?;
-    match &mut h.original {
+    match &mut h.meta_mut()?.original {
         Some(o) if o.state == from => o.state = to,
         Some(o) if o.state == to => return Ok(()),
         _ => return Err(Error::Invalid("no imported profile in this state")),
@@ -928,14 +929,19 @@ pub struct CleanupPreview {
     pub browser: Browser,
 }
 
-pub fn cleanup_preview(store: &Store, roots: &Roots, id: &str) -> Result<CleanupPreview> {
-    let h = store.load(id)?;
+/// Needs the open session: the original's profile id and paths are in the
+/// header's encrypted metadata (v2).
+pub fn cleanup_preview(store: &Store, roots: &Roots, session: &Unlocked) -> Result<CleanupPreview> {
+    let id = &session.header.vault_id;
     // Added from a backup: `original` names a profile on the other Mac.
     if crate::backup::restored_from_backup(store, id) {
         return Err(Error::Invalid(ERR_ORIGINAL_ELSEWHERE));
     }
+    let h = load_verified(store, session)?;
     let o = h
+        .meta()?
         .original
+        .clone()
         .ok_or(Error::Invalid("this vault has no imported profile"))?;
     let t = targets_of(roots, &o)?;
     Ok(CleanupPreview {
@@ -971,6 +977,7 @@ pub fn cleanup_original(
         return Err(Error::Invalid(ERR_ORIGINAL_ELSEWHERE));
     }
     let o = h
+        .meta()?
         .original
         .clone()
         .ok_or(Error::Invalid("this vault has no imported profile"))?;
@@ -1007,7 +1014,7 @@ pub fn cleanup_original(
     }
     remove_path(&t.saved_state)?;
     notify(Event::CleanupProgress { pct: 95 });
-    if let Some(orig) = &mut h.original {
+    if let Some(orig) = &mut h.meta_mut()?.original {
         orig.state = OriginalState::Deleted;
         orig.deleted_at = Some(now_rfc3339());
     }

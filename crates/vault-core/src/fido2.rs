@@ -1353,7 +1353,7 @@ mod tests {
         }
         assert!(failed(unlock(&h, &v.auth, PW, PIN_A, n())));
         let mut h = v.header.clone();
-        h.name = "Evil".into();
+        h.tamper_sealed_meta();
         if let Slot::Fido2 { label, .. } = &mut h.slots[0] {
             *label = "renamed".into();
         }
@@ -1592,5 +1592,36 @@ mod tests {
             auth.hmac_secret("evil.example", &id, &[1; 32], PIN_A),
             Err(FidoError::NoCredential)
         ));
+    }
+
+    #[test]
+    fn v1_header_upgrades_and_unlocks_with_either_key() {
+        use crate::store::Store;
+        let mut v = vault();
+        let meta = v.header.meta().unwrap().clone();
+        v.header.downgrade_to_v1(v.key.vmk());
+        let id = v.header.vault_id.clone();
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::new(d.path()).with_index_key(crate::index::memory_key);
+        std::fs::create_dir_all(s.vault_dir(&id)).unwrap();
+        s.save_header(&v.header).unwrap();
+        v.auth.only(v.a);
+        let k = unlock(&s.load(&id).unwrap(), &v.auth, PW, PIN_A, n()).unwrap();
+        assert!(k.header_intact);
+        let up = s.upgrade_header(&id, &k).unwrap();
+        assert_eq!(up.version, crate::header::HEADER_VERSION);
+        assert_eq!(up.meta().unwrap(), &meta);
+        let h = s.load(&id).unwrap();
+        assert!(h.meta_locked());
+        let k = unlock(&h, &v.auth, PW, PIN_A, n()).unwrap();
+        assert!(k.header_intact);
+        v.auth.only(v.b);
+        let k = unlock(&h, &v.auth, PW, PIN_B, n()).unwrap();
+        assert!(k.header_intact);
+        assert!(
+            crate::keyslot::unlock_with_recovery(&h, &v.phrase)
+                .unwrap()
+                .header_intact
+        );
     }
 }

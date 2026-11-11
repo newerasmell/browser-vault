@@ -29,7 +29,7 @@ Frontend-ът е готов в `app/src/`: vanilla JS (ES modules), без build
 
 | Команда | Вход | Изход |
 |---|---|---|
-| `list_vaults` | — | `[{ id, name, browser: 'brave'|'firefox', mode: 'fido2'|'totp', status: 'locked'|'unlocked'|'error', sizeGb }]` |
+| `list_vaults` | — | `[{ id, name: string|null, browser: 'brave'|'firefox'|null, mode: 'fido2'|'totp', status: 'locked'|'unlocked'|'error', sizeGb }]` |
 | `detect_browsers` | — | `{ brave: { found, path }, firefox: { found, path } }` |
 | `open_window` | `{ view, params? }` | — |
 | `close_window` | — | затваря текущия прозорец |
@@ -67,7 +67,7 @@ Frontend-ът е готов в `app/src/`: vanilla JS (ES modules), без build
 | `create_progress` | `{ stage: 'disk'|'keys'|'profile'|'import'|'done', pct }` | wizard |
 | `cleanup_progress` | `{ pct }` | cleanup |
 
-`list_vaults` връща и `original: null | { profileName, sizeMb, reviewed, state: 'pending'|'kept'|'deleted' }`. При `pending` менюто показва бележка „Оригиналният профил още е на диска“.
+`list_vaults` връща и `original: null | { profileName, sizeMb, reviewed, state: 'pending'|'kept'|'deleted' }`. При `pending` менюто показва бележка „Оригиналният профил още е на диска“. `name`/`browser` са `null` за сейф с криптирани метаданни (header v2), за който този Mac няма запис в локалния индекс: UI-ят показва „Заключен сейф“ с неутрална иконка до първото отключване. `add_vault_from_drive` също връща `name: null`.
 
 ## Menu bar иконка
 Template image (монохромна, macOS сам я оцветява): щит, затворен при всички заключени; щит с точка при отворен сейф; удивителна при грешка. Клик показва `tray`. Десен клик: „Заключи всички“, „Изход“.

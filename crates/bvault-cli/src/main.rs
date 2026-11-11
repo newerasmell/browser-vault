@@ -174,7 +174,9 @@ fn add_factor(draft: &mut Draft, mode: &str, from_stdin: bool) -> Result<(), Err
 }
 
 fn run(cli: Cli) -> Result<(), Error> {
-    let store = Store::default_location()?;
+    // The CLI only reads the app's name index; it never creates the
+    // Keychain item (macOS would then ask the app for access to it).
+    let store = Store::default_location()?.with_index_key(vault_core::index::keychain_read_only);
     match cli.cmd {
         Cmd::Create {
             name,
@@ -207,19 +209,20 @@ fn run(cli: Cli) -> Result<(), Error> {
             println!("{}", header.vault_id);
         }
         Cmd::List => {
-            for h in store.list()? {
+            for l in store.list_labeled()? {
+                let h = &l.header;
                 let state = if store.is_unlocked(&h.vault_id) {
                     "unlocked"
                 } else {
                     "locked"
                 };
-                println!(
-                    "{}  {:<8} {:<8} {}",
-                    h.vault_id,
-                    h.browser.as_str(),
-                    state,
-                    h.name
-                );
+                // v2 headers keep name and browser encrypted; without this
+                // Mac's index entry they are unknown until the next unlock.
+                let (browser, name) = match &l.label {
+                    Some(e) => (e.browser.as_str(), e.name.as_str()),
+                    None => ("?", "(locked)"),
+                };
+                println!("{}  {:<8} {:<8} {}", h.vault_id, browser, state, name);
             }
         }
         Cmd::Unlock {
@@ -282,7 +285,9 @@ fn run(cli: Cli) -> Result<(), Error> {
                 Err(e) => {
                     let _ = store.lock(&h.vault_id);
                     if matches!(e, Error::BrowserMissing) {
-                        eprintln!("Download: {}", h.browser.download_url());
+                        if let Ok(m) = unlocked.header.meta() {
+                            eprintln!("Download: {}", m.browser.download_url());
+                        }
                     }
                     return Err(e);
                 }

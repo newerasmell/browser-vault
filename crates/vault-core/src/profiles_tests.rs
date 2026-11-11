@@ -276,6 +276,8 @@ struct Fixture {
     roots: Roots,
     store: Store,
     session: Unlocked,
+    /// Copy of the VMK, to read the encrypted metadata after `close`.
+    vmk: crate::crypto::Key,
 }
 
 /// A store with one vault whose header records an import of `profile_id`,
@@ -298,11 +300,12 @@ fn fixture_with(
     let mut o = import_profile(&roots, browser, profile_id, &m, &ignore).unwrap();
     o.reviewed = reviewed;
     let mut h = nv.header;
-    h.original = Some(o);
+    h.meta_mut().unwrap().original = Some(o);
     h.seal_mac(nv.key.vmk()).unwrap();
     fs::create_dir_all(store.vault_dir(&h.vault_id)).unwrap();
     store.save_header(&h).unwrap();
     let verifier = PasswordVerifier::new(&h.kdf, nv.key.vmk(), PW).unwrap();
+    let vmk = nv.key.vmk().clone();
     let session = Unlocked {
         header: h,
         mountpoint: m,
@@ -315,15 +318,23 @@ fn fixture_with(
         roots,
         store,
         session,
+        vmk,
     }
 }
 
 fn state(f: &Fixture) -> Original {
-    f.store
-        .load(&f.session.header.vault_id)
+    load_open(f, &f.session.header.vault_id)
+        .meta()
         .unwrap()
         .original
+        .clone()
         .unwrap()
+}
+
+fn load_open(f: &Fixture, id: &str) -> Header {
+    let mut h = f.store.load(id).unwrap();
+    h.open_meta(&f.vmk).unwrap();
+    h
 }
 
 fn brave_originals_exist(f: &Fixture) -> bool {
@@ -377,9 +388,19 @@ fn cleanup_refused_with_wrong_password_or_no_verifier() {
 #[test]
 fn cleanup_refused_on_tampered_header() {
     let mut f = fixture(Browser::Brave, "Profile 1", false);
-    // Someone flips `reviewed` (or the paths) on disk without the VMK.
+    // Someone changes the encrypted metadata on disk without the VMK.
     let mut h = f.store.load(&f.session.header.vault_id).unwrap();
-    h.original.as_mut().unwrap().reviewed = true;
+    h.tamper_sealed_meta();
+    f.store.save_header(&h).unwrap();
+    let r = cleanup_original(&f.store, &f.roots, &mut f.session, PW, &ignore);
+    assert!(matches!(r, Err(Error::Format(_))));
+    assert!(brave_originals_exist(&f));
+
+    // v1 header: someone flips `reviewed` (or the paths) in the plain JSON.
+    let mut f = fixture(Browser::Brave, "Profile 1", false);
+    let mut h = load_open(&f, &f.session.header.vault_id);
+    h.downgrade_to_v1(&f.vmk);
+    h.meta_mut().unwrap().original.as_mut().unwrap().reviewed = true;
     f.store.save_header(&h).unwrap();
     let r = cleanup_original(&f.store, &f.roots, &mut f.session, PW, &ignore);
     assert!(matches!(r, Err(Error::Format(_))));
@@ -389,7 +410,7 @@ fn cleanup_refused_on_tampered_header() {
 #[test]
 fn brave_cleanup_removes_only_that_profile() {
     let mut f = fixture(Browser::Brave, "Profile 1", true);
-    let preview = cleanup_preview(&f.store, &f.roots, &f.session.header.vault_id).unwrap();
+    let preview = cleanup_preview(&f.store, &f.roots, &f.session).unwrap();
     assert_eq!(
         preview.items,
         [
@@ -531,10 +552,12 @@ fn ini_roundtrip() {
 fn close_marks_reviewed_once_and_keep_toggles() {
     let f = fixture(Browser::Brave, "Profile 1", false);
     let id = f.session.header.vault_id.clone();
+    let vmk = f.vmk.clone();
     // Not mounted here, so lock is a no-op; close then marks reviewed.
     f.store.close(f.session).unwrap();
-    let h = f.store.load(&id).unwrap();
-    let o = h.original.clone().unwrap();
+    let mut h = f.store.load(&id).unwrap();
+    h.open_meta(&vmk).unwrap();
+    let o = h.meta().unwrap().original.clone().unwrap();
     assert!(o.reviewed);
     assert_eq!(o.state, OriginalState::Pending);
 
@@ -843,7 +866,7 @@ fn cleanup_all_removes_exactly_the_imported_profiles() {
     let c = f.roots.brave_cache();
     let ls_before = fs::read(b.join("Local State")).unwrap();
 
-    let preview = cleanup_preview(&f.store, &f.roots, &f.session.header.vault_id).unwrap();
+    let preview = cleanup_preview(&f.store, &f.roots, &f.session).unwrap();
     assert_eq!(
         preview.items,
         [

@@ -4,6 +4,7 @@
 //! ~/Library/Application Support/BrowserVault/
 //!   vaults/<vault-id>/image.sparsebundle
 //!   vaults/<vault-id>/header.json (+ .bak)
+//!   index.bin                  (this Mac's encrypted name index, see `index`)
 //!   mnt/<vault-id>/            (700, mountpoint while unlocked)
 //!   run/<vault-id>.pid         (PID of the vault's browser while it runs)
 //! ```
@@ -19,6 +20,7 @@ use crate::events::{CreateStage, Event, Notify};
 use crate::fido2::Authenticator;
 use crate::hdiutil;
 use crate::header::{Header, VaultSettings};
+use crate::index::{self, KeyProvider};
 use crate::keyslot::{self, Draft, UnlockedKey};
 use crate::profiles::{self, PasswordVerifier, Roots};
 use crate::se::SecureEnclave;
@@ -31,6 +33,15 @@ pub const HOME_ENV: &str = "BVAULT_HOME";
 
 pub struct Store {
     root: PathBuf,
+    /// Key for the local name index (`index.bin`); see [`Store::with_index_key`].
+    index_key: KeyProvider,
+}
+
+/// A vault in [`Store::list_labeled`]: its header plus what this Mac knows
+/// about it before unlocking (`None` = "Locked vault").
+pub struct Listed {
+    pub header: Header,
+    pub label: Option<index::Entry>,
 }
 
 /// Credential presented to unlock a vault.
@@ -107,8 +118,20 @@ fn check_id(id: &str) -> Result<()> {
 }
 
 impl Store {
+    /// A store at `root`. The name index uses [`index::default_provider`]
+    /// (login Keychain in macOS builds, nothing in tests / elsewhere).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Store { root: root.into() }
+        Store {
+            root: root.into(),
+            index_key: index::default_provider(),
+        }
+    }
+
+    /// Use another index key provider (tests: [`index::no_key`],
+    /// `index::memory_key`).
+    pub fn with_index_key(mut self, provider: KeyProvider) -> Self {
+        self.index_key = provider;
+        self
     }
 
     /// `$BVAULT_HOME`, else `~/Library/Application Support/BrowserVault`.
@@ -157,7 +180,79 @@ impl Store {
         Ok(h)
     }
 
+    /// Every vault, ordered by creation date then name (as far as known:
+    /// locked vaults without an index entry come last, by id).
     pub fn list(&self) -> Result<Vec<Header>> {
+        Ok(self.list_labeled()?.into_iter().map(|l| l.header).collect())
+    }
+
+    /// [`Store::list`] with each vault's display label: the decrypted (or
+    /// v1 plain) metadata if the header has it, else this Mac's index entry.
+    pub fn list_labeled(&self) -> Result<Vec<Listed>> {
+        let index = index::read(&self.root, self.index_key);
+        let mut out: Vec<Listed> = self
+            .list_headers()?
+            .into_iter()
+            .map(|h| {
+                let label = match h.try_meta() {
+                    Some(m) => Some(index::Entry::from_meta(m)),
+                    None => index.get(&h.vault_id).cloned(),
+                };
+                Listed { header: h, label }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            let key = |l: &Listed| match &l.label {
+                Some(e) => (0, e.created_at.clone(), e.name.clone()),
+                None => (1, String::new(), String::new()),
+            };
+            key(a)
+                .cmp(&key(b))
+                .then_with(|| a.header.vault_id.cmp(&b.header.vault_id))
+        });
+        Ok(out)
+    }
+
+    /// The display label of one vault (see [`Store::list_labeled`]).
+    pub fn label(&self, h: &Header) -> Option<index::Entry> {
+        match h.try_meta() {
+            Some(m) => Some(index::Entry::from_meta(m)),
+            None => index::read(&self.root, self.index_key).remove(&h.vault_id),
+        }
+    }
+
+    /// Best effort: remember `h`'s label on this Mac (needs open metadata).
+    pub fn index_put(&self, h: &Header) {
+        if let Some(m) = h.try_meta() {
+            if let Err(e) = index::put(
+                &self.root,
+                self.index_key,
+                &h.vault_id,
+                index::Entry::from_meta(m),
+            ) {
+                crate::trace::emit(&format!("index: not updated: {e}"));
+            }
+        }
+    }
+
+    /// Best effort: forget `id` in this Mac's index (vault deleted).
+    pub fn index_remove(&self, id: &str) {
+        if let Err(e) = index::remove(&self.root, self.index_key, id) {
+            crate::trace::emit(&format!("index: not updated: {e}"));
+        }
+    }
+
+    /// Delete a vault's files (image, header) and its index entry. The
+    /// caller makes sure it is locked and the user confirmed.
+    pub fn remove_vault(&self, id: &str) -> Result<()> {
+        check_id(id)?;
+        fs::remove_dir_all(self.vault_dir(id))?;
+        let _ = fs::remove_dir(self.mountpoint(id));
+        self.index_remove(id);
+        Ok(())
+    }
+
+    fn list_headers(&self) -> Result<Vec<Header>> {
         let dir = self.vaults_dir();
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
@@ -173,7 +268,6 @@ impl Store {
                 }
             }
         }
-        out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.name.cmp(&b.name)));
         Ok(out)
     }
 
@@ -184,9 +278,14 @@ impl Store {
         }
         let wanted = id_or_name.trim().to_lowercase();
         let mut hits: Vec<Header> = self
-            .list()?
+            .list_labeled()?
             .into_iter()
-            .filter(|h| h.name.to_lowercase() == wanted)
+            .filter(|l| {
+                l.label
+                    .as_ref()
+                    .is_some_and(|e| e.name.to_lowercase() == wanted)
+            })
+            .map(|l| l.header)
             .collect();
         match hits.len() {
             1 => Ok(hits.remove(0)),
@@ -195,9 +294,43 @@ impl Store {
         }
     }
 
+    /// Save atomically (+ `.bak`). A header with known metadata also
+    /// refreshes this Mac's index entry.
     pub fn save_header(&self, header: &Header) -> Result<()> {
         check_id(&header.vault_id)?;
-        header.save(&self.vault_dir(&header.vault_id))
+        header.save(&self.vault_dir(&header.vault_id))?;
+        self.index_put(header);
+        Ok(())
+    }
+
+    /// [`Store::load`] with the v2 metadata decrypted under the vault's key.
+    pub fn load_open(&self, id: &str, key: &UnlockedKey) -> Result<Header> {
+        let mut h = self.load(id)?;
+        h.open_meta(key.vmk())?;
+        Ok(h)
+    }
+
+    /// Convert `id`'s header to v2 (encrypted metadata) if it is still v1,
+    /// and refresh this Mac's index entry. Returns the header with its
+    /// metadata open. Refuses a header whose MAC does not verify under
+    /// `key` (re-sealing would bless the tampering). After the conversion
+    /// `header.json.bak` is the v2 header too, so no plain copy of the
+    /// metadata stays in the vault folder.
+    pub fn upgrade_header(&self, id: &str, key: &UnlockedKey) -> Result<Header> {
+        let mut h = self.load(id)?;
+        if !h.verify_mac(key.vmk()) {
+            return Err(Error::Invalid("header was modified outside the app"));
+        }
+        h.open_meta(key.vmk())?;
+        if h.upgrade(key.vmk())? {
+            let dir = self.vault_dir(id);
+            h.save(&dir)?;
+            // Second save: the .bak (the old v1 file) becomes v2 as well.
+            h.save(&dir)?;
+            crate::trace::emit(&format!("header {id}: upgraded to v2"));
+        }
+        self.index_put(&h);
+        Ok(h)
     }
 
     /// Finish a [`Draft`]: build the sealed header, create the encrypted
@@ -228,10 +361,11 @@ impl Store {
             pct: 10,
         });
         let mut settings = settings;
+        let browser = draft.browser();
         // Fresh Brave vaults start portable (logins work on any Mac). An
         // imported profile becomes portable only if its logins can be
         // converted below.
-        settings.portable_keys = draft.browser() == Browser::Brave && opts.import.is_none();
+        settings.portable_keys = browser == Browser::Brave && opts.import.is_none();
         let nv = draft.finish(settings)?;
         let id = nv.header.vault_id.clone();
         mkdir_700(&self.root)?;
@@ -250,7 +384,7 @@ impl Store {
                 stage: CreateStage::Profile,
                 pct: 80,
             });
-            if nv.header.browser == Browser::Firefox || opts.import.is_some() {
+            if browser == Browser::Firefox || opts.import.is_some() {
                 self.init_profile(&nv.header, &nv.key, opts, notify)
             } else {
                 Ok(None)
@@ -268,8 +402,9 @@ impl Store {
         let import_error = match import_result {
             None => None,
             Some(Ok((original, portable))) => {
-                header.original = Some(original);
-                header.settings.portable_keys = portable;
+                let m = header.meta_mut()?;
+                m.original = Some(original);
+                m.settings.portable_keys = portable;
                 header.seal_mac(nv.key.vmk())?;
                 self.save_header(&header)?;
                 None
@@ -296,6 +431,7 @@ impl Store {
         notify: Notify<'_>,
     ) -> Result<Option<Result<(crate::header::Original, bool)>>> {
         let id = &header.vault_id;
+        let browser = header.meta()?.browser;
         let mnt = self.mountpoint(id);
         mkdir_700(&self.root.join("mnt"))?;
         mkdir_700(&mnt)?;
@@ -305,12 +441,12 @@ impl Store {
             mkdir_700(&browser::profile_dir(&mnt))?;
             mkdir_700(&browser::cache_dir(&mnt))?;
             let imported = opts.import.as_ref().map(|req| {
-                profiles::import_profile(&req.roots, header.browser, &req.profile_id, &mnt, notify)
-                    .map(|original| {
+                profiles::import_profile(&req.roots, browser, &req.profile_id, &mnt, notify).map(
+                    |original| {
                         // Re-encrypt the COPY's logins for other Macs. If the
                         // Keychain can't be read (user clicked Deny), the
                         // vault stays tied to this Mac and still works here.
-                        let portable = header.browser == Browser::Brave
+                        let portable = browser == Browser::Brave
                             && match crate::portable::convert_mount_with(&mnt, req.roots.brave_key)
                             {
                                 Ok(st) => {
@@ -326,10 +462,11 @@ impl Store {
                                 }
                             };
                         (original, portable)
-                    })
+                    },
+                )
             });
             // After the import, so our managed block wins over an imported user.js.
-            if header.browser == Browser::Firefox {
+            if browser == Browser::Firefox {
                 browser::write_firefox_user_js(&mnt, Some(opts.disable_fxa))?;
             }
             Ok(imported)
@@ -345,14 +482,15 @@ impl Store {
     /// Mac's Keychain key to the portable key, detach, set the flag.
     pub fn make_portable(&self, id: &str, key: &UnlockedKey) -> Result<crate::portable::Stats> {
         let mut header = self.load(id)?;
-        if header.browser != Browser::Brave {
-            return Err(Error::Invalid("only Brave vaults need this"));
-        }
-        if header.settings.portable_keys {
-            return Ok(crate::portable::Stats::default());
-        }
         if !header.verify_mac(key.vmk()) {
             return Err(Error::Invalid("header was modified outside the app"));
+        }
+        header.open_meta(key.vmk())?;
+        if header.meta()?.browser != Browser::Brave {
+            return Err(Error::Invalid("only Brave vaults need this"));
+        }
+        if header.meta()?.settings.portable_keys {
+            return Ok(crate::portable::Stats::default());
         }
         let mnt = self.mountpoint(id);
         if hdiutil::is_mounted(&mnt) {
@@ -365,7 +503,8 @@ impl Store {
         let detached = hdiutil::detach_with_retries(&mnt);
         let stats = r?;
         detached?;
-        header.settings.portable_keys = true;
+        header.upgrade(key.vmk())?;
+        header.meta_mut()?.settings.portable_keys = true;
         header.seal_mac(key.vmk())?;
         self.save_header(&header)?;
         Ok(stats)
@@ -400,6 +539,16 @@ impl Store {
             #[cfg(any(test, feature = "test-password-slot"))]
             Credential::Password(p) => keyslot::unlock_with_password(&header, p)?,
         };
+        // v1 → v2 now that the VMK is known (never for a tampered header).
+        if key.header_intact {
+            match self.upgrade_header(id, &key) {
+                Ok(h) => header = h,
+                Err(e) => crate::trace::emit(&format!("header {id}: not upgraded: {e}")),
+            }
+        }
+        header.open_meta(key.vmk())?;
+        self.index_put(&header);
+        let browser = header.meta()?.browser;
         let mnt = self.mountpoint(id);
         if !hdiutil::is_mounted(&mnt) {
             mkdir_700(&self.root.join("mnt"))?;
@@ -410,11 +559,11 @@ impl Store {
         }
         mkdir_700(&browser::profile_dir(&mnt))?;
         mkdir_700(&browser::cache_dir(&mnt))?;
-        if header.browser == Browser::Firefox {
+        if browser == Browser::Firefox {
             browser::write_firefox_user_js(&mnt, None)?;
         }
         // Only vaults with an original still on disk pay the extra Argon2id.
-        let cleanup_verifier = match (&header.original, password) {
+        let cleanup_verifier = match (&header.meta()?.original, password) {
             (Some(o), Some(pw)) if o.state != crate::header::OriginalState::Deleted => {
                 Some(PasswordVerifier::new(&header.kdf, key.vmk(), pw)?)
             }
@@ -440,7 +589,8 @@ impl Store {
 
     /// Launch the vault's browser against the mounted volume and record its PID.
     pub fn launch(&self, unlocked: &Unlocked, binary: Option<&Path>) -> Result<Child> {
-        let browser = unlocked.header.browser;
+        let meta = unlocked.header.meta()?;
+        let browser = meta.browser;
         let bin = match binary {
             Some(b) => b.to_path_buf(),
             None => browser::detect(browser).ok_or(Error::BrowserMissing)?,
@@ -449,7 +599,7 @@ impl Store {
             browser,
             &bin,
             &unlocked.mountpoint,
-            unlocked.header.settings.portable_keys,
+            meta.settings.portable_keys,
         )?;
         mkdir_700(&self.root.join("run"))?;
         fs::write(
@@ -520,22 +670,31 @@ mod tests {
 
     const PW: &str = "correct horse battery";
 
+    /// A store with this Mac's (in-memory) index key and one saved vault.
     fn store_with_vault(name: &str) -> (tempfile::TempDir, Store, Header) {
         let d = tempfile::tempdir().unwrap();
-        let s = Store::new(d.path());
+        let s = Store::new(d.path()).with_index_key(index::memory_key);
+        let h = add_vault(&s, name).0;
+        (d, s, h)
+    }
+
+    fn add_vault(s: &Store, name: &str) -> (Header, UnlockedKey) {
         let nv = new_vault(name, Browser::Brave, PW, KdfCost::FAST)
             .unwrap()
             .0;
         mkdir_700(&s.vault_dir(&nv.header.vault_id)).unwrap();
         s.save_header(&nv.header).unwrap();
-        (d, s, nv.header)
+        (nv.header, nv.key)
     }
 
     #[test]
     fn list_load_resolve() {
         let (_d, s, h) = store_with_vault("Work");
         assert_eq!(s.list().unwrap().len(), 1);
-        assert_eq!(s.load(&h.vault_id).unwrap(), h);
+        let loaded = s.load(&h.vault_id).unwrap();
+        assert!(loaded.meta_locked());
+        assert_eq!(loaded.mac, h.mac);
+        assert_eq!(loaded.slots, h.slots);
         assert_eq!(s.resolve("work").unwrap().vault_id, h.vault_id);
         assert_eq!(s.resolve(&h.vault_id).unwrap().vault_id, h.vault_id);
         assert!(matches!(s.resolve("nope"), Err(Error::NotFound)));
@@ -544,12 +703,127 @@ mod tests {
     #[test]
     fn ambiguous_name_needs_id() {
         let (_d, s, _h) = store_with_vault("Work");
-        let nv = new_vault("work", Browser::Brave, PW, KdfCost::FAST)
+        add_vault(&s, "work");
+        assert!(matches!(s.resolve("WORK"), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn new_vault_header_on_disk_reveals_no_metadata() {
+        let (_d, s, h) = store_with_vault("Very Secret Name");
+        for f in ["header.json", "header.json.bak"] {
+            let p = s.vault_dir(&h.vault_id).join(f);
+            if !p.exists() {
+                continue;
+            }
+            let text = fs::read_to_string(p).unwrap();
+            for needle in ["Very Secret", "brave", "created_at", "settings", "202"] {
+                assert!(!text.contains(needle), "{f}: {needle}");
+            }
+        }
+    }
+
+    #[test]
+    fn labels_come_from_the_local_index() {
+        let (_d, s, h) = store_with_vault("Work");
+        let (h2, k2) = add_vault(&s, "Private");
+        let listed = s.list_labeled().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|l| l.header.meta_locked()));
+        let names: Vec<_> = listed
+            .iter()
+            .map(|l| l.label.as_ref().unwrap().name.as_str())
+            .collect();
+        assert!(names.contains(&"Work") && names.contains(&"Private"));
+        assert_eq!(
+            s.label(&s.load(&h.vault_id).unwrap()).unwrap().browser,
+            Browser::Brave
+        );
+
+        // The same store seen without the key (another Mac, Keychain reset):
+        // no names, generic "Locked vault"; resolve by name is impossible.
+        let blind = Store::new(s.root()).with_index_key(index::no_key);
+        let listed = blind.list_labeled().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|l| l.label.is_none()));
+        assert!(matches!(blind.resolve("work"), Err(Error::NotFound)));
+        assert_eq!(blind.resolve(&h.vault_id).unwrap().vault_id, h.vault_id);
+        // Unlocking (upgrade_header) on a Mac with a key restores the label.
+        let other = Store::new(s.root()).with_index_key(index::other_memory_key);
+        assert!(other.label(&other.load(&h2.vault_id).unwrap()).is_none());
+        other.upgrade_header(&h2.vault_id, &k2).unwrap();
+        assert_eq!(
+            other
+                .label(&other.load(&h2.vault_id).unwrap())
+                .unwrap()
+                .name,
+            "Private"
+        );
+
+        // Deleting a vault drops its entry.
+        s.remove_vault(&h2.vault_id).unwrap();
+        assert!(!index::read(s.root(), index::memory_key).contains_key(&h2.vault_id));
+        assert_eq!(s.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upgrade_refuses_tampered_header() {
+        let (_d, s, mut h) = store_with_vault("Work");
+        let nv = new_vault("X", Browser::Brave, PW, KdfCost::FAST).unwrap().0;
+        // A key that isn't this vault's: MAC does not verify.
+        assert!(s.upgrade_header(&h.vault_id, &nv.key).is_err());
+        h.tamper_sealed_meta();
+        h.save(&s.vault_dir(&h.vault_id)).unwrap();
+        let k = keyslot::unlock_with_password(&s.load(&h.vault_id).unwrap(), PW).unwrap();
+        assert!(!k.header_intact);
+        assert!(s.upgrade_header(&h.vault_id, &k).is_err());
+    }
+
+    /// `Store::unlock` converts a v1 header before mounting. Off macOS the
+    /// mount itself fails, but the conversion has happened by then.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unlock_converts_v1_header_before_mounting() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::new(d.path()).with_index_key(index::memory_key);
+        let nv = new_vault("Legacy", Browser::Firefox, PW, KdfCost::FAST)
             .unwrap()
             .0;
-        mkdir_700(&s.vault_dir(&nv.header.vault_id)).unwrap();
-        s.save_header(&nv.header).unwrap();
-        assert!(matches!(s.resolve("WORK"), Err(Error::Invalid(_))));
+        let mut h = nv.header;
+        h.downgrade_to_v1(nv.key.vmk());
+        let id = h.vault_id.clone();
+        mkdir_700(&s.vault_dir(&id)).unwrap();
+        h.save(&s.vault_dir(&id)).unwrap();
+        h.save(&s.vault_dir(&id)).unwrap();
+        assert!(fs::read_to_string(s.vault_dir(&id).join("header.json.bak"))
+            .unwrap()
+            .contains("Legacy"));
+        let blind = Store::new(d.path()).with_index_key(index::no_key);
+        // v1: the plain name is still listed, even without an index.
+        assert_eq!(
+            blind.list_labeled().unwrap()[0]
+                .label
+                .as_ref()
+                .unwrap()
+                .name,
+            "Legacy"
+        );
+
+        let r = s.unlock(&id, Credential::Password(PW), &devs());
+        assert!(matches!(r, Err(Error::Command { .. })), "no hdiutil here");
+        let on_disk = s.load(&id).unwrap();
+        assert_eq!(on_disk.version, crate::header::HEADER_VERSION);
+        assert!(on_disk.meta_locked());
+        for f in ["header.json", "header.json.bak"] {
+            let text = fs::read_to_string(s.vault_dir(&id).join(f)).unwrap();
+            assert!(!text.contains("Legacy") && !text.contains("firefox"), "{f}");
+        }
+        assert_eq!(s.label(&on_disk).unwrap().name, "Legacy");
+        assert_eq!(s.label(&on_disk).unwrap().browser, Browser::Firefox);
+        assert!(blind.list_labeled().unwrap()[0].label.is_none());
+        // Still opens with every factor it had.
+        let k = keyslot::unlock_with_password(&on_disk, PW).unwrap();
+        assert!(k.header_intact);
+        assert_eq!(s.load_open(&id, &k).unwrap().meta().unwrap().name, "Legacy");
     }
 
     #[test]

@@ -249,7 +249,8 @@ pub fn replace_begin(header: &Header, se: &dyn SecureEnclave) -> Result<(TotpSet
     if slot_data(header).is_none() {
         return Err(Error::Invalid("vault has no authenticator slot"));
     }
-    prepare(&header.vault_id, &header.name, se)
+    // Needs the open metadata (the name labels the authenticator entry).
+    prepare(&header.vault_id, &header.meta()?.name, se)
 }
 
 /// Step 2: the first code from the new app confirms it; the VMK is re-wrapped
@@ -1175,7 +1176,7 @@ mod tests {
     #[test]
     fn tampered_metadata_unlocks_but_is_flagged_and_not_resealed() {
         let mut v = vault();
-        v.header.name = "Evil".into();
+        v.header.tamper_sealed_meta();
         let k = unlock(&mut v.header, PW, &code_at(&v.seed, T0), &v.se, T0).unwrap();
         assert!(!k.header_intact);
         assert!(!v.header.verify_mac(&v.vmk), "tampering must stay visible");
@@ -1234,5 +1235,54 @@ mod tests {
         ] {
             assert_eq!(code_at(seed, t), code8[2..]);
         }
+    }
+
+    /// A v1 header (plain metadata, written by older versions) unlocks,
+    /// converts to v2 on the first unlock and keeps working.
+    #[test]
+    fn v1_header_upgrades_on_unlock_and_keeps_unlocking() {
+        use crate::store::Store;
+        let mut v = vault();
+        let meta = v.header.meta().unwrap().clone();
+        v.header.downgrade_to_v1(&v.vmk);
+        let id = v.header.vault_id.clone();
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::new(d.path()).with_index_key(crate::index::memory_key);
+        std::fs::create_dir_all(s.vault_dir(&id)).unwrap();
+        s.save_header(&v.header).unwrap();
+        s.save_header(&v.header).unwrap(); // .bak = v1 too
+        let mut h = s.load(&id).unwrap();
+        assert_eq!(h.version, crate::header::HEADER_VERSION_V1);
+        let key = unlock(&mut h, PW, &code_at(&v.seed, T0), &v.se, T0).unwrap();
+        assert!(key.header_intact);
+        s.save_header(&h).unwrap(); // counters, as Store::unlock does
+
+        let up = s.upgrade_header(&id, &key).unwrap();
+        assert_eq!(up.version, crate::header::HEADER_VERSION);
+        assert_eq!(up.meta().unwrap(), &meta);
+        for f in ["header.json", "header.json.bak"] {
+            let text = std::fs::read_to_string(s.vault_dir(&id).join(f)).unwrap();
+            assert!(!text.contains("Work"), "{f} still names the vault");
+            assert!(text.contains("\"version\": 2"), "{f}");
+        }
+        assert_eq!(s.label(&s.load(&id).unwrap()).unwrap().name, meta.name);
+
+        // Next unlocks: TOTP (counters keep working) and recovery.
+        let mut h = s.load(&id).unwrap();
+        assert!(h.meta_locked());
+        assert!(matches!(
+            unlock(&mut h, PW, &code_at(&v.seed, T0), &v.se, T0 + 1),
+            Err(Error::UnlockFailed)
+        ));
+        let k2 = unlock(&mut h, PW, &code_at(&v.seed, T0 + 30), &v.se, T0 + 30).unwrap();
+        assert!(k2.header_intact);
+        assert!(h.verify_mac(&v.vmk));
+        let k3 = unlock_with_recovery(&h, &v.phrase).unwrap();
+        assert!(k3.header_intact);
+        h.open_meta(k3.vmk()).unwrap();
+        assert_eq!(h.meta().unwrap(), &meta);
+        // A second upgrade is a no-op.
+        let again = s.upgrade_header(&id, &k2).unwrap();
+        assert_eq!(again.mac, s.load(&id).unwrap().mac);
     }
 }

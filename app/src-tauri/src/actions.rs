@@ -86,12 +86,17 @@ fn with_ctx<R>(
 }
 
 /// Load the current header and save `h` after a change; keep an open
-/// session's in-memory copy in sync so triggers see the new slots.
+/// session's in-memory copy in sync so triggers see the new slots. The
+/// session's copy always keeps its decrypted metadata (v2).
 fn commit(app: &AppHandle, h: &Header) -> CmdResult<()> {
     let st = state::get(app);
     st.store.save_header(h)?;
     if let Some(s) = lock(&st.sessions).get_mut(&h.vault_id) {
-        s.unlocked.header = h.clone();
+        let mut copy = h.clone();
+        if copy.meta_locked() && copy.open_meta(s.unlocked.key.vmk()).is_err() {
+            return Ok(());
+        }
+        s.unlocked.header = copy;
     }
     lockctl::vaults_changed(app);
     Ok(())
@@ -127,6 +132,10 @@ pub fn auth(
     if !key.header_intact {
         return Err(CmdError::new("header_modified"));
     }
+    // The VMK is known: convert a v1 header (plain metadata) to v2 now.
+    if let Err(e) = st.store.upgrade_header(id, &key) {
+        applog::log(&format!("header {id} not upgraded: {e}"));
+    }
     let token = new_token();
     let keys: Vec<String> = fido2::keys(&header).into_iter().map(|k| k.label).collect();
     lock(&st.actions).insert(
@@ -161,7 +170,7 @@ pub fn change_password(
     let st = state::get(app);
     keyslot::validate_password(&new_password).map_err(|_| CmdError::invalid())?;
     with_ctx(app, token, |c| {
-        let mut h = st.store.load(&c.id)?;
+        let mut h = st.store.load_open(&c.id, &c.key)?;
         if mode_of(&h) == "totp" {
             if c.via_recovery {
                 return Err(CmdError::invalid()); // use the reset flow
@@ -186,7 +195,7 @@ pub fn change_password(
 pub fn fido_rewrap(app: &AppHandle, token: &str, pin: Zeroizing<String>) -> CmdResult<Value> {
     let st = state::get(app);
     with_ctx(app, token, |c| {
-        let mut h = st.store.load(&c.id)?;
+        let mut h = st.store.load_open(&c.id, &c.key)?;
         let (_kdf, pw, done, slots) = c.pw_change.as_mut().ok_or(CmdError::invalid())?;
         let app2 = app.clone();
         let notify = move |e| emit_touch(&app2, e);
@@ -216,7 +225,7 @@ pub fn totp_begin(app: &AppHandle, token: &str) -> CmdResult<Value> {
         if c.via_recovery {
             return Err(CmdError::invalid()); // use the reset flow
         }
-        let h = st.store.load(&c.id)?;
+        let h = st.store.load_open(&c.id, &c.key)?;
         let (setup, pending) = totp::replace_begin(&h, st.se.as_ref())?;
         c.pending_totp = Some(pending);
         Ok(json!({ "secret": setup.secret.as_str(), "qrSvg": setup.qr_svg.as_str() }))
@@ -226,7 +235,7 @@ pub fn totp_begin(app: &AppHandle, token: &str) -> CmdResult<Value> {
 pub fn totp_confirm(app: &AppHandle, token: &str, code: Zeroizing<String>) -> CmdResult<Value> {
     let st = state::get(app);
     with_ctx(app, token, |c| {
-        let mut h = st.store.load(&c.id)?;
+        let mut h = st.store.load_open(&c.id, &c.key)?;
         let pending = c.pending_totp.as_ref().ok_or(CmdError::invalid())?;
         match totp::replace_confirm(
             &mut h,
@@ -260,7 +269,7 @@ pub fn add_fido2(
         if c.via_recovery {
             return Err(CmdError::invalid()); // needs the password
         }
-        let mut h = st.store.load(&c.id)?;
+        let mut h = st.store.load_open(&c.id, &c.key)?;
         let app2 = app.clone();
         let notify = move |e| emit_touch(&app2, e);
         let label = fido2::add_key(
@@ -308,7 +317,7 @@ pub fn recovery_confirm(
         if parsed.len() < 3 || !recovery::verify_answers(phrase, &parsed) {
             return Ok(json!({ "ok": false }));
         }
-        let mut h = st.store.load(&c.id)?;
+        let mut h = st.store.load_open(&c.id, &c.key)?;
         keyslot::set_recovery(&mut h, &c.key, phrase)?;
         commit(app, &h)?;
         c.pending_recovery = None;
@@ -328,6 +337,9 @@ pub fn auth_recovery(app: &AppHandle, id: &str, phrase: Zeroizing<String>) -> Cm
     drop(phrase);
     if !key.header_intact {
         return Err(CmdError::new("header_modified"));
+    }
+    if let Err(e) = st.store.upgrade_header(id, &key) {
+        applog::log(&format!("header {id} not upgraded: {e}"));
     }
     let token = new_token();
     let mode = mode_of(&header);
@@ -361,7 +373,7 @@ pub fn reset_begin(
     let st = state::get(app);
     keyslot::validate_password(&new_password).map_err(|_| CmdError::invalid())?;
     with_ctx(app, token, |c| {
-        let h = st.store.load(&c.id)?;
+        let h = st.store.load_open(&c.id, &c.key)?;
         if mode_of(&h) != "totp" {
             return Err(CmdError::invalid());
         }
@@ -377,7 +389,7 @@ pub fn reset_begin(
 pub fn reset_confirm(app: &AppHandle, token: &str, code: Zeroizing<String>) -> CmdResult<Value> {
     let st = state::get(app);
     with_ctx(app, token, |c| {
-        let mut h = st.store.load(&c.id)?;
+        let mut h = st.store.load_open(&c.id, &c.key)?;
         let pending = c.pending_totp.as_ref().ok_or(CmdError::invalid())?;
         let pw = c.reset_password.as_ref().ok_or(CmdError::invalid())?;
         match totp::reset_with_recovery(
@@ -417,7 +429,9 @@ pub fn make_portable(app: &AppHandle, token: &str) -> CmdResult<Value> {
             other => other.into(),
         })?;
         if let Some(s) = lock(&st.sessions).get_mut(&c.id) {
-            s.unlocked.header.settings.portable_keys = true;
+            if let Ok(m) = s.unlocked.header.meta_mut() {
+                m.settings.portable_keys = true;
+            }
         }
         lockctl::vaults_changed(app);
         applog::log(&format!(

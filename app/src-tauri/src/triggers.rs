@@ -103,7 +103,11 @@ fn idle_loop(app: AppHandle) {
         };
         let global = lock(&st.settings).idle_minutes;
         let _ = lockctl::lock_matching(&app, Reason::Idle, |s| {
-            idle_expired(idle, global, s.unlocked.header.settings.idle_minutes)
+            idle_expired(
+                idle,
+                global,
+                s.unlocked.header.settings_or_default().idle_minutes,
+            )
         });
     }
 }
@@ -124,7 +128,7 @@ fn key_loop(app: AppHandle) {
                     id.clone(),
                     s.generation,
                     h.clone(),
-                    h.settings.lock_on_key_removal,
+                    h.settings_or_default().lock_on_key_removal,
                 )
             })
             .collect();
@@ -156,7 +160,7 @@ pub fn on_screen_lock(app: &AppHandle) {
     let app = app.clone();
     thread::spawn(move || {
         let _ = lockctl::lock_matching(&app, Reason::ScreenLock, |s| {
-            s.unlocked.header.settings.lock_on_screen_lock
+            s.unlocked.header.settings_or_default().lock_on_screen_lock
         });
     });
 }

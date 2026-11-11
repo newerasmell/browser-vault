@@ -110,7 +110,7 @@ fn create_with_import(s: &Store, roots: &Roots, b: Browser, profile_id: &str) ->
         .create_with(d, 1, VaultSettings::default(), &opts, &events::ignore)
         .unwrap();
     assert!(c.import_error.is_none(), "{:?}", c.import_error);
-    let o = c.header.original.clone().unwrap();
+    let o = c.header.meta().unwrap().original.clone().unwrap();
     assert_eq!(o.profile_id, profile_id);
     assert!(!o.reviewed);
     assert_eq!(o.state, OriginalState::Pending);
@@ -118,13 +118,20 @@ fn create_with_import(s: &Store, roots: &Roots, b: Browser, profile_id: &str) ->
 }
 
 /// Import → open + close (review) → delete, with the in-core refusals.
+/// The vault's metadata (encrypted in a v2 header): password-slot key, no mount.
+fn meta_of(s: &Store, id: &str) -> vault_core::header::Meta {
+    let h = s.load(id).unwrap();
+    let key = vault_core::keyslot::unlock_with_password(&h, PW).unwrap();
+    s.load_open(id, &key).unwrap().meta().unwrap().clone()
+}
+
 fn review_and_delete(s: &Store, roots: &Roots, id: &str, bin: &Path, check: impl Fn(&Path)) {
     let mut u = s.unlock(id, Credential::Password(PW), &devs()).unwrap();
     check(&u.mountpoint);
     let mut child = s.launch(&u, Some(bin)).unwrap();
     std::thread::sleep(Duration::from_secs(10));
     assert!(
-        !profiles::regular_browser_running(u.header.browser),
+        !profiles::regular_browser_running(u.header.meta().unwrap().browser),
         "the vault instance is not the regular one"
     );
     // Not reviewed yet: refused in core, whatever the caller.
@@ -134,10 +141,10 @@ fn review_and_delete(s: &Store, roots: &Roots, id: &str, bin: &Path, check: impl
     ));
     s.close(u).unwrap();
     let _ = child.wait();
-    assert!(s.load(id).unwrap().original.unwrap().reviewed);
+    assert!(meta_of(s, id).original.unwrap().reviewed);
 
     let mut u = s.unlock(id, Credential::Password(PW), &devs()).unwrap();
-    let preview = profiles::cleanup_preview(s, roots, id).unwrap();
+    let preview = profiles::cleanup_preview(s, roots, &u).unwrap();
     eprintln!("cleanup preview: {preview:#?}");
     assert!(preview.reviewed && !preview.items.is_empty());
     assert!(matches!(
@@ -146,7 +153,7 @@ fn review_and_delete(s: &Store, roots: &Roots, id: &str, bin: &Path, check: impl
     ));
     profiles::cleanup_original(s, roots, &mut u, PW, &events::ignore).unwrap();
     s.close(u).unwrap();
-    let o = s.load(id).unwrap().original.unwrap();
+    let o = meta_of(s, id).original.unwrap();
     assert_eq!(o.state, OriginalState::Deleted);
     assert!(o.deleted_at.is_some());
 }
@@ -187,7 +194,7 @@ fn m7b_brave_import_and_cleanup() {
     assert_eq!(ids, ["Default", "Profile 1"]);
     let default_prefs = fs::read(udd.join("Default/Preferences")).unwrap();
 
-    let s = Store::new(d.path().join("BrowserVault"));
+    let s = Store::new(d.path().join("BrowserVault")).with_index_key(vault_core::index::no_key);
     let id = create_with_import(&s, &roots, Browser::Brave, "Profile 1");
     review_and_delete(&s, &roots, &id, &brave, |mnt| {
         assert!(mnt.join("profile/Default/Preferences").is_file());
@@ -262,10 +269,10 @@ fn m7b_brave_import_all_profiles_and_cleanup() {
         .collect();
     assert_eq!(ids, ["Default", "Profile 1"]);
 
-    let s = Store::new(d.path().join("BrowserVault"));
+    let s = Store::new(d.path().join("BrowserVault")).with_index_key(vault_core::index::no_key);
     let id = create_with_import(&s, &roots, Browser::Brave, profiles::ALL_PROFILES);
     assert_eq!(
-        s.load(&id).unwrap().original.unwrap().profile_name,
+        meta_of(&s, &id).original.unwrap().profile_name,
         "All profiles (2)"
     );
     // Created in regular Brave after the import: cleanup must not touch it.
@@ -355,7 +362,7 @@ fn m7b_firefox_import_and_cleanup() {
     )
     .unwrap();
 
-    let s = Store::new(d.path().join("BrowserVault"));
+    let s = Store::new(d.path().join("BrowserVault")).with_index_key(vault_core::index::no_key);
     let id = create_with_import(&s, &roots, Browser::Firefox, "Profiles/bbb.work");
     review_and_delete(&s, &roots, &id, &firefox, |mnt| {
         let uj = fs::read_to_string(mnt.join("profile/user.js")).unwrap();
