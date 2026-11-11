@@ -156,3 +156,38 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 Отворени въпроси:
 1. Ако след импорта потребителят изтрие профил в Brave и Brave по-късно създаде нов със същото име на папка (на практика не става: Brave брои с `profiles_created`), cleanup ще изтрие и него.
 2. Профили, които са в `info_cache`, но нямат папка, не се импортират и записите им остават в обикновения `Local State`.
+
+## Режим „призрак“ и маскировка (Настройки → Общи → Поверителност)
+
+Цел: защита от **бегъл поглед** към Mac-а (plausible deniability), не криминалистична невидимост. Подсказката в UI-я го казва изрично.
+
+**Режим „призрак“** (`ghostMode`, по подразбиране изключен):
+- Иконата в menu bar се скрива (`TrayIcon::set_visible(false)`); Dock икона няма и без това (`LSUIElement`). При изключване иконата се връща.
+- Всички известия спират (`lockctl::notify` е единственото място, което ги праща).
+- **Клавиш за показване** (`revealHotkey`, по подразбиране `⌃⌥⌘B`): същите правила като panic клавиша (`hotkey::allowed`) и трябва да е различен от него (`hotkey::same`, иначе `hotkey_clash`). Регистрира се само в режим „призрак“; `register_hotkey` регистрира и двата, а handler-ът в `main.rs` ги различава с `hotkey::dispatch`. Показва tray прозореца горе вдясно под menu bar-а (`windows::reveal_tray`, няма икона, спрямо която да се позиционира). Panic клавишът си остава „заключи всички“.
+- Повторно стартиране: двоен клик на вече работещото приложение → `RunEvent::Reopen` → в режим „призрак“ нищо; иначе показва менюто. Втори процес (`open -n`) → `tauri-plugin-single-instance`: вторият процес излиза веднага, преди да създаде каквото и да е; първият показва менюто само ако не е „призрак“ или ако е подаден `--reveal`.
+- **Ако клавишът е забравен:** в Terminal `open -n -a "<име на приложението>" --args --reveal` (напр. `open -n -a "Font Cache Helper" --args --reveal`). `-n` е нужно: без него macOS само активира работещото приложение и не подава аргументите. Ако приложението не работи, `--reveal` се обработва и при първо стартиране.
+- Без фалшиви съобщения за грешка и без имитация на системни диалози.
+- Не се скриват: браузърът на отключен сейф (прозорци, Dock), процесът в Activity Monitor, следите на диска.
+
+**Маскировка** (`disguise`; таблицата е в `app/src-tauri/src/disguise.rs`): `none` + „Font Cache Helper“, „Display Profile Tool“, „Archive Index“. Имената и иконите са измислени за това приложение; иконите се рисуват от `app/src-tauri/disguises/generate.py` (Pillow, `.icns` се пише на ръка: `icns` + дължина + записи `ic07..ic10` с PNG) и се пакетират като Tauri resources (`Contents/Resources/disguises/`). `browser-vault.icns` е нормалната иконка, за връщане към „Без“.
+
+Какво прави `apply_disguise` на macOS (`disguise::apply`), по ред:
+1. Отказ, ако текущата маскировка е същата (`disguise_same`), ако не работи от `.app` (`disguise_unsupported`), ако има отключен/монтиран сейф, сейф в грешка или отворена чернова в wizard-а (`disguise_unlocked`, плюс проверка на `mount` за нещо под store root-а).
+2. Предварителна проверка: непразна папка с данни с новото име → `disguise_data_exists`. Съществуващ `<Име>.app` на целевото място, който не е наш (CFBundleExecutable не е от таблицата) → `disguise_target_exists`; ако е наш (останал от предишен опит) → изтрива се.
+3. Копие с `ditto` в `/Applications/<Име>.app` (или до текущия bundle, ако `/Applications` не е writable) → `xattr -cr` (quarantine и др.) → `Contents/MacOS/<exe>` се преименува на неутралното име (напр. `fontcache-helper`) → иконата се копира в `Contents/Resources` → `plutil -replace` на `CFBundleName`, `CFBundleDisplayName`, `CFBundleExecutable`, `CFBundleIdentifier` (напр. `local.fontcache.helper`), `CFBundleIconFile`, `BVStoreName` (за „Без“: `-remove BVStoreName`) → `plutil -convert xml1` → прочитане обратно и сверка (`plist_matches`) → `codesign --force --deep --sign -` → `codesign --verify --deep --strict`. При грешка копието се трие и нищо друго не е пипнато (`disguise_failed`).
+4. `settings.disguise` се записва в текущата папка (мести се заедно с нея).
+5. Папката с данни `~/Library/Application Support/<старо>` → `<ново>` с един `rename` (същият том; всички сейфове са заключени, mount точките са под root-а). При грешка: настройките се връщат, копието се трие. При `BVAULT_HOME` данните не се местят (env-ът печели).
+6. Логът спира да пише (`applog::suspend`) и `~/Library/Logs/<старо>` → `<ново>`.
+7. Ако е включено „Стартиране при вход“: старият LaunchAgent се маха; новият процес при старт го регистрира наново със своето име и път (autostart plugin-ът е с `app_name = CFBundleName`, т.е. `~/Library/LaunchAgents/<Име>.plist`).
+8. Старият bundle се изтрива (ако може; от DMG или App Translocation не може и остава).
+9. Отделен `/bin/sh` (собствена process group) изчаква текущия PID да излезе (single-instance socket-ът се освобождава), трие следите на стария bundle id (`~/Library/{WebKit,Caches,HTTPStorages}/<id>`, `Preferences/<id>.plist`, `Saved Application State/<id>.savedState`) и пуска `open -n <ново>.app`. Текущият процес излиза без да пипа store-а (`AppState::relaunching`).
+
+**Имена:** `vault_core::identity` чете `Contents/Info.plist` на работещия bundle (до изпълнимия файл; XML, затова `-convert xml1`): `BVStoreName` → име на папките с данни и логове (валидира се: един компонент, без `/`, без водеща точка; иначе `BrowserVault`), `CFBundleDisplayName`/`CFBundleName` → заглавие на известия, tooltip и прозорци. Извън bundle (CLI, `tauri dev`, Linux) всичко е по подразбиране; **CLI-ят не намира данните на маскирано приложение** — ползвай `BVAULT_HOME="~/Library/Application Support/<BVStoreName>"`. Името на процеса = името на изпълнимия файл. Crash guard-ът е с `$0 = idle-watch` (`identity::GUARD_NAME`; изключването в `pids_matching` и в самия скрипт ползва същото име).
+
+**Устойчивост при срив по средата:** при старт (`disguise::adopt_on_start`, преди лога и store-а), ако папката с данни на текущото име липсва, а съществува **точно една** друга позната папка от таблицата (и нищо не е монтирано под нея), тя се преименува към текущото име. Същото за папката с логове. Така и прекъснато превключване, и пуснат стар bundle намират данните.
+
+**Остават видими (известно):** томовете `BV-<id>` съществуват само докато сейфът е отключен; socket-ът на single-instance е `/tmp/com_browservault_app_si.sock` (идва от identifier-а в `tauri.conf.json` по време на build); `~/Library/WebKit/<нов id>` се създава от WebKit; заглавията на системните диалози в `commands.rs` (изтриване на сейф, грешка при импорт) още са „Browser Vault“; текстовете в самите прозорци казват „Browser Vault“; в не-„призрак“ режим menu bar иконата е същият щит.
+
+**Тествано само на Linux (unit тестове):** таблицата, plist ключовете и редакциите (`plist_edits` върху модел), пътищата, преместване/осиновяване на папки, `mount` парсване, dispatch на клавишите, настройки (round-trip, стари файлове, reveal ≠ panic). Самото превключване (`ditto`/`plutil`/`codesign`/`open`), `set_visible`, позицията на менюто, single-instance и Reopen трябва да се проверят на истински Mac.
+

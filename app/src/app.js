@@ -583,8 +583,9 @@ async function viewSettings(params) {
     content.append(await ({ general, vaultsTab, browsersTab, about })[tab === 'vaults' ? 'vaultsTab' : tab === 'browsers' ? 'browsersTab' : tab]());
   };
 
-  function general() {
-    const hk = h('kbd', {}, s.panicHotkey);
+  // Global hotkey recorder: `field` is 'panicHotkey' or 'revealHotkey'.
+  function hotkeyRow(label, field, hint) {
+    const hk = h('kbd', {}, s[field]);
     const rec = h('button', { class: 'btn sm ghost', onclick: () => {
       hk.textContent = t('press_keys'); rec.disabled = true;
       const handler = (e) => {
@@ -601,15 +602,68 @@ async function viewSettings(params) {
         const mods = [e.ctrlKey, e.altKey, e.shiftKey, e.metaKey].filter(Boolean).length;
         const cmdShiftOnly = mods === 2 && e.metaKey && e.shiftKey;
         if (mods < 2 || cmdShiftOnly || !key || key.length > 3) {
-          hk.textContent = s.panicHotkey; toast(t('hotkey_invalid')); return;
+          hk.textContent = s[field]; toast(t('hotkey_invalid')); return;
         }
+        const other = field === 'panicHotkey' ? s.revealHotkey : s.panicHotkey;
+        if (combo === other) { hk.textContent = s[field]; toast(t('hotkey_clash')); return; }
         hk.textContent = combo;
-        save({ panicHotkey: combo }).catch(() => { hk.textContent = s.panicHotkey; toast(t('hotkey_invalid')); });
+        save({ [field]: combo }).catch((err) => {
+          hk.textContent = s[field]; toast(t(err?.code === 'hotkey_clash' ? 'hotkey_clash' : 'hotkey_invalid'));
+        });
       };
       window.addEventListener('keydown', handler, true);
       cleanup.push(() => window.removeEventListener('keydown', handler, true));
     } }, t('change'));
+    return h('div', { class: 'toggle-row' },
+      h('span', { class: 'toggle-text' }, label, hint && h('small', {}, hint)), h('span', { class: 'row' }, hk, rec));
+  }
 
+  // Recovery when the reveal hotkey is forgotten (handled in main.rs).
+  const revealCmd = (name) => h('code', { class: 'cmd' }, `open -n -a "${name}" --args --reveal`);
+
+  // Disguise: pick, confirm inside the window (no native dialog), apply.
+  function disguiseRow(dg) {
+    const cur = dg.items.find((d) => d.id === dg.current) || dg.items[0];
+    let picked = cur.id;
+    const apply = h('button', { class: 'btn sm', disabled: true, onclick: () => confirmDisguise(dg.items.find((d) => d.id === picked)) }, t('disguise_apply'));
+    const sel = h('select', { class: 'input select', disabled: !dg.supported, onchange: (e) => { picked = e.target.value; apply.disabled = picked === cur.id; } },
+      dg.items.map((d) => h('option', { value: d.id, selected: d.id === cur.id }, d.id === 'none' ? t('disguise_none') : d.name)));
+    return h('div', { class: 'toggle-row' },
+      h('span', { class: 'toggle-text' }, t('disguise'),
+        h('small', {}, dg.supported ? t('disguise_hint', { name: cur.name }) : t('disguise_unsupported_hint'))),
+      h('span', { class: 'row' }, sel, apply));
+  }
+
+  function confirmDisguise(d) {
+    const sheet = h('div', { class: 'sheet form' });
+    const overlay = h('div', { class: 'overlay sheet-overlay' }, sheet);
+    const err = h('p', { class: 'error', role: 'alert' });
+    const close = () => overlay.remove();
+    const go = h('button', { class: 'btn primary', type: 'button', onclick: async () => {
+      err.textContent = ''; go.disabled = true;
+      try {
+        const r = await api('apply_disguise', { disguise: d.id });
+        sheet.replaceChildren(h('h2', {}, t('disguise_restarting', { name: r.name })),
+          h('p', { class: 'muted' }, t('disguise_restarting_body')));
+      } catch (e) {
+        const k = 'err_' + (e && e.code);
+        err.textContent = t(k) !== k ? t(k) : t('err_disguise_failed');
+        go.disabled = false;
+      }
+    } }, t('disguise_apply'));
+    const name = d.id === 'none' ? 'Browser Vault' : d.name;
+    sheet.append(h('h2', {}, t('disguise_confirm_title', { name })),
+      h('ul', { class: 'checklist steps' }, t('disguise_confirm_steps').map((x) => h('li', {}, icon('check', 'sm'), h('span', {}, x.replaceAll('{name}', name))))),
+      h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, t('disguise_recovery'), ' ', revealCmd(name))),
+      err,
+      h('div', { class: 'wiz-nav' }, h('button', { class: 'btn ghost', type: 'button', onclick: close }, t('cancel')), go));
+    el.append(overlay);
+    cleanup.push(close);
+  }
+
+  async function general() {
+    const dg = await api('list_disguises');
+    const appName = (dg.items.find((d) => d.id === dg.current) || dg.items[0]).name;
     return h('div', { class: 'form' },
       h('h2', {}, t('tab_general')),
       h('div', { class: 'group' },
@@ -617,12 +671,18 @@ async function viewSettings(params) {
           h('select', { class: 'input select', onchange: (e) => { setLang(e.target.value); save({ language: e.target.value }); route(); } },
             languages.map(([v, n]) => h('option', { value: v, selected: v === getLang() }, n)))),
         toggle(t('launch_login'), s.launchAtLogin, (v) => save({ launchAtLogin: v })),
-        h('div', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, t('panic_hotkey')), h('span', { class: 'row' }, hk, rec))),
+        hotkeyRow(t('panic_hotkey'), 'panicHotkey')),
       h('h3', {}, t('lock_triggers')),
       h('div', { class: 'group' },
         h('div', { class: 'toggle-row' }, h('span', { class: 'toggle-text' }, t('idle_lock')), idleSelect(s.idleMinutes, (v) => save({ idleMinutes: v }))),
         toggle(t('lock_screen'), s.lockOnScreenLock, (v) => save({ lockOnScreenLock: v })),
-        toggle(t('lock_key_removal'), s.lockOnKeyRemoval, (v) => save({ lockOnKeyRemoval: v }))));
+        toggle(t('lock_key_removal'), s.lockOnKeyRemoval, (v) => save({ lockOnKeyRemoval: v }))),
+      h('h3', {}, t('privacy')),
+      h('div', { class: 'group' },
+        toggle(t('ghost_mode'), s.ghostMode, (v) => save({ ghostMode: v }), t('ghost_hint')),
+        hotkeyRow(t('reveal_hotkey'), 'revealHotkey', [t('reveal_hint'), ' ', revealCmd(appName)]),
+        disguiseRow(dg)),
+      h('p', { class: 'muted' }, h('small', {}, t('privacy_limits'))));
   }
 
   function originalBlock(v) {

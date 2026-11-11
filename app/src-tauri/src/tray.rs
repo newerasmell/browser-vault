@@ -53,7 +53,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     TrayIconBuilder::with_id(ID)
         .icon(image(IconState::Locked))
         .icon_as_template(true)
-        .tooltip("Browser Vault")
+        .tooltip(vault_core::identity::display_name())
         .menu(&menu(app)?)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, ev| match ev.id().as_ref() {
@@ -74,7 +74,16 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
     refresh(app);
+    apply_ghost(app);
     Ok(())
+}
+
+/// Ghost mode hides the menu bar icon; turning it off shows it again.
+pub fn apply_ghost(app: &AppHandle) {
+    let ghost = lock(&state::get(app).settings).ghost_mode;
+    if let Some(tray) = app.tray_by_id(ID) {
+        let _ = tray.set_visible(!ghost);
+    }
 }
 
 pub fn current_state(app: &AppHandle) -> IconState {

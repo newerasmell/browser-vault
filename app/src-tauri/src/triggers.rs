@@ -161,14 +161,27 @@ pub fn on_screen_lock(app: &AppHandle) {
     });
 }
 
-/// (Re-)register the panic hotkey from settings. Returns false if the OS
-/// refused it (e.g. taken by another app).
+/// The reveal hotkey, if it should be registered (ghost mode only).
+pub fn active_reveal_hotkey(s: &crate::settings::Settings) -> Option<String> {
+    s.ghost_mode.then(|| s.reveal_hotkey.clone())
+}
+
+/// (Re-)register the panic hotkey and, in ghost mode, the reveal hotkey
+/// from settings. Returns false if the OS refused the panic hotkey (e.g.
+/// taken by another app). The handler in main.rs tells them apart with
+/// `hotkey::dispatch`.
 pub fn register_hotkey(app: &AppHandle) -> bool {
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
-    let combo = state::get(app).settings().panic_hotkey;
-    let shortcut = hotkey::parse(&combo).or_else(|| hotkey::parse(hotkey::DEFAULT));
-    shortcut.is_some_and(|s| gs.register(s).is_ok())
+    let s = state::get(app).settings();
+    let shortcut = hotkey::parse(&s.panic_hotkey).or_else(|| hotkey::parse(hotkey::DEFAULT));
+    let ok = shortcut.is_some_and(|sc| gs.register(sc).is_ok());
+    if let Some(reveal) = active_reveal_hotkey(&s).and_then(|r| hotkey::parse(&r)) {
+        if shortcut != Some(reveal) && gs.register(reveal).is_err() {
+            crate::applog::log("reveal hotkey: refused by the system");
+        }
+    }
+    ok
 }
 
 /// Called from `setup` on the main thread.

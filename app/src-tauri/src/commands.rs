@@ -736,6 +736,8 @@ pub fn save_settings(
     lock_on_screen_lock: Option<bool>,
     lock_on_key_removal: Option<bool>,
     panic_hotkey: Option<String>,
+    ghost_mode: Option<bool>,
+    reveal_hotkey: Option<String>,
 ) -> CmdResult<Settings> {
     let st = state::get(&app);
     let (before, after) = {
@@ -748,13 +750,27 @@ pub fn save_settings(
             lock_on_screen_lock,
             lock_on_key_removal,
             panic_hotkey,
+            ghost_mode,
+            reveal_hotkey,
         })
-        .map_err(|_| CmdError::invalid())?;
+        .map_err(|e| {
+            CmdError::new(if e == "hotkey clash" {
+                "hotkey_clash"
+            } else {
+                "invalid"
+            })
+        })?;
         (before, s.clone())
     };
     after.save(st.store.root())?;
-    if before.panic_hotkey != after.panic_hotkey {
+    if before.panic_hotkey != after.panic_hotkey
+        || before.reveal_hotkey != after.reveal_hotkey
+        || before.ghost_mode != after.ghost_mode
+    {
         triggers::register_hotkey(&app);
+    }
+    if before.ghost_mode != after.ghost_mode {
+        tray::apply_ghost(&app);
     }
     if before.language != after.language {
         tray::rebuild_menu(&app);
@@ -1186,4 +1202,37 @@ mod tests {
         assert_eq!(bytes_to_mb(1024 * 1024), 1);
         assert_eq!(bytes_to_mb(1024 * 1024 * 3 / 2), 2);
     }
+}
+
+// ---------------------------------------------------------------- disguise (Settings → Privacy)
+
+/// `{ current, supported, items: [{ id, name }] }`. `supported` is false
+/// outside a macOS app bundle (dev builds, Linux).
+#[tauri::command]
+pub fn list_disguises() -> Value {
+    let supported = cfg!(target_os = "macos") && crate::disguise::current_bundle().is_some();
+    json!({
+        "current": crate::disguise::current().id,
+        "supported": supported,
+        "items": crate::disguise::DISGUISES
+            .iter()
+            .map(|d| json!({ "id": d.id, "name": d.name }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Switch to another disguise (or back to "none"). All vaults must be
+/// locked (`disguise_unlocked`). On success the app quits and the renamed
+/// copy starts; returns `{ name }` first. Other codes: `disguise_same`,
+/// `disguise_target_exists`, `disguise_data_exists`, `disguise_failed`,
+/// `disguise_unsupported`.
+#[tauri::command]
+pub async fn apply_disguise(app: AppHandle, disguise: String) -> CmdResult<Value> {
+    let d = crate::disguise::by_id(&disguise).ok_or(CmdError::invalid())?;
+    blocking(move || {
+        crate::disguise::apply(&app, d)
+            .map(|name| json!({ "name": name }))
+            .map_err(CmdError::new)
+    })
+    .await
 }

@@ -306,3 +306,5 @@ body.preview #app > * { margin: 24px auto; border-radius: 12px; box-shadow: 0 0 
 .backup-box .row.grow { flex: 1; min-width: 0; }
 .backup-box .progress { max-width: none; flex: 1; }
 .backup-box .path { display: block; color: var(--muted); font: 11.5px/1.5 var(--mono); word-break: break-all; -webkit-user-select: text; user-select: text; }
+.cmd { white-space: nowrap; font-family: ui-monospace, Menlo, monospace; font-size: 11px; user-select: all; }
+.checklist.steps li { flex-wrap: nowrap; align-items: flex-start; }

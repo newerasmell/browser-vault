@@ -305,9 +305,15 @@ pub fn pids_matching(ps: &str, mnt: &Path, real: &Path, own_pid: i32) -> Vec<i32
             // never keep a vault open after its browser quit.
             let exe = cmd.split(" --").next().unwrap_or(cmd);
             let browser = exe.contains(".app/Contents/");
-            let tooling = ["bv-crash-guard", "hdiutil", "mdutil", "/bin/ps", "grep"]
-                .iter()
-                .any(|t| exe.contains(t));
+            let tooling = [
+                crate::identity::GUARD_NAME,
+                "hdiutil",
+                "mdutil",
+                "/bin/ps",
+                "grep",
+            ]
+            .iter()
+            .any(|t| exe.contains(t));
             (hit && browser && !tooling && pid != own_pid).then_some(pid)
         })
         .collect()
@@ -332,7 +338,7 @@ done
 mounted || exit 0
 # Every process using the vault (the browser may have relaunched itself
 # under a new PID), never this guard itself.
-users() { /bin/ps -axww -o pid=,command= | /usr/bin/grep -F -e "$MNT" -e "$ORIG" | /usr/bin/grep -v -e bv-crash-guard -e grep | /usr/bin/awk '{print $1}'; }
+users() { /bin/ps -axww -o pid=,command= | /usr/bin/grep -F -e "$MNT" -e "$ORIG" | /usr/bin/grep -v -e "$0" -e grep | /usr/bin/awk '{print $1}'; }
 kill -TERM "$BR" 2>/dev/null
 for p in $(users); do kill -TERM "$p" 2>/dev/null; done
 i=0; while [ -n "$(users)" ] && [ $i -lt 8 ]; do sleep 1; i=$((i+1)); done
@@ -346,7 +352,7 @@ done
     std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg(SCRIPT)
-        .arg("bv-crash-guard")
+        .arg(crate::identity::GUARD_NAME)
         .arg(app_pid.to_string())
         .arg(browser_pid.to_string())
         // `mount` lists the resolved path (/var → /private/var); the
@@ -427,7 +433,7 @@ mod relaunch_tests {
         let mnt = Path::new("/Users/a/Library/Application Support/BrowserVault/mnt/x");
         let real = mnt;
         let ps = "  101 /Applications/Firefox.app/Contents/MacOS/firefox --new-instance -profile /Users/a/Library/Application Support/BrowserVault/mnt/x/profile
-  102 /bin/sh -c ... bv-crash-guard 1 2 /Users/a/Library/Application Support/BrowserVault/mnt/x
+  102 /bin/sh -c ... idle-watch 1 2 /Users/a/Library/Application Support/BrowserVault/mnt/x
   103 /usr/bin/hdiutil detach /Users/a/Library/Application Support/BrowserVault/mnt/x
   104 /Applications/Firefox.app/Contents/MacOS/firefox -profile /Users/a/Other/profile
   105 /Applications/Brave Browser.app/Contents/MacOS/Brave Browser --user-data-dir=/Users/a/Library/Application Support/BrowserVault/mnt/x/profile

@@ -22,7 +22,6 @@ use crate::state::{self, lock};
 pub const TRAY: &str = "tray";
 pub const TRAY_WIDTH: f64 = 360.0;
 const TRAY_INITIAL_HEIGHT: f64 = 420.0;
-const TITLE: &str = "Browser Vault";
 
 /// Injected into the tray webview only: keeps the borderless popover exactly
 /// as tall as its content ("360 × auto"), via the internal `tray_fit` command.
@@ -124,7 +123,7 @@ pub fn open(app: &AppHandle, view: &str, params: &BTreeMap<String, String>) -> C
         &s.label,
         WebviewUrl::App(format!("index.html#{}", s.hash).into()),
     )
-    .title(TITLE)
+    .title(vault_core::identity::display_name())
     .inner_size(s.size.0, s.size.1)
     .resizable(false)
     .maximizable(false)
@@ -150,7 +149,7 @@ pub fn open(app: &AppHandle, view: &str, params: &BTreeMap<String, String>) -> C
 /// The tray popover: borderless, transparent, hidden until the icon is clicked.
 pub fn create_tray_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let w = WebviewWindowBuilder::new(app, TRAY, WebviewUrl::App("index.html#tray".into()))
-        .title(TITLE)
+        .title(vault_core::identity::display_name())
         .inner_size(TRAY_WIDTH, TRAY_INITIAL_HEIGHT)
         .decorations(false)
         .transparent(true)
@@ -213,6 +212,62 @@ pub fn toggle_tray(app: &AppHandle, icon: Rect) {
     let _ = w.set_focus();
 }
 
+/// Top-left corner (physical px) of the popover when there is no icon to
+/// anchor it to: the top-right of the monitor, just under the menu bar.
+pub fn corner_position(
+    monitor_x: f64,
+    monitor_y: f64,
+    monitor_w: f64,
+    win_w: f64,
+    scale: f64,
+) -> (f64, f64) {
+    const MENU_BAR: f64 = 30.0; // logical px, a little more than the bar itself
+    let x = (monitor_x + monitor_w - win_w - 8.0 * scale).max(monitor_x);
+    (x, monitor_y + MENU_BAR * scale)
+}
+
+/// Reveal hotkey / `--reveal` / relaunch: toggle the popover, placed under
+/// the menu bar icon when it is visible, else at the top-right corner.
+pub fn reveal_tray(app: &AppHandle) {
+    let Some(w) = app.get_webview_window(TRAY) else {
+        return;
+    };
+    if w.is_visible().unwrap_or(false) {
+        let _ = w.hide();
+        return;
+    }
+    let ghost = lock(&state::get(app).settings).ghost_mode;
+    if !ghost {
+        if let Some(Ok(Some(rect))) = app.tray_by_id(crate::tray::ID).map(|t| t.rect()) {
+            toggle_tray(app, rect);
+            return;
+        }
+    }
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let win = w
+        .outer_size()
+        .map(|s| s.width as f64)
+        .unwrap_or(TRAY_WIDTH * scale);
+    // The monitor with the menu bar: primary, else whatever we are on.
+    let monitor = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| w.current_monitor().ok().flatten());
+    if let Some(m) = monitor {
+        let (x, y) = corner_position(
+            m.position().x as f64,
+            m.position().y as f64,
+            m.size().width as f64,
+            win,
+            m.scale_factor(),
+        );
+        let _ = w.set_position(PhysicalPosition::new(x, y));
+    }
+    let _ = w.show();
+    let _ = w.set_focus();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +295,22 @@ mod tests {
             spec("cleanup", &p(&[("id", "x")])).unwrap().size,
             (520.0, 720.0)
         );
+    }
+
+    #[test]
+    fn corner() {
+        // 1440 pt wide Retina display, 360 pt popover.
+        assert_eq!(
+            corner_position(0.0, 0.0, 2880.0, 720.0, 2.0),
+            (2144.0, 60.0)
+        );
+        // Secondary monitor to the left, scale 1.
+        assert_eq!(
+            corner_position(-1920.0, 0.0, 1920.0, 360.0, 1.0),
+            (-368.0, 30.0)
+        );
+        // Popover wider than the monitor stays on it.
+        assert_eq!(corner_position(0.0, 0.0, 300.0, 360.0, 1.0), (0.0, 30.0));
     }
 
     #[test]

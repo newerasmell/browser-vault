@@ -3,6 +3,7 @@
 mod actions;
 mod applog;
 mod commands;
+mod disguise;
 mod error;
 mod hotkey;
 mod lockctl;
@@ -17,36 +18,62 @@ mod windows;
 use std::sync::Arc;
 
 use tauri::RunEvent;
-use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_global_shortcut::ShortcutState;
 use vault_core::Store;
 
 use crate::lockctl::Reason;
 use crate::state::AppState;
 
+/// Recovery when the reveal hotkey is forgotten:
+/// `open -n -a "<app name>" --args --reveal` (docs/NOTES.md).
+const REVEAL_ARG: &str = "--reveal";
+
 fn main() {
+    // An interrupted disguise switch may have left the data under the
+    // previous name; adopt it before anything opens the store or the log.
+    disguise::adopt_on_start();
     applog::install();
     let store = Store::default_location().expect("HOME must be set");
     let app_state = Arc::new(AppState::new(store));
 
     let app = tauri::Builder::default()
+        // First: a second launch hands over its arguments and exits before
+        // it creates anything (no icon flash). In ghost mode that is all —
+        // nothing visible happens unless it asked for `--reveal`.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let ghost = state::get(app).settings().ghost_mode;
+            if args.iter().any(|a| a == REVEAL_ARG) || !ghost {
+                windows::reveal_tray(app);
+            }
+        }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    // The panic hotkey is the only registered shortcut.
-                    if event.state() == ShortcutState::Pressed {
-                        applog::log("hotkey pressed: lock all");
-                        lockctl::spawn_lock_all(app, Reason::Hotkey);
+                .with_handler(|app, shortcut, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    let s = state::get(app).settings();
+                    let reveal = triggers::active_reveal_hotkey(&s);
+                    match hotkey::dispatch(shortcut, reveal.as_deref()) {
+                        hotkey::Action::LockAll => {
+                            applog::log("hotkey pressed: lock all");
+                            lockctl::spawn_lock_all(app, Reason::Hotkey);
+                        }
+                        hotkey::Action::Reveal => windows::reveal_tray(app),
                     }
                 })
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            None,
-        ))
+        // Named after the running bundle, so a disguised copy's LaunchAgent
+        // is `~/Library/LaunchAgents/<disguise name>.plist` (LaunchAgent is
+        // the builder default on macOS).
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name(vault_core::identity::display_name())
+                .build(),
+        )
         .manage(app_state.clone())
         .invoke_handler(tauri::generate_handler![
             commands::list_vaults,
@@ -96,6 +123,8 @@ fn main() {
             commands::tray_fit,
             commands::backup_vault,
             commands::add_vault_from_drive,
+            commands::list_disguises,
+            commands::apply_disguise,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -126,12 +155,45 @@ fn main() {
             tray::create(&handle)?;
             triggers::start(&handle);
             triggers::register_hotkey(&handle);
+
+            // Keep `disguise` in settings in step with the bundle we run as.
+            if disguise::current_bundle().is_some() {
+                let cur = disguise::current().id;
+                let mut s = state::lock(&st.settings);
+                if s.disguise != cur {
+                    s.disguise = cur.into();
+                    let _ = s.save(st.store.root());
+                }
+            }
+            // Re-register login start with this bundle's name and path
+            // (after a disguise switch the old entry was removed).
+            if st.settings().launch_at_login {
+                use tauri_plugin_autostart::ManagerExt as _;
+                let _ = handle.autolaunch().enable();
+            }
+            if std::env::args().any(|a| a == REVEAL_ARG) {
+                windows::reveal_tray(&handle);
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("failed to build the Tauri application");
 
     app.run(move |handle, event| match event {
+        // Double-click on the already running app in Finder / Launchpad.
+        // Ghost mode: nothing visible happens.
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => {
+            if !state::get(handle).settings().ghost_mode {
+                windows::reveal_tray(handle);
+            }
+        }
+        // Switching to a disguise: everything is locked and the store has
+        // already moved; hand over without touching it.
+        RunEvent::Exit
+            if state::get(handle)
+                .relaunching
+                .load(std::sync::atomic::Ordering::SeqCst) => {}
         // A menu bar app keeps running when its last window closes.
         RunEvent::ExitRequested {
             code: None, api, ..

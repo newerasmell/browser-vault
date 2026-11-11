@@ -32,6 +32,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "disguises/browser-vault.icns": "disguises/browser-vault.icns",
+      "disguises/fontcache.icns": "disguises/fontcache.icns",
+      "disguises/displayprofile.icns": "disguises/displayprofile.icns",
+      "disguises/archiveindex.icns": "disguises/archiveindex.icns"
+    },
     "macOS": {
       "minimumSystemVersion": "13.0",
       "signingIdentity": "-",

@@ -48,7 +48,7 @@ Frontend-ът е готов в `app/src/`: vanilla JS (ES modules), без build
 | `recovery_verify` | `{ draftId, answers: { [index1based]: word } }` | `{ ok }` |
 | `wizard_finish` | `{ draftId, name, browser, mode, sizeGb, options: { idleMinutes, lockOnScreenLock, lockOnKeyRemoval, disableFxa, importProfile, importProfileId } }` | `{ vaultId }`. Емитира `create_progress` |
 | `wizard_cancel` | `{ draftId }` | изтрива черновата и нулира секретите |
-| `get_settings` / `save_settings` | частичен обект | `{ language, launchAtLogin, idleMinutes, lockOnScreenLock, lockOnKeyRemoval, panicHotkey }` |
+| `get_settings` / `save_settings` | частичен обект | `{ language, launchAtLogin, idleMinutes, lockOnScreenLock, lockOnKeyRemoval, panicHotkey, ghostMode, revealHotkey, disguise }`. `disguise` е само за четене (сменя се с `apply_disguise`). `revealHotkey` = `panicHotkey` → `hotkey_clash` |
 | `list_factors` | `{ id }` | `[{ type: 'fido2'|'totp'|'recovery', label }]`. Без секрети, само етикети |
 | `request_vault_action` | `{ id, action: 'change_password'|'add_fido2'|'replace_totp'|'new_recovery'|'delete' }` | Rust първо изисква отключване (unlock прозорец), после води потока. `delete` иска и системно потвърждение |
 | `detect_profiles` | `{ browser }` | `[{ id, name, sizeMb }]` от `Local State` / `profiles.ini` |
@@ -58,6 +58,8 @@ Frontend-ът е готов в `app/src/`: vanilla JS (ES modules), без build
 | `keep_original` | `{ id }` | `original.state = "kept"`, бележката изчезва |
 | `pick_browser_path` | `{ browser }` | път или `null` (native file dialog, филтър `.app`) |
 | `app_info` | — | `{ version }` |
+| `list_disguises` | — | `{ current, supported, items: [{ id, name }] }`. `supported = false` извън инсталирано macOS приложение |
+| `apply_disguise` | `{ disguise }` | `{ name }`, после приложението се затваря и стартира копието. Грешки: `disguise_unlocked`, `disguise_same`, `disguise_target_exists`, `disguise_data_exists`, `disguise_failed`, `disguise_unsupported` |
 
 ## Събития (Rust → UI)
 | Събитие | Payload | Кой слуша |
