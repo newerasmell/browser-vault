@@ -25,14 +25,16 @@ pub enum Reason {
     Quit,
 }
 
+/// System notification. Never shown in ghost mode.
 pub fn notify(app: &AppHandle, body: &str) {
-    if state::get(app).is_quitting() {
+    let st = state::get(app);
+    if st.is_quitting() || lock(&st.settings).ghost_mode {
         return;
     }
     let _ = app
         .notification()
         .builder()
-        .title("Browser Vault")
+        .title(vault_core::identity::display_name())
         .body(body)
         .show();
 }
@@ -97,7 +99,7 @@ pub fn lock_one(app: &AppHandle, id: &str, reason: Reason) -> CmdResult<()> {
 
 /// Every vault that may hold decrypted data: open sessions, anything still
 /// mounted (e.g. from the CLI) and vaults in error state.
-fn lockable_ids(st: &AppState) -> Vec<String> {
+pub fn lockable_ids(st: &AppState) -> Vec<String> {
     let mut ids: Vec<String> = lock(&st.sessions).keys().cloned().collect();
     ids.extend(lock(&st.errors).iter().cloned());
     if let Ok(list) = st.store.list() {

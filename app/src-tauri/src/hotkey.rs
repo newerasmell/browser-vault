@@ -1,9 +1,33 @@
-//! Panic hotkey (SPEC §6 trigger 5): parse the UI's display form (`⌃⌥⌘L`)
-//! into a global shortcut.
+//! Panic hotkey (SPEC §6 trigger 5) and the ghost-mode reveal hotkey: parse
+//! the UI's display form (`⌃⌥⌘L`) into a global shortcut.
 
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
 
 pub const DEFAULT: &str = "⌃⌥⌘L";
+/// Ghost mode: shows the tray popover (there is no menu bar icon).
+pub const DEFAULT_REVEAL: &str = "⌃⌥⌘B";
+
+/// What a registered global shortcut does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    LockAll,
+    Reveal,
+}
+
+/// Whether two display forms name the same key combination.
+pub fn same(a: &str, b: &str) -> bool {
+    matches!((parse(a), parse(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// Which action a fired shortcut belongs to. The reveal hotkey only counts
+/// while it is registered (ghost mode); anything else registered is the
+/// panic hotkey (or its default fallback).
+pub fn dispatch(fired: &Shortcut, reveal: Option<&str>) -> Action {
+    match reveal.and_then(parse) {
+        Some(r) if r == *fired => Action::Reveal,
+        _ => Action::LockAll,
+    }
+}
 
 /// `⌃` Control, `⌥` Option, `⇧` Shift, `⌘` Command, then one key: a letter,
 /// a digit, `F1`..`F20` or `SPACE`. At least one modifier is required.
@@ -102,6 +126,20 @@ mod tests {
             parse("⌃k"),
             Some(Shortcut::new(Some(Modifiers::CONTROL), Code::KeyK))
         );
+    }
+
+    #[test]
+    fn dispatch_by_shortcut() {
+        let panic = parse(DEFAULT).unwrap();
+        let reveal = parse(DEFAULT_REVEAL).unwrap();
+        assert_eq!(dispatch(&panic, Some(DEFAULT_REVEAL)), Action::LockAll);
+        assert_eq!(dispatch(&reveal, Some(DEFAULT_REVEAL)), Action::Reveal);
+        assert_eq!(dispatch(&reveal, None), Action::LockAll);
+        assert_eq!(dispatch(&panic, Some("garbage")), Action::LockAll);
+        assert!(same("⌃⌥⌘B", "⌘⌥⌃b"));
+        assert!(!same(DEFAULT, DEFAULT_REVEAL));
+        assert!(!same("x", "x"));
+        assert!(allowed(DEFAULT_REVEAL));
     }
 
     #[test]

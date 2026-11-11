@@ -134,15 +134,18 @@ impl Store {
         self
     }
 
-    /// `$BVAULT_HOME`, else `~/Library/Application Support/BrowserVault`.
+    /// `$BVAULT_HOME`, else `~/Library/Application Support/<name>`, where
+    /// `<name>` is the running bundle's `BVStoreName` (a disguised copy,
+    /// see `identity`) or `BrowserVault`.
     pub fn default_location() -> Result<Self> {
         if let Some(p) = std::env::var_os(HOME_ENV) {
             return Ok(Store::new(p));
         }
         let home = std::env::var_os("HOME").ok_or(Error::Invalid("HOME is not set"))?;
-        Ok(Store::new(
-            PathBuf::from(home).join("Library/Application Support/BrowserVault"),
-        ))
+        Ok(Store::new(crate::identity::data_dir(
+            Path::new(&home),
+            &crate::identity::store_name(),
+        )))
     }
 
     pub fn root(&self) -> &Path {

@@ -39,8 +39,14 @@ const vaults = [
 const reveal = (v) => { if (v._real) { Object.assign(v, v._real); delete v._real; } };
 let settings = {
   language: 'bg', launchAtLogin: true, idleMinutes: 15,
-  lockOnScreenLock: true, lockOnKeyRemoval: true, panicHotkey: '⌃⌥⌘L'
+  lockOnScreenLock: true, lockOnKeyRemoval: true, panicHotkey: '⌃⌥⌘L',
+  ghostMode: false, revealHotkey: '⌃⌥⌘B', disguise: 'none'
 };
+// Mirrors app/src-tauri/src/disguise.rs DISGUISES (invented names, own icons).
+const DISGUISES = [
+  { id: 'none', name: 'Browser Vault' }, { id: 'fontcache', name: 'Font Cache Helper' },
+  { id: 'displayprofile', name: 'Display Profile Tool' }, { id: 'archiveindex', name: 'Archive Index' }
+];
 const WORDS = 'orbit velvet canyon mirror stable pepper ladder violin thunder cotton harbor magnet ' +
   'silver planet frozen meadow rocket island garden copper winter shadow bamboo lantern';
 let fails = 0;
@@ -125,7 +131,21 @@ const mock = {
   wizard_cancel: async () => {},
 
   get_settings: async () => ({ ...settings }),
-  save_settings: async (s) => { settings = { ...settings, ...s }; return settings; },
+  save_settings: async (s) => {
+    const next = { ...settings, ...s };
+    if (next.panicHotkey === next.revealHotkey) throw err('hotkey_clash');
+    settings = next; return settings;
+  },
+  list_disguises: async () => ({ current: settings.disguise, supported: true, items: structuredClone(DISGUISES) }),
+  apply_disguise: async ({ disguise }) => {
+    const d = DISGUISES.find((x) => x.id === disguise);
+    if (!d) throw err('invalid');
+    if (d.id === settings.disguise) throw err('disguise_same');
+    if (vaults.some((v) => v.status !== 'locked')) throw err('disguise_unlocked');
+    await wait(900);
+    settings.disguise = d.id;
+    return { name: d.name };
+  },
   list_factors: async ({ id }) => {
     const v = vaults.find((x) => x.id === id);
     return v.mode === 'fido2'

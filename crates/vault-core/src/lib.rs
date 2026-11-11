@@ -10,6 +10,7 @@ pub mod events;
 pub mod fido2;
 pub mod hdiutil;
 pub mod header;
+pub mod identity;
 pub mod index;
 pub mod keyslot;
 pub mod lock;

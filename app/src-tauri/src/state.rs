@@ -40,6 +40,10 @@ pub struct AppState {
     /// thread, so it must not touch anything that needs the main thread
     /// (tray icon, events) or it deadlocks (seen on ⌘Q via the app menu).
     pub quitting: AtomicBool,
+    /// Set by `disguise::apply` right before this process hands over to
+    /// the renamed copy: the store and log directories have already moved,
+    /// so the exit path must not touch them.
+    pub relaunching: AtomicBool,
     /// Actions waiting for an unlock of that vault (see original.rs).
     pub pending: Mutex<HashMap<String, crate::original::Pending>>,
     /// Settings → vault actions in progress (see actions.rs), by token.
@@ -67,6 +71,7 @@ impl AppState {
             fido: vault_core::fido2::system(),
             generation: AtomicU64::new(1),
             quitting: AtomicBool::new(false),
+            relaunching: AtomicBool::new(false),
             pending: Mutex::default(),
             tray_blurred_at: Mutex::new(None),
             actions: Mutex::default(),

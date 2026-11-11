@@ -28,6 +28,15 @@ pub struct Settings {
     pub panic_hotkey: String,
     /// Manual browser locations (`.app` bundle path) by browser id.
     pub browser_paths: BTreeMap<String, String>,
+    /// Ghost mode: no menu bar icon, no notifications; the reveal hotkey
+    /// shows the popover.
+    pub ghost_mode: bool,
+    /// Shows the tray popover in ghost mode. Same rules as the panic hotkey
+    /// and never the same combo.
+    pub reveal_hotkey: String,
+    /// Active disguise id (`disguise::DISGUISES`), "none" by default.
+    /// Written by `apply_disguise` only, not by `save_settings`.
+    pub disguise: String,
 }
 
 /// "bg" if the user's first preferred macOS language is Bulgarian, else "en".
@@ -60,6 +69,9 @@ impl Default for Settings {
             lock_on_key_removal: true,
             panic_hotkey: hotkey::DEFAULT.into(),
             browser_paths: BTreeMap::new(),
+            ghost_mode: false,
+            reveal_hotkey: hotkey::DEFAULT_REVEAL.into(),
+            disguise: "none".into(),
         }
     }
 }
@@ -73,6 +85,8 @@ pub struct Patch {
     pub lock_on_screen_lock: Option<bool>,
     pub lock_on_key_removal: Option<bool>,
     pub panic_hotkey: Option<String>,
+    pub ghost_mode: Option<bool>,
+    pub reveal_hotkey: Option<String>,
 }
 
 impl Settings {
@@ -129,6 +143,18 @@ impl Settings {
                 return Err("invalid hotkey");
             }
             next.panic_hotkey = h;
+        }
+        if let Some(v) = p.ghost_mode {
+            next.ghost_mode = v;
+        }
+        if let Some(h) = p.reveal_hotkey {
+            if !hotkey::allowed(&h) {
+                return Err("invalid hotkey");
+            }
+            next.reveal_hotkey = h;
+        }
+        if hotkey::same(&next.panic_hotkey, &next.reveal_hotkey) {
+            return Err("hotkey clash");
         }
         *self = next;
         Ok(())
@@ -213,6 +239,75 @@ mod tests {
         })
         .unwrap();
         assert_eq!(s.panic_hotkey, "⌃⇧F5");
+    }
+
+    #[test]
+    fn ghost_settings() {
+        let d = tempfile::tempdir().unwrap();
+        // Files from before ghost mode stay valid and get the defaults.
+        fs::write(
+            d.path().join(FILE_NAME),
+            br#"{"panicHotkey":"\u2303\u2325\u2318K"}"#,
+        )
+        .unwrap();
+        let s = Settings::load(d.path());
+        assert_eq!(s.panic_hotkey, "⌃⌥⌘K");
+        assert!(!s.ghost_mode);
+        assert_eq!(s.reveal_hotkey, hotkey::DEFAULT_REVEAL);
+        assert_eq!(s.disguise, "none");
+
+        let mut s = Settings::default();
+        s.apply(Patch {
+            ghost_mode: Some(true),
+            reveal_hotkey: Some("⌃⌥⌘J".into()),
+            ..Patch::default()
+        })
+        .unwrap();
+        s.save(d.path()).unwrap();
+        let back = Settings::load(d.path());
+        assert_eq!(back, s);
+        assert!(back.ghost_mode);
+        let json = fs::read_to_string(d.path().join(FILE_NAME)).unwrap();
+        assert!(json.contains("\"ghostMode\": true"));
+        assert!(json.contains("\"revealHotkey\""));
+        assert!(json.contains("\"disguise\": \"none\""));
+    }
+
+    #[test]
+    fn reveal_must_differ_from_panic() {
+        let mut s = Settings::default();
+        let before = s.clone();
+        for bad in [hotkey::DEFAULT, "⌘B", "B"] {
+            assert!(s
+                .apply(Patch {
+                    reveal_hotkey: Some(bad.into()),
+                    ..Patch::default()
+                })
+                .is_err());
+        }
+        // Changing the panic hotkey onto the reveal one is refused too.
+        assert!(s
+            .apply(Patch {
+                panic_hotkey: Some(hotkey::DEFAULT_REVEAL.into()),
+                ..Patch::default()
+            })
+            .is_err());
+        // Same combo spelled with another modifier order / case.
+        assert!(s
+            .apply(Patch {
+                panic_hotkey: Some("⌘⌥⌃b".into()),
+                ..Patch::default()
+            })
+            .is_err());
+        assert_eq!(s, before);
+        // Swapping both in one patch is fine.
+        s.apply(Patch {
+            panic_hotkey: Some(hotkey::DEFAULT_REVEAL.into()),
+            reveal_hotkey: Some(hotkey::DEFAULT.into()),
+            ..Patch::default()
+        })
+        .unwrap();
+        assert_eq!(s.reveal_hotkey, hotkey::DEFAULT);
     }
 
     #[test]
