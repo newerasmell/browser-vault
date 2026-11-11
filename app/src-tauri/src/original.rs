@@ -64,7 +64,13 @@ pub fn open_cleanup(app: &AppHandle, id: &str) -> CmdResult<()> {
 
 pub fn preview(app: &AppHandle, id: &str) -> CmdResult<Value> {
     let st = state::get(app);
-    let p = profiles::cleanup_preview(&st.store, &Roots::system()?, id)?;
+    let roots = Roots::system()?;
+    // The original's details are in the encrypted metadata: open session only.
+    let p = {
+        let sessions = lock(&st.sessions);
+        let s = sessions.get(id).ok_or(CmdError::new("unlock_failed"))?;
+        profiles::cleanup_preview(&st.store, &roots, &s.unlocked)?
+    };
     let items: Vec<String> = p
         .items
         .iter()

@@ -42,7 +42,14 @@ const icon = (name, cls = '') =>
 
 const BROWSERS = { brave: 'Brave', firefox: 'Firefox' };
 const fmtSize = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB');
-const badge = (b) => h('span', { class: 'badge badge-' + b, 'aria-label': BROWSERS[b] }, BROWSERS[b][0]);
+// A vault's name/browser are null when its header keeps them encrypted and
+// this Mac has no index entry yet (shown as "Locked vault" until unlocked).
+const badge = (b) => BROWSERS[b]
+  ? h('span', { class: 'badge badge-' + b, 'aria-label': BROWSERS[b] }, BROWSERS[b][0])
+  : h('span', { class: 'badge badge-unknown', 'aria-label': t('browser_unknown') }, icon('lock', 'xs'));
+const vname = (v) => v.name ?? t('locked_vault');
+const bname = (b) => BROWSERS[b] ?? t('browser_unknown');
+const vsub = (v, ...rest) => [BROWSERS[v.browser], ...rest].filter(Boolean).join(' · ');
 
 function toast(msg, kind = '') {
   const el = h('div', { class: 'toast ' + kind, role: 'status' }, msg);
@@ -134,8 +141,8 @@ async function viewTray() {
     return h('li', { class: 'vault-row' + (unlocked ? ' is-open' : ''), onclick: () => unlocked && api('focus_browser', { id: v.id }) },
       badge(v.browser),
       h('div', { class: 'vault-meta' },
-        h('strong', {}, v.name),
-        h('small', {}, `${BROWSERS[v.browser]} · ${t('mode_' + v.mode)}`)),
+        h('strong', { class: v.name == null ? 'muted' : '' }, vname(v)),
+        h('small', {}, vsub(v, t('mode_' + v.mode)))),
       h('span', { class: 'status status-' + v.status }, icon(unlocked ? 'unlock' : 'lock', 'sm'), t('status_' + v.status)),
       busy, btn);
   };
@@ -149,7 +156,7 @@ async function viewTray() {
     (() => {
       const pv = vaults.find((v) => v.original?.state === 'pending');
       return pv && h('div', { class: 'banner' }, icon('alert', 'sm'),
-        h('span', {}, h('strong', {}, t('original_pending')), h('small', {}, pv.name)),
+        h('span', {}, h('strong', {}, t('original_pending')), h('small', {}, vname(pv))),
         h('button', { class: 'btn sm ghost push', onclick: () => api('open_window', { view: 'settings', params: { tab: 'vaults' } }) }, t('review')));
     })(),
     vaults.length
@@ -174,7 +181,7 @@ async function viewUnlock(params) {
       h('div', { class: 'unlock-head' },
         h('div', { class: 'lock-art' }, icon('lock', 'lg')),
         h('h1', {}, mode === 'recovery' ? t('recovery_title') : t('unlock_title')),
-        h('p', { class: 'vault-chip' }, badge(v.browser), v.name)),
+        h('p', { class: 'vault-chip' }, badge(v.browser), vname(v))),
       mode === 'recovery' ? recoveryForm() : mainForm());
   };
 
@@ -637,7 +644,7 @@ async function viewSettings(params) {
     return h('div', { class: 'callout warn col' },
       h('div', { class: 'row' }, icon('alert', 'sm'), h('strong', {}, t('original_pending'))),
       h('p', {}, t(allCount(o.profileName) ? 'original_pending_all_body' : 'original_pending_body',
-        { browser: BROWSERS[v.browser], profile: o.profileName, n: allCount(o.profileName), size: fmtSize(o.sizeMb) })),
+        { browser: bname(v.browser), profile: o.profileName, n: allCount(o.profileName), size: fmtSize(o.sizeMb) })),
       !o.reviewed && h('p', { class: 'muted' }, t('not_reviewed_hint')),
       h('div', { class: 'row' }, del,
         h('button', { class: 'btn sm ghost', onclick: async () => { await api('keep_original', { id: v.id }); route(); } }, t('keep_original'))));
@@ -669,7 +676,7 @@ async function viewSettings(params) {
     const head = (title, body) => [h('h2', {}, title), body && h('p', { class: 'muted' }, body)];
     const navRow = (primary) => h('div', { class: 'wiz-nav' },
       h('button', { class: 'btn ghost', type: 'button', onclick: close }, t('cancel')), primary);
-    const show = (...kids) => sheet.replaceChildren(h('p', { class: 'vault-chip' }, badge(v.browser), v.name), ...kids);
+    const show = (...kids) => sheet.replaceChildren(h('p', { class: 'vault-chip' }, badge(v.browser), vname(v)), ...kids);
     const done = (msg) => show(h('div', { class: 'callout ok' }, icon('check', 'sm'), h('p', {}, msg)),
       h('div', { class: 'wiz-nav center' }, h('button', { class: 'btn primary', type: 'button', onclick: close }, t('close'))));
 
@@ -975,7 +982,7 @@ async function viewSettings(params) {
       else {
         vaults.splice(0, vaults.length, ...(await api('list_vaults')));
         driveNote = { name: r.name, totp: r.mode === 'totp' };
-        toast(t('add_done', { name: r.name }));
+        toast(r.name == null ? t('add_done_locked') : t('add_done', { name: r.name }));
       }
     } catch (e) { driveNote = { err: bkErr(e) }; }
     off(); render();
@@ -991,7 +998,8 @@ async function viewSettings(params) {
     }
     if (n.err) return h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', { class: 'grow' }, n.err), dismiss);
     return h('div', { class: 'callout ok col' },
-      h('div', { class: 'row' }, icon('check', 'sm'), h('strong', { class: 'grow' }, t('add_done', { name: n.name })), dismiss),
+      h('div', { class: 'row' }, icon('check', 'sm'), h('strong', { class: 'grow' }, n.name == null ? t('add_done_locked') : t('add_done', { name: n.name })), dismiss),
+      n.name == null && h('p', {}, t('add_locked_note')),
       n.totp && h('p', {}, t('add_totp_note')));
   }
 
@@ -1004,7 +1012,7 @@ async function viewSettings(params) {
         if (!isTauri) toast(t('auth_required'));
       } }, label);
       return h('article', { class: 'vault-card' },
-        h('header', {}, badge(v.browser), h('div', {}, h('strong', {}, v.name), h('small', {}, `${BROWSERS[v.browser]} · ${v.sizeGb} GB`)),
+        h('header', {}, badge(v.browser), h('div', {}, h('strong', {}, vname(v)), h('small', {}, vsub(v, `${v.sizeGb} GB`))),
           h('span', { class: 'status status-' + v.status + ' push' }, t('status_' + v.status))),
         originalBlock(v),
         h('div', { class: 'factors' }, h('small', { class: 'muted' }, t('factors')),
@@ -1023,6 +1031,7 @@ async function viewSettings(params) {
         h('button', { class: 'btn sm ghost push', disabled: !!driveNote?.busy, onclick: addFromDrive }, t('add_from_drive')),
         h('button', { class: 'btn sm primary', onclick: () => api('open_window', { view: 'wizard' }) }, icon('plus', 'sm'), t('new_vault'))),
       h('p', { class: 'muted' }, t('auth_required')),
+      h('p', { class: 'muted small' }, icon('lock', 'xs'), ' ', t('vaults_names_hint')),
       driveCallout(),
       cards);
   }
@@ -1061,7 +1070,7 @@ async function viewCleanup(params) {
   const el = h('div', { class: 'pane cleanup' });
   let info = await api('cleanup_preview', { id });
   let running = (await api('browser_running', { browser: v.browser })).running;
-  const B = BROWSERS[v.browser];
+  const B = bname(v.browser);
   let ack = false;
 
   const render = () => {

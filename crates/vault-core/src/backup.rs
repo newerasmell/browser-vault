@@ -1,9 +1,12 @@
 //! Backup of a LOCKED vault to an external drive, and "add vault from
 //! drive" (import into the local store).
 //!
-//! A backup is a plain folder `<parent>/<name> (<short id>).bvault/` with
+//! A backup is a plain folder `<parent>/vault-<short id>.bvault/` with
 //! `image.sparsebundle/` and `header.json` (+ `header.json.bak`). Both are
-//! already encrypted / sealed, so nothing here touches key material.
+//! already encrypted / sealed, so nothing here touches key material. The
+//! folder name carries no vault name (v2 headers keep the name encrypted);
+//! backups made by older versions as `<name> (<short id>).bvault` are still
+//! found and updated in place by their header's `vault_id`.
 //!
 //! Backups are incremental: an existing backup of the same vault is updated
 //! by copying only files whose size or mtime differ and deleting files the
@@ -375,31 +378,15 @@ pub(crate) fn verify(src: &Path, dst: &Path, vault_id: &str) -> Result<()> {
     }
 }
 
-/// Folder name for a backup: `<name> (<first 8 of id>).bvault`, with
-/// characters that are unsafe on FAT/exFAT/HFS+ replaced.
-pub fn backup_folder_name(name: &str, id: &str) -> String {
-    let mut s: String = name
+/// Folder name for a new backup: `vault-<first 8 of id>.bvault`. Never the
+/// vault's name: the drive must not tell what the vault is.
+pub fn backup_folder_name(id: &str) -> String {
+    let short: String = id
         .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(8)
         .collect();
-    s = s.trim().trim_start_matches('.').trim().to_string();
-    if s.chars().count() > 60 {
-        s = s
-            .chars()
-            .take(60)
-            .collect::<String>()
-            .trim_end()
-            .to_string();
-    }
-    if s.is_empty() {
-        s = "Vault".into();
-    }
-    let short: String = id.chars().take(8).collect();
-    format!("{s} ({short}).{BACKUP_EXT}")
+    format!("vault-{short}.{BACKUP_EXT}")
 }
 
 /// `vault_id` of the backup in `dir`, if `dir/header.json` parses.
@@ -438,7 +425,7 @@ fn destination(dest_parent: &Path, header: &Header) -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    Ok(dest_parent.join(backup_folder_name(&header.name, id)))
+    Ok(dest_parent.join(backup_folder_name(id)))
 }
 
 /// Back up the locked vault `id` into `dest_parent` (see module docs).
@@ -621,10 +608,15 @@ mod tests {
     const PW: &str = "correct horse battery";
 
     fn fake_vault(s: &Store, name: &str) -> Header {
-        let h = new_vault(name, Browser::Brave, PW, KdfCost::FAST)
+        fake_vault_k(s, name).0
+    }
+
+    /// A vault on disk; returns its header as loaded (metadata sealed) and key.
+    fn fake_vault_k(s: &Store, name: &str) -> (Header, crate::keyslot::UnlockedKey) {
+        let nv = new_vault(name, Browser::Brave, PW, KdfCost::FAST)
             .unwrap()
-            .0
-            .header;
+            .0;
+        let h = nv.header;
         let dir = s.vault_dir(&h.vault_id);
         mkdir(&dir, true).unwrap();
         let img = dir.join(IMAGE_DIR);
@@ -640,7 +632,7 @@ mod tests {
         }
         s.save_header(&h).unwrap();
         s.save_header(&h).unwrap(); // also writes header.json.bak
-        h
+        (s.load(&h.vault_id).unwrap(), nv.key)
     }
 
     fn set_old_mtime(p: &Path) {
@@ -658,14 +650,15 @@ mod tests {
         store: Store,
         drive: PathBuf,
         h: Header,
+        key: crate::keyslot::UnlockedKey,
     }
 
     fn fx() -> Fx {
         let d = tempfile::tempdir().unwrap();
-        let store = Store::new(d.path().join("store"));
+        let store = Store::new(d.path().join("store")).with_index_key(crate::index::memory_key);
         let drive = d.path().join("drive");
         fs::create_dir_all(&drive).unwrap();
-        let h = fake_vault(&store, "Work: Brave/1");
+        let (h, key) = fake_vault_k(&store, "Work: Brave/1");
         // Source files are "old", so a rewrite is detectable by mtime.
         for e in vault_entries(&store.vault_dir(&h.vault_id)).unwrap() {
             if !e.dir {
@@ -677,6 +670,7 @@ mod tests {
             store,
             drive,
             h,
+            key,
         }
     }
 
@@ -691,14 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn folder_name_is_safe() {
+    fn folder_name_has_no_vault_name() {
         let id = "8b4c7f0e-7a63-4d55-9a1e-2f0d9d3b6a11";
-        assert_eq!(
-            backup_folder_name("Work: Brave/1", id),
-            "Work_ Brave_1 (8b4c7f0e).bvault"
-        );
-        assert_eq!(backup_folder_name("..", id), "Vault (8b4c7f0e).bvault");
-        assert_eq!(backup_folder_name("  ", id), "Vault (8b4c7f0e).bvault");
+        assert_eq!(backup_folder_name(id), "vault-8b4c7f0e.bvault");
+        assert_eq!(backup_folder_name("../x"), "vault-.bvault");
     }
 
     #[test]
@@ -711,10 +701,7 @@ mod tests {
             }
         };
         let out = export_with(&f.store, &f.h.vault_id, &f.drive, &locked, &notify).unwrap();
-        assert_eq!(
-            out.path,
-            f.drive.join(backup_folder_name(&f.h.name, &f.h.vault_id))
-        );
+        assert_eq!(out.path, f.drive.join(backup_folder_name(&f.h.vault_id)));
         // Info.plist, token, 4 bands, header.json.bak, header.json.
         assert_eq!(out.stats.copied_files, 8);
         assert_eq!(out.stats.unchanged_files, 0);
@@ -766,26 +753,72 @@ mod tests {
     }
 
     #[test]
-    fn renamed_vault_reuses_its_backup_folder_and_picking_it_works() {
-        let mut f = fx();
+    fn legacy_named_backup_folder_is_reused_and_picking_it_works() {
+        let f = fx();
         let first = export_t(&f).unwrap();
-        f.h.name = "Renamed".into();
-        f.store.save_header(&f.h).unwrap();
-        assert_eq!(export_t(&f).unwrap().path, first.path);
+        // A backup made by an older version, named after the vault.
+        let legacy = f.drive.join("Work_ Brave_1 (8b4c7f0e).bvault");
+        fs::rename(&first.path, &legacy).unwrap();
+        assert_eq!(export_t(&f).unwrap().path, legacy);
         // The user picked the .bvault folder itself.
         let r = export_with(
             &f.store,
             &f.h.vault_id,
-            &first.path,
+            &legacy,
             &locked,
             &crate::events::ignore,
         )
         .unwrap();
-        assert_eq!(r.path, first.path);
-        assert!(!first
-            .path
-            .join(backup_folder_name("Renamed", &f.h.vault_id))
-            .exists());
+        assert_eq!(r.path, legacy);
+        assert!(!f.drive.join(backup_folder_name(&f.h.vault_id)).exists());
+    }
+
+    #[test]
+    fn backup_on_drive_never_names_the_vault() {
+        let f = fx();
+        let out = export_t(&f).unwrap();
+        let name = out.path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("vault-") && name.ends_with(".bvault"),
+            "{name}"
+        );
+        let mut all = vec![];
+        walk(&f.drive, Path::new(""), &mut all).unwrap();
+        for e in &all {
+            let rel = e.rel.to_string_lossy();
+            assert!(!rel.contains("Work") && !rel.contains("Brave"), "{rel}");
+            if !e.dir {
+                let bytes = fs::read(f.drive.join(&e.rel)).unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(!text.contains("Work"), "{rel} names the vault");
+            }
+        }
+    }
+
+    #[test]
+    fn imported_v2_backup_is_locked_until_first_unlock() {
+        let f = fx();
+        assert_eq!(f.store.label(&f.h).unwrap().name, "Work: Brave/1");
+        export_t(&f).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        // Another Mac: its own index key, nothing known about this vault.
+        let other = Store::new(d.path().join("s")).with_index_key(crate::index::other_memory_key);
+        let h = import(&other, &f.drive, &crate::events::ignore).unwrap();
+        assert!(h.meta_locked());
+        let listed = other.list_labeled().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].label.is_none(), "shown as 'Locked vault'");
+        assert!(matches!(
+            other.resolve("Work: Brave/1"),
+            Err(Error::NotFound)
+        ));
+        // First unlock on the new Mac fills its index.
+        let opened = other.upgrade_header(&h.vault_id, &f.key).unwrap();
+        assert_eq!(opened.meta().unwrap().name, "Work: Brave/1");
+        let label = other.list_labeled().unwrap().remove(0).label.unwrap();
+        assert_eq!(label.name, "Work: Brave/1");
+        assert_eq!(label.browser, Browser::Brave);
+        assert_eq!(other.resolve("work: brave/1").unwrap().vault_id, h.vault_id);
     }
 
     #[test]
@@ -801,27 +834,19 @@ mod tests {
         )
         .unwrap();
         // Put the other vault's backup where this vault's would go.
-        fs::rename(
-            &out.path,
-            f.drive.join(backup_folder_name(&f.h.name, &f.h.vault_id)),
-        )
-        .unwrap();
+        fs::rename(&out.path, f.drive.join(backup_folder_name(&f.h.vault_id))).unwrap();
         // The user picks that folder for this vault:
         let r = export_with(
             &f.store,
             &f.h.vault_id,
-            &f.drive.join(backup_folder_name(&f.h.name, &f.h.vault_id)),
+            &f.drive.join(backup_folder_name(&f.h.vault_id)),
             &locked,
             &crate::events::ignore,
         );
         assert!(matches!(r, Err(Error::Invalid(ERR_OTHER_VAULT))));
         // A non-empty folder without a header at the target name is not ours.
         let d2 = f.drive.join("d2");
-        fs::create_dir_all(
-            d2.join(backup_folder_name(&f.h.name, &f.h.vault_id))
-                .join("x"),
-        )
-        .unwrap();
+        fs::create_dir_all(d2.join(backup_folder_name(&f.h.vault_id)).join("x")).unwrap();
         let r = export_with(
             &f.store,
             &f.h.vault_id,
@@ -941,8 +966,17 @@ mod tests {
         let other = Store::new(d.path().join("s"));
         let h = import(&other, &f.drive, &crate::events::ignore).unwrap();
         let roots = crate::profiles::Roots::for_home(d.path());
+        let mut header = h.clone();
+        header.open_meta(f.key.vmk()).unwrap();
+        let session = crate::store::Unlocked {
+            header,
+            mountpoint: d.path().join("mnt"),
+            header_intact: true,
+            key: crate::keyslot::unlocked(&h, f.key.vmk().clone()),
+            cleanup_verifier: None,
+        };
         assert!(matches!(
-            crate::profiles::cleanup_preview(&other, &roots, &h.vault_id),
+            crate::profiles::cleanup_preview(&other, &roots, &session),
             Err(Error::Invalid(crate::profiles::ERR_ORIGINAL_ELSEWHERE))
         ));
     }
@@ -962,8 +996,8 @@ mod tests {
             import(&other, &out.path, &crate::events::ignore),
             Err(Error::Format(_))
         ));
-        let mut h = f.h.clone();
-        h.version = 99;
+        let mut h: serde_json::Value = serde_json::from_slice(&f.h.to_json().unwrap()).unwrap();
+        h["version"] = serde_json::json!(99);
         fs::write(out.path.join(HEADER_FILE), serde_json::to_vec(&h).unwrap()).unwrap();
         assert!(matches!(
             import(&other, &out.path, &crate::events::ignore),
@@ -971,7 +1005,7 @@ mod tests {
         ));
         let mut h = f.h.clone();
         h.vault_id = "../../etc".into();
-        fs::write(out.path.join(HEADER_FILE), serde_json::to_vec(&h).unwrap()).unwrap();
+        fs::write(out.path.join(HEADER_FILE), h.to_json().unwrap()).unwrap();
         assert!(matches!(
             import(&other, &out.path, &crate::events::ignore),
             Err(Error::Format(_))

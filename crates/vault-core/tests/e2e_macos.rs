@@ -43,7 +43,8 @@ fn create(s: &Store, name: &str, browser: Browser) -> (String, String) {
 
 fn store() -> (tempfile::TempDir, Store) {
     let d = tempfile::tempdir().unwrap();
-    let s = Store::new(d.path().join("BrowserVault"));
+    // No Keychain index from a test binary (it would own the item).
+    let s = Store::new(d.path().join("BrowserVault")).with_index_key(vault_core::index::no_key);
     (d, s)
 }
 

@@ -93,9 +93,11 @@ pub fn cleanup_traces(browser: Browser) -> Result<()> {
 /// detach, then `profiles::mark_reviewed` so SPEC §5.1 `reviewed` can flip),
 /// then clean traces. Keys are wiped when `session` is dropped inside.
 pub fn close_vault(store: &Store, session: Unlocked) -> Result<()> {
-    let browser = session.header.browser;
+    let browser = session.header.try_meta().map(|m| m.browser);
     store.close(session)?;
-    let _ = cleanup_traces(browser);
+    if let Some(b) = browser {
+        let _ = cleanup_traces(b);
+    }
     Ok(())
 }
 
@@ -104,7 +106,13 @@ pub fn close_vault(store: &Store, session: Unlocked) -> Result<()> {
 /// [`close_vault`] whenever the `Unlocked` session is available.
 /// Trace cleanup is best effort and never fails the lock.
 pub fn lock_vault(store: &Store, id: &str) -> Result<()> {
-    let browser = store.load(id).ok().map(|h| h.browser);
+    // v2: the browser is only known from the open metadata or this Mac's
+    // index; when unknown, the shared state of no browser is touched.
+    let browser = store
+        .load(id)
+        .ok()
+        .and_then(|h| store.label(&h))
+        .map(|e| e.browser);
     store.lock(id)?;
     if let Some(b) = browser {
         let _ = cleanup_traces(b);

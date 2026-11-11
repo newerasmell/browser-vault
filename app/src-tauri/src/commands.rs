@@ -16,8 +16,10 @@ use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use vault_core::events::Event;
 use vault_core::header::{Header, OriginalState, Slot, VaultSettings};
+use vault_core::index;
 use vault_core::keyslot::{Draft, KdfCost};
 use vault_core::profiles::Roots;
+use vault_core::store::Listed;
 use vault_core::store::{CreateOptions, Devices, ImportRequest};
 use vault_core::{browser, Browser, Credential};
 use zeroize::Zeroizing;
@@ -61,12 +63,14 @@ pub struct OriginalInfo {
     state: &'static str,
 }
 
+/// `name` / `browser` are `null` for a vault whose v2 header keeps them
+/// encrypted and that this Mac has no index entry for ("Locked vault").
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultInfo {
     id: String,
-    name: String,
-    browser: &'static str,
+    name: Option<String>,
+    browser: Option<&'static str>,
     mode: &'static str,
     status: &'static str,
     size_gb: u32,
@@ -88,8 +92,8 @@ pub fn bytes_to_mb(b: u64) -> u64 {
     (b + 512 * 1024) / (1024 * 1024)
 }
 
-fn original_info(h: &Header) -> Option<OriginalInfo> {
-    h.original.as_ref().map(|o| OriginalInfo {
+fn original_info(e: &index::Entry) -> Option<OriginalInfo> {
+    e.original.as_ref().map(|o| OriginalInfo {
         profile_name: o.profile_name.clone(),
         size_mb: bytes_to_mb(o.size_bytes),
         reviewed: o.reviewed,
@@ -128,7 +132,9 @@ fn plist_size_gb(xml: &str) -> u32 {
         .unwrap_or(0)
 }
 
-fn vault_info(st: &AppState, h: &Header) -> VaultInfo {
+fn vault_info(st: &AppState, l: &Listed) -> VaultInfo {
+    let h = &l.header;
+    let label = l.label.as_ref();
     let id = h.vault_id.clone();
     let status = if lock(&st.errors).contains(&id) {
         "error"
@@ -142,17 +148,18 @@ fn vault_info(st: &AppState, h: &Header) -> VaultInfo {
     };
     VaultInfo {
         size_gb: sparsebundle_size_gb(&st.store.image_path(&id)),
-        name: h.name.clone(),
-        browser: h.browser.as_str(),
+        name: label.map(|e| e.name.clone()),
+        browser: label.map(|e| e.browser.as_str()),
         mode: mode_of(h),
         status,
         // Added from a backup: the original is on the other Mac (backup.rs).
         original: if vault_core::backup::restored_from_backup(&st.store, &id) {
             None
         } else {
-            original_info(h)
+            label.and_then(original_info)
         },
-        portable: h.browser != Browser::Brave || h.settings.portable_keys,
+        // Unknown browser: nothing to offer until the first unlock.
+        portable: label.is_none_or(|e| e.browser != Browser::Brave || e.portable_keys),
         id,
     }
 }
@@ -162,9 +169,9 @@ pub async fn list_vaults(app: AppHandle) -> CmdResult<Vec<VaultInfo>> {
     let st = state::get(&app);
     Ok(st
         .store
-        .list()?
+        .list_labeled()?
         .iter()
-        .map(|h| vault_info(&st, h))
+        .map(|l| vault_info(&st, l))
         .collect())
 }
 
@@ -360,7 +367,7 @@ fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
                 activate_pid(pid);
                 return Ok(json!(OK));
             }
-            let bin = browser_binary(&st, s.unlocked.header.browser);
+            let bin = browser_binary(&st, s.unlocked.header.meta()?.browser);
             let child = st.store.launch(&s.unlocked, bin.as_deref())?;
             let pid = child.id();
             s.browser_pid = Some(pid);
@@ -409,7 +416,10 @@ fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
     if !unlocked.header_intact {
         lockctl::notify(app, tr(st.is_bg(), T::HeaderModified));
     }
-    let bin = browser_binary(&st, unlocked.header.browser);
+    let bin = match unlocked.header.meta() {
+        Ok(m) => browser_binary(&st, m.browser),
+        Err(_) => None,
+    };
     let child = match st.store.launch(&unlocked, bin.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -839,8 +849,7 @@ pub fn delete_unlocked_vault(app: &AppHandle, id: &str) -> CmdResult<Value> {
             });
         }
     }
-    std::fs::remove_dir_all(st.store.vault_dir(id))?;
-    let _ = std::fs::remove_dir(st.store.mountpoint(id));
+    st.store.remove_vault(id)?;
     lockctl::vaults_changed(app);
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.eval("location.reload()");
@@ -1097,7 +1106,9 @@ pub async fn add_vault_from_drive(app: AppHandle) -> CmdResult<Value> {
             Ok(h) => {
                 crate::applog::log(&format!("add from drive {}: done", h.vault_id));
                 lockctl::vaults_changed(&app);
-                Ok(json!({ "id": h.vault_id, "name": h.name, "mode": mode_of(&h) }))
+                // v2: the name is encrypted; `null` until the first unlock here.
+                let name = st.store.label(&h).map(|e| e.name);
+                Ok(json!({ "id": h.vault_id, "name": name, "mode": mode_of(&h) }))
             }
             Err(e) => {
                 crate::applog::log(&format!("add from drive: error {e}"));
