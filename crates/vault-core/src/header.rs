@@ -213,6 +213,15 @@ pub struct Meta {
     pub settings: VaultSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original: Option<Original>,
+    /// YubiKey slot labels by credential id (base64). In a v2 header the
+    /// labels on disk are blank and live here, encrypted; the in-memory
+    /// slots get them back when the metadata is opened.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub key_labels: std::collections::BTreeMap<String, String>,
+}
+
+fn b64_key(b: &B64) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &b.0)
 }
 
 /// `meta` as stored in a v2 header: XChaCha20-Poly1305 under
@@ -330,6 +339,7 @@ impl Header {
                         created_at: d.created_at,
                         settings: d.settings,
                         original: d.original,
+                        key_labels: Default::default(),
                     }),
                     sealed: None,
                     mac: d.mac,
@@ -375,7 +385,19 @@ impl Header {
                 version: self.version,
                 vault_id: self.vault_id.clone(),
                 kdf: self.kdf.clone(),
-                slots: self.slots.clone(),
+                // Labels are user text ("YubiKey main"): kept in the sealed
+                // metadata, never on disk in the clear.
+                slots: self
+                    .slots
+                    .iter()
+                    .cloned()
+                    .map(|mut s| {
+                        if let Slot::Fido2 { label, .. } = &mut s {
+                            label.clear();
+                        }
+                        s
+                    })
+                    .collect(),
                 meta: self
                     .sealed
                     .clone()
@@ -440,12 +462,50 @@ impl Header {
         .map_err(|_| Error::Format("vault metadata could not be decrypted".into()))?;
         let meta: Meta = serde_json::from_slice(&pt)
             .map_err(|_| Error::Format("vault metadata is malformed".into()))?;
+        for slot in &mut self.slots {
+            if let Slot::Fido2 {
+                label,
+                credential_id,
+                ..
+            } = slot
+            {
+                if let Some(l) = meta.key_labels.get(&b64_key(credential_id)) {
+                    *label = l.clone();
+                }
+            }
+        }
         self.meta = Some(meta);
         Ok(())
     }
 
     /// Encrypt the current metadata into `sealed` (fresh nonce).
     fn seal_meta(&mut self, vmk: &Key) -> Result<()> {
+        let labels: std::collections::BTreeMap<String, String> = self
+            .slots
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Fido2 {
+                    label,
+                    credential_id,
+                    ..
+                } if !label.is_empty() => Some((b64_key(credential_id), label.clone())),
+                _ => None,
+            })
+            .collect();
+        if !labels.is_empty() {
+            let m = self.meta_mut()?;
+            m.key_labels.extend(labels);
+        }
+        // Drop labels of keys that were removed.
+        let ids: Vec<String> = self
+            .slots
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Fido2 { credential_id, .. } => Some(b64_key(credential_id)),
+                _ => None,
+            })
+            .collect();
+        self.meta_mut()?.key_labels.retain(|k, _| ids.contains(k));
         let meta = self.meta()?;
         let mut pt = Zeroizing::new(serde_json::to_vec(meta)?);
         // Pad so the ciphertext length says little about the name or paths.
@@ -623,6 +683,7 @@ mod tests {
             created_at: "2026-11-03T10:00:00Z".into(),
             settings: VaultSettings::default(),
             original: None,
+            key_labels: Default::default(),
         }
     }
 
@@ -882,10 +943,48 @@ mod tests {
         let mut back = Header::from_json(&h.to_json().unwrap()).unwrap();
         assert!(back.verify_mac(&vmk));
         back.open_meta(&vmk).unwrap();
-        assert_eq!(back.meta().unwrap(), before.meta().unwrap());
+        let mut m = back.meta().unwrap().clone();
+        assert_eq!(m.key_labels.len(), 1, "labels moved into the sealed meta");
+        m.key_labels.clear();
+        assert_eq!(&m, before.meta().unwrap());
         assert_eq!(back.slots, before.slots);
         assert_eq!(back.kdf, before.kdf);
         assert_eq!(back.vault_id, before.vault_id);
+    }
+
+    #[test]
+    fn v2_keeps_key_labels_out_of_the_file() {
+        let vmk = crypto::random_key();
+        let h = sample_v2(&vmk);
+        let json = h.to_json().unwrap();
+        let text = String::from_utf8(json.clone()).unwrap();
+        assert!(!text.contains("YubiKey main"), "label must not be in clear");
+        let mut back = Header::from_json(&json).unwrap();
+        assert!(back.verify_mac(&vmk));
+        let locked: Vec<_> = crate::fido2::keys(&back)
+            .into_iter()
+            .map(|k| k.label)
+            .collect();
+        assert!(locked.iter().all(|l| l.starts_with("YubiKey ")));
+        back.open_meta(&vmk).unwrap();
+        assert!(back.verify_mac(&vmk));
+        assert_eq!(back.slots, h.slots, "labels restored on open");
+
+        // A removed key's label is dropped from the metadata too.
+        let mut fewer = back.clone();
+        let idx = fewer
+            .slots
+            .iter()
+            .position(|s| matches!(s, Slot::Fido2 { .. }))
+            .unwrap();
+        fewer.slots.remove(idx);
+        fewer.seal_mac(&vmk).unwrap();
+        let n = fewer
+            .slots
+            .iter()
+            .filter(|s| matches!(s, Slot::Fido2 { .. }))
+            .count();
+        assert_eq!(fewer.meta().unwrap().key_labels.len(), n);
     }
 
     #[test]

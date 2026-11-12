@@ -30,11 +30,19 @@ pub struct Disguise {
     pub icon: &'static str,
 }
 
+/// Must equal `identifier` in `tauri.conf.json` (checked by a test): the
+/// single-instance socket in /tmp is named after it at build time.
+pub const BASE_BUNDLE_ID: &str = "local.statusbar.helper";
+
+/// Bundle id of versions before the trace cleanup. Its ~/Library folders and
+/// stale /tmp socket are removed on start.
+pub const LEGACY_BUNDLE_ID: &str = "com.browservault.app";
+
 pub const NONE: Disguise = Disguise {
     id: "none",
     name: DEFAULT_DISPLAY_NAME,
     exe: "browser-vault",
-    bundle_id: "com.browservault.app",
+    bundle_id: BASE_BUNDLE_ID,
     store: DEFAULT_STORE_NAME,
     icon: "browser-vault.icns",
 };
@@ -278,6 +286,36 @@ pub fn adopt_on_start() {
         let _ = std::fs::remove_file(base.join(&own).join(SWITCH_MARKER));
     }
     adopt_store(&identity::log_dir(&home, ""), &own, |_| false);
+    remove_legacy_traces(&home);
+}
+
+/// Folders and the socket left by versions that used [`LEGACY_BUNDLE_ID`].
+fn remove_legacy_traces(home: &Path) {
+    if current().bundle_id == LEGACY_BUNDLE_ID {
+        return;
+    }
+    for p in bundle_id_traces(home, LEGACY_BUNDLE_ID) {
+        if p.exists() {
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+        }
+    }
+    let sock = legacy_socket();
+    // Only a stale one: a live old copy still answers on it.
+    if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_err() {
+        let _ = std::fs::remove_file(&sock);
+    }
+}
+
+fn legacy_socket() -> PathBuf {
+    // Same rule as tauri-plugin-single-instance: identifier with '.'/'-' → '_'.
+    std::env::temp_dir().join(format!(
+        "{}_si.sock",
+        LEGACY_BUNDLE_ID.replace(['.', '-'], "_")
+    ))
 }
 
 /// Shell run detached after a switch: waits for this process to exit (so
@@ -645,7 +683,7 @@ mod tests {
     fn plist_round_trip() {
         let orig = "<dict><key>CFBundleName</key><string>Browser Vault</string>\
             <key>CFBundleExecutable</key><string>browser-vault</string>\
-            <key>CFBundleIdentifier</key><string>com.browservault.app</string></dict>";
+            <key>CFBundleIdentifier</key><string>local.statusbar.helper</string></dict>";
         assert!(plist_matches(orig, &NONE));
         assert!(is_our_bundle(orig));
         let fc = by_id("fontcache").unwrap();
@@ -667,8 +705,21 @@ mod tests {
         let t = bundle_id_traces(Path::new("/Users/a"), NONE.bundle_id);
         assert!(t.iter().all(|p| p.starts_with("/Users/a/Library/")));
         assert!(t.contains(&PathBuf::from(
-            "/Users/a/Library/WebKit/com.browservault.app"
+            "/Users/a/Library/WebKit/local.statusbar.helper"
         )));
+    }
+
+    #[test]
+    fn base_bundle_id_matches_tauri_conf() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"], BASE_BUNDLE_ID);
+        for s in [BASE_BUNDLE_ID, NONE.bundle_id] {
+            assert!(!s.contains("vault"), "{s}");
+        }
+        assert!(legacy_socket()
+            .to_string_lossy()
+            .ends_with("com_browservault_app_si.sock"));
     }
 
     #[test]

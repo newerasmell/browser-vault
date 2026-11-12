@@ -822,7 +822,7 @@ pub async fn list_factors(app: AppHandle, id: String) -> CmdResult<Vec<Value>> {
 fn message(app: &AppHandle, text: &str) {
     app.dialog()
         .message(text)
-        .title("Browser Vault")
+        .title(vault_core::identity::display_name())
         .kind(MessageDialogKind::Info)
         .blocking_show();
 }
@@ -839,7 +839,7 @@ pub fn delete_unlocked_vault(app: &AppHandle, id: &str) -> CmdResult<Value> {
     let confirmed = app
         .dialog()
         .message(tr(bg, T::DeleteConfirm))
-        .title("Browser Vault")
+        .title(vault_core::identity::display_name())
         .kind(MessageDialogKind::Warning)
         .buttons(MessageDialogButtons::OkCancelCustom(
             tr(bg, T::DeleteButton).into(),

@@ -350,6 +350,7 @@ impl Draft {
                 created_at: now_rfc3339(),
                 settings,
                 original: None,
+                key_labels: Default::default(),
             },
         );
         header.seal_mac(&self.vmk)?;

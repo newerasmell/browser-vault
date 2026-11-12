@@ -168,11 +168,19 @@ fn keys_in(slots: &[Slot]) -> Vec<KeyInfo> {
                 label,
                 credential_id,
                 ..
-            } => Some(KeyInfo {
-                label: label.clone(),
-                credential_id: credential_id.0.clone(),
-            }),
+            } => Some((label, credential_id)),
             _ => None,
+        })
+        .enumerate()
+        .map(|(i, (label, credential_id))| KeyInfo {
+            // A v2 header keeps labels in the sealed metadata; before it is
+            // opened the slot label is blank.
+            label: if label.is_empty() {
+                format!("YubiKey {}", i + 1)
+            } else {
+                label.clone()
+            },
+            credential_id: credential_id.0.clone(),
         })
         .collect()
 }

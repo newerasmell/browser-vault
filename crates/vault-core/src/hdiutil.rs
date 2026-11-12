@@ -12,6 +12,11 @@ use crate::error::{Error, Result};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
 const MDUTIL: &str = "/usr/bin/mdutil";
+const DISKUTIL: &str = "/usr/sbin/diskutil";
+
+/// Volume name of every vault. Neutral on purpose: an unlocked vault shows
+/// up in `mount` / `diskutil list`, and the name must not say what it is.
+pub const VOLUME_NAME: &str = "Data";
 
 /// How long each tool may run before it is killed. A wedged `hdiutil`
 /// must never hang a lock (SPEC §6) or the app forever.
@@ -97,12 +102,8 @@ fn run_with_timeout(
     }
 }
 
-pub fn volume_name(vault_id: &str) -> String {
-    format!("BV-{vault_id}")
-}
-
-/// `hdiutil create -size <N>g -type SPARSEBUNDLE -fs APFS -encryption AES-256 -stdinpass -volname BV-<id> <path>`
-pub fn create(image: &Path, size_gb: u32, vault_id: &str, disk_key: &str) -> Result<()> {
+/// `hdiutil create -size <N>g -type SPARSEBUNDLE -fs APFS -encryption AES-256 -stdinpass -volname Data <path>`
+pub fn create(image: &Path, size_gb: u32, disk_key: &str) -> Result<()> {
     if size_gb == 0 {
         return Err(Error::Invalid("vault size must be at least 1 GB"));
     }
@@ -113,7 +114,7 @@ pub fn create(image: &Path, size_gb: u32, vault_id: &str, disk_key: &str) -> Res
             .args(["-size", &format!("{size_gb}g")])
             .args(["-type", "SPARSEBUNDLE", "-fs", "APFS"])
             .args(["-encryption", "AES-256", "-stdinpass"])
-            .args(["-volname", &volume_name(vault_id)])
+            .args(["-volname", VOLUME_NAME])
             .arg(image),
         Some(disk_key),
     )
@@ -163,6 +164,19 @@ pub fn detach_with_retries(mountpoint: &Path) -> Result<()> {
     }))
 }
 
+/// Vaults made by older versions are named `BV-<id>`; give them the neutral
+/// name. Best effort and idempotent, run after every attach.
+pub fn neutralize_volume_name(mountpoint: &Path) -> Result<()> {
+    run(
+        "diskutil rename",
+        Command::new(DISKUTIL)
+            .arg("rename")
+            .arg(mountpoint)
+            .arg(VOLUME_NAME),
+        None,
+    )
+}
+
 /// SPEC §3: `mdutil -i off <mountdir>` (no Spotlight index of vault contents).
 pub fn disable_spotlight(mountpoint: &Path) -> Result<()> {
     run(
@@ -203,8 +217,9 @@ mod tests {
     }
 
     #[test]
-    fn volume_name_format() {
-        assert_eq!(volume_name("abc"), "BV-abc");
+    fn volume_name_is_neutral() {
+        assert!(!VOLUME_NAME.to_lowercase().contains("bv"));
+        assert!(!VOLUME_NAME.to_lowercase().contains("vault"));
     }
 
     #[test]

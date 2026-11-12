@@ -341,6 +341,7 @@ mod tests {
                 state: OriginalState::Pending,
                 deleted_at: None,
             }),
+            key_labels: Default::default(),
         }
     }
 

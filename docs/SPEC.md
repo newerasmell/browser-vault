@@ -31,7 +31,7 @@ Desktop приложение за macOS, което държи профилит�
 
 ```
 hdiutil create -size <N>g -type SPARSEBUNDLE -fs APFS \
-  -encryption AES-256 -stdinpass -volname BV-<id> <path>.sparsebundle
+  -encryption AES-256 -stdinpass -volname Data <path>.sparsebundle   (по-старите сейфове `BV-<id>` се преименуват на `Data` при отключване)
 
 hdiutil attach -stdinpass -nobrowse -noautoopen -owners on \
   -mountpoint <mountdir> <path>.sparsebundle
@@ -153,7 +153,7 @@ TOTP не може да участва в извеждането на ключа
 4. Почистване на следи: `~/Library/Saved Application State/com.brave.Browser.savedState` и `org.mozilla.firefox.savedState`, само ако обикновеният браузър не върви в момента.
 5. Известие „Vault locked“.
 
-При краш на приложението или рестарт: при следващо стартиране се проверява за останали mount-ове на BV-* томове и те се демонтират.
+При краш на приложението или рестарт: при следващо стартиране се проверява за останали mount-ове на томове на сейфове (по пътя на image-а) и те се демонтират.
 
 ## 7. UI (Tauri)
 

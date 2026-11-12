@@ -377,7 +377,8 @@ done
     Ok(())
 }
 
-/// SPEC §6: at startup, detach leftover `BV-*` volumes from a crash.
+/// SPEC §6: at startup, detach leftover vault volumes from a crash (found by
+/// image path, not by volume name).
 /// Returns the vault ids that were recovered.
 ///
 /// Also stops a vault browser that survived the crash (only when its command

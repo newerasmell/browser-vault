@@ -381,7 +381,7 @@ impl Store {
                 stage: CreateStage::Disk,
                 pct: 30,
             });
-            hdiutil::create(&self.image_path(&id), size_gb, &id, &nv.key.disk_key_hex())?;
+            hdiutil::create(&self.image_path(&id), size_gb, &nv.key.disk_key_hex())?;
             self.save_header(&nv.header)?;
             notify(Event::CreateProgress {
                 stage: CreateStage::Profile,
@@ -440,6 +440,7 @@ impl Store {
         mkdir_700(&mnt)?;
         hdiutil::attach(&self.image_path(id), &mnt, &key.disk_key_hex())?;
         let _ = hdiutil::disable_spotlight(&mnt);
+        let _ = hdiutil::neutralize_volume_name(&mnt);
         let r = (|| -> Result<_> {
             mkdir_700(&browser::profile_dir(&mnt))?;
             mkdir_700(&browser::cache_dir(&mnt))?;
@@ -559,6 +560,7 @@ impl Store {
             hdiutil::attach(&self.image_path(id), &mnt, &key.disk_key_hex())?;
             // Best effort: indexing off is a hardening step, not a blocker.
             let _ = hdiutil::disable_spotlight(&mnt);
+            let _ = hdiutil::neutralize_volume_name(&mnt);
         }
         mkdir_700(&browser::profile_dir(&mnt))?;
         mkdir_700(&browser::cache_dir(&mnt))?;
