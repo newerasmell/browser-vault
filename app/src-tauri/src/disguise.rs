@@ -144,6 +144,13 @@ pub fn plist_matches(info_xml: &str, d: &Disguise) -> bool {
 
 /// Whether an existing bundle at the target path is one of ours (left over
 /// from an earlier attempt) and may be replaced.
+/// A bundle the app can replace: not on a mounted disk image / other volume
+/// (`/Volumes/...`) and not a Gatekeeper App Translocation path.
+pub fn is_installed_location(bundle: &Path) -> bool {
+    let s = bundle.to_string_lossy();
+    !s.starts_with("/Volumes/") && !s.contains("/AppTranslocation/")
+}
+
 pub fn is_our_bundle(info_xml: &str) -> bool {
     identity::plist_string(info_xml, "CFBundleExecutable").is_some_and(|e| by_exe(&e).is_some())
 }
@@ -366,6 +373,12 @@ mod mac {
             return Err("disguise_same");
         }
         let src = current_bundle().ok_or("disguise_unsupported")?;
+        // Started from the DMG (read-only) or a Gatekeeper-translocated copy:
+        // the switch could not remove that copy and the real one in
+        // /Applications would stay. Ask the user to install first.
+        if !is_installed_location(&src) {
+            return Err("disguise_install_first");
+        }
         if !lockctl::lockable_ids(&st).is_empty() || !lock(&st.drafts).is_empty() {
             return Err("disguise_unlocked");
         }
@@ -457,6 +470,24 @@ mod mac {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         st.quitting.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&src);
+        // Any other copy of this app (original name or an older disguise) in
+        // the Applications folders would give the app away: remove the ones
+        // that are verifiably ours (by their executable name), never others.
+        for dir in [PathBuf::from("/Applications"), home.join("Applications")] {
+            for other in &DISGUISES {
+                let p = dir.join(format!("{}.app", other.name));
+                if p == dst || !p.exists() {
+                    continue;
+                }
+                let ours = std::fs::read_to_string(p.join("Contents/Info.plist"))
+                    .map(|x| is_our_bundle(&x))
+                    .unwrap_or(false);
+                if ours {
+                    let _ = std::fs::remove_dir_all(&p);
+                    applog::log("disguise: removed an older copy");
+                }
+            }
+        }
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
@@ -486,6 +517,22 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_location() {
+        assert!(is_installed_location(Path::new(
+            "/Applications/Browser Vault.app"
+        )));
+        assert!(is_installed_location(Path::new(
+            "/Users/a/Applications/X.app"
+        )));
+        assert!(!is_installed_location(Path::new(
+            "/Volumes/Browser Vault/Browser Vault.app"
+        )));
+        assert!(!is_installed_location(Path::new(
+            "/private/var/folders/x/AppTranslocation/ABC/d/Browser Vault.app"
+        )));
+    }
 
     #[test]
     fn table_is_consistent() {

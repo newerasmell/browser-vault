@@ -175,6 +175,9 @@ pub fn write_firefox_user_js(mnt: &Path, disable_fxa: Option<bool>) -> Result<()
     ));
     out.push_str("user_pref(\"browser.shell.checkDefaultBrowser\", false);\n");
     out.push_str("user_pref(\"browser.sessionstore.resume_from_crash\", true);\n");
+    // Locking quits Firefox cleanly, so it must restore the previous
+    // session itself (Brave behaves this way by default).
+    out.push_str("user_pref(\"browser.startup.page\", 3);\n");
     // The vault quits Firefox with a normal "quit" when it locks; a
     // "close N tabs?" prompt would block that and force a hard stop.
     out.push_str("user_pref(\"browser.warnOnQuit\", false);\n");
@@ -326,6 +329,7 @@ mod tests {
         assert!(t.contains(&want_cache), "{t}");
         assert!(t.contains("\"browser.shell.checkDefaultBrowser\", false"));
         assert!(t.contains("\"browser.sessionstore.resume_from_crash\", true"));
+        assert!(t.contains("\"browser.startup.page\", 3"));
         assert!(t.contains(FXA_OFF));
 
         // Unlock path: same choice kept, block not duplicated, idempotent.
