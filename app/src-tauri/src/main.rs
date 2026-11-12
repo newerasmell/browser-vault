@@ -28,6 +28,8 @@ use crate::state::AppState;
 /// `open -n -a "<app name>" --args --reveal` (docs/NOTES.md).
 const REVEAL_ARG: &str = "--reveal";
 
+static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
 fn main() {
     // An interrupted disguise switch may have left the data under the
     // previous name; adopt it before anything opens the store or the log.
@@ -112,6 +114,7 @@ fn main() {
             commands::action_reset_confirm,
             commands::action_make_portable,
             commands::action_end,
+            commands::ui_log,
             commands::detect_profiles,
             commands::browser_running,
             commands::cleanup_preview,
@@ -130,6 +133,14 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let handle = app.handle().clone();
+            // Vault names arrive from the Keychain on a background thread;
+            // refresh every list when they do (see index::keychain).
+            let _ = APP.set(handle.clone());
+            vault_core::index::set_on_ready(|| {
+                if let Some(h) = APP.get() {
+                    lockctl::vaults_changed(h);
+                }
+            });
             let st = state::get(&handle);
 
             // SPEC §6: leftovers from a crash are detached before anything else.

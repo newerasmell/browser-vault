@@ -1247,3 +1247,12 @@ pub async fn apply_disguise(app: AppHandle, disguise: String) -> CmdResult<Value
     })
     .await
 }
+
+/// Frontend errors (uncaught exceptions, rejected promises) go to the app
+/// log so a blank window can be diagnosed. Messages are truncated; the UI
+/// never puts secrets in errors (command errors are bare codes).
+#[tauri::command]
+pub fn ui_log(view: String, msg: String) {
+    let clip = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+    crate::applog::log(&format!("ui[{}]: {}", clip(&view, 24), clip(&msg, 300)));
+}

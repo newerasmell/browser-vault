@@ -190,7 +190,17 @@ pub fn move_dir(from: &Path, to: &Path) -> Result<bool, &'static str> {
     if let Some(p) = to.parent() {
         let _ = std::fs::create_dir_all(p);
     }
-    std::fs::rename(from, to).map_err(|_| "disguise_failed")?;
+    // Mark the move first: if the switch is interrupted, only the app it
+    // was meant for may finish it at startup (see adopt_store).
+    let target_name = to
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = std::fs::write(from.join(SWITCH_MARKER), &target_name);
+    if std::fs::rename(from, to).is_err() {
+        let _ = std::fs::remove_file(from.join(SWITCH_MARKER));
+        return Err("disguise_failed");
+    }
     Ok(true)
 }
 
@@ -214,9 +224,15 @@ pub fn mount_output() -> String {
         .unwrap_or_default()
 }
 
+/// Marker written into the data directory right before a disguise switch
+/// renames it; holds the store name the directory is moving to.
+pub const SWITCH_MARKER: &str = ".switch-to";
+
 /// Startup fallback for an interrupted switch: this bundle's data directory
-/// is missing but exactly one other known store directory exists (and has
-/// nothing mounted) → adopt it by renaming. Returns the adopted directory.
+/// is missing and exactly one other known store directory carries a switch
+/// marker naming THIS store → finish the move. Without the marker nothing
+/// is adopted: another copy of the app (e.g. one started from the DMG) must
+/// never pull the vaults away from the installed one.
 pub fn adopt_store(base: &Path, own: &str, is_mounted: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let target = base.join(own);
     if target.exists() {
@@ -227,7 +243,12 @@ pub fn adopt_store(base: &Path, own: &str, is_mounted: impl Fn(&Path) -> bool) -
         .map(|d| d.store)
         .filter(|s| *s != own)
         .map(|s| base.join(s))
-        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.is_dir()
+                && std::fs::read_to_string(p.join(SWITCH_MARKER))
+                    .map(|m| m.trim() == own)
+                    .unwrap_or(false)
+        })
         .collect();
     let [only] = found.as_slice() else {
         return None;
@@ -236,6 +257,7 @@ pub fn adopt_store(base: &Path, own: &str, is_mounted: impl Fn(&Path) -> bool) -
         return None;
     }
     std::fs::rename(only, &target).ok()?;
+    let _ = std::fs::remove_file(target.join(SWITCH_MARKER));
     Some(only.clone())
 }
 
@@ -252,6 +274,8 @@ pub fn adopt_on_start() {
         let mounts = mount_output();
         let base = identity::data_dir(&home, "");
         adopt_store(&base, &own, |p| mounted_under(&mounts, p));
+        // The switch completed: drop its marker from our own directory.
+        let _ = std::fs::remove_file(base.join(&own).join(SWITCH_MARKER));
     }
     adopt_store(&identity::log_dir(&home, ""), &own, |_| false);
 }
@@ -684,26 +708,52 @@ mod tests {
     fn adopting_an_orphaned_store() {
         let d = tempfile::tempdir().unwrap();
         let base = d.path();
+        let mark =
+            |dir: &str, to: &str| std::fs::write(base.join(dir).join(SWITCH_MARKER), to).unwrap();
         // Nothing to adopt.
         assert_eq!(adopt_store(base, "com.fontcache.store", |_| false), None);
         std::fs::create_dir_all(base.join("BrowserVault/vaults")).unwrap();
-        // Mounted → left alone.
+        // Unmarked (e.g. another copy of the app is simply installed): never taken.
+        assert_eq!(adopt_store(base, "com.fontcache.store", |_| false), None);
+        // Marked for a different store: not ours to take.
+        mark("BrowserVault", "com.archiveindex.data");
+        assert_eq!(adopt_store(base, "com.fontcache.store", |_| false), None);
+        // Marked for us, but mounted → left alone.
+        mark("BrowserVault", "com.fontcache.store");
         assert_eq!(adopt_store(base, "com.fontcache.store", |_| true), None);
         assert_eq!(
             adopt_store(base, "com.fontcache.store", |_| false),
             Some(base.join("BrowserVault"))
         );
         assert!(base.join("com.fontcache.store/vaults").is_dir());
+        assert!(!base
+            .join("com.fontcache.store")
+            .join(SWITCH_MARKER)
+            .exists());
         // Own dir exists → nothing happens.
         std::fs::create_dir_all(base.join("com.archiveindex.data")).unwrap();
+        mark("com.archiveindex.data", "com.fontcache.store");
         assert_eq!(adopt_store(base, "com.fontcache.store", |_| false), None);
-        // Two candidates → ambiguous, nothing happens.
+        // The DMG-copy case: own dir missing, the installed app's dir is
+        // unmarked → the DMG copy must not pull it away.
+        std::fs::remove_file(base.join("com.archiveindex.data").join(SWITCH_MARKER)).unwrap();
         assert_eq!(adopt_store(base, "BrowserVault", |_| false), None);
         assert!(base.join("com.archiveindex.data").is_dir());
-        // Unknown names are never taken.
-        std::fs::create_dir_all(base.join("Other")).unwrap();
-        std::fs::remove_dir(base.join("com.archiveindex.data")).unwrap();
-        std::fs::rename(base.join("com.fontcache.store"), base.join("Other2")).unwrap();
-        assert_eq!(adopt_store(base, "BrowserVault", |_| false), None);
+        assert!(base.join("com.fontcache.store").is_dir());
+    }
+
+    #[test]
+    fn move_dir_marks_and_cleans_up() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (
+            d.path().join("BrowserVault"),
+            d.path().join("com.fontcache.store"),
+        );
+        std::fs::create_dir_all(a.join("vaults")).unwrap();
+        assert_eq!(move_dir(&a, &b), Ok(true));
+        assert_eq!(
+            std::fs::read_to_string(b.join(SWITCH_MARKER)).unwrap(),
+            "com.fontcache.store"
+        );
     }
 }

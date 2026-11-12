@@ -62,60 +62,88 @@ pub fn default_provider() -> KeyProvider {
 #[cfg(target_os = "macos")]
 enum Cached {
     Unknown,
+    /// A background read is running (macOS may be showing an access prompt).
+    Pending,
     Key(Key),
+    /// No item yet (first run): created on the first write.
+    Missing,
     /// Access failed (e.g. the user clicked Deny after an app update): don't
     /// ask again in this process; names show as "Locked vault".
     Failed,
 }
 
-/// The key from the login Keychain (read once per process, then cached).
+/// Called once the background Keychain read finishes, so the app can
+/// refresh lists that showed "Locked vault" meanwhile.
+static ON_READY: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+pub fn set_on_ready(f: fn()) {
+    let _ = ON_READY.set(f);
+}
+
+/// The key from the login Keychain, read once per process on a background
+/// thread. Never blocks a caller for long: if macOS is still waiting for
+/// the user to answer an access prompt (an updated or disguised app has a
+/// new signature), callers get `Ok(None)` after ~1.5 s and the names fill
+/// in when the read completes ([`set_on_ready`]). Holding a lock across the
+/// prompt froze every window that lists vaults.
 #[cfg(target_os = "macos")]
 pub fn keychain(create: bool) -> Result<Option<Key>> {
     use crate::error::Error;
     use security_framework::passwords::{get_generic_password, set_generic_password};
+    use std::sync::Condvar;
+    use std::time::Duration;
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
     const ERR: Error = Error::Unsupported("Keychain index key");
-    static CACHE: Mutex<Cached> = Mutex::new(Cached::Unknown);
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    match &*cache {
-        Cached::Key(k) => return Ok(Some(k.clone())),
-        Cached::Failed => return Err(ERR),
-        Cached::Unknown => {}
+    static STATE: (Mutex<Cached>, Condvar) = (Mutex::new(Cached::Unknown), Condvar::new());
+
+    let lock = || STATE.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = lock();
+    if matches!(*st, Cached::Unknown) {
+        *st = Cached::Pending;
+        std::thread::spawn(move || {
+            let r = match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+                Ok(v) => match from_hex(&Zeroizing::new(v)) {
+                    Some(k) => Cached::Key(k),
+                    None => Cached::Failed,
+                },
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Cached::Missing,
+                Err(_) => Cached::Failed,
+            };
+            *STATE.0.lock().unwrap_or_else(|e| e.into_inner()) = r;
+            STATE.1.notify_all();
+            if let Some(f) = ON_READY.get() {
+                f();
+            }
+        });
     }
-    match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
-        Ok(v) => {
-            let v = Zeroizing::new(v);
-            match from_hex(&v) {
-                Some(k) => {
-                    *cache = Cached::Key(k.clone());
-                    Ok(Some(k))
-                }
-                None => {
-                    *cache = Cached::Failed;
-                    Err(ERR)
-                }
-            }
-        }
-        Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => {
-            if !create {
-                return Ok(None);
-            }
+    if matches!(*st, Cached::Pending) {
+        st = STATE
+            .1
+            .wait_timeout_while(st, Duration::from_millis(1500), |c| {
+                matches!(c, Cached::Pending)
+            })
+            .map(|(g, _)| g)
+            .unwrap_or_else(|e| e.into_inner().0);
+    }
+    match &*st {
+        Cached::Key(k) => Ok(Some(k.clone())),
+        Cached::Failed => Err(ERR),
+        Cached::Pending | Cached::Unknown => Ok(None),
+        Cached::Missing if !create => Ok(None),
+        Cached::Missing => {
+            // Our own new item: creating it never prompts.
             let k = crypto::random_key();
             let hex = to_hex(&k);
             match set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, hex.as_bytes()) {
                 Ok(()) => {
-                    *cache = Cached::Key(k.clone());
+                    *st = Cached::Key(k.clone());
                     Ok(Some(k))
                 }
                 Err(_) => {
-                    *cache = Cached::Failed;
+                    *st = Cached::Failed;
                     Err(ERR)
                 }
             }
-        }
-        Err(_) => {
-            *cache = Cached::Failed;
-            Err(ERR)
         }
     }
 }

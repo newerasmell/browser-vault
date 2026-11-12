@@ -1205,6 +1205,11 @@ async function route() {
 }
 
 window.addEventListener('hashchange', route);
+if (isTauri) {
+  const report = (m) => { try { api('ui_log', { view: document.body.dataset.view || '?', msg: String(m) }); } catch {} };
+  window.addEventListener('error', (e) => report(e.message + ' @' + (e.filename || '').split('/').pop() + ':' + e.lineno));
+  window.addEventListener('unhandledrejection', (e) => report('rejection: ' + (e.reason?.code || e.reason?.message || e.reason)));
+}
 if (isTauri) on('settings_changed', () => route());
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && document.body.dataset.view !== 'tray' && isTauri) api('close_window');
