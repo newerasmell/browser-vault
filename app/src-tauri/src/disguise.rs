@@ -321,13 +321,49 @@ fn legacy_socket() -> PathBuf {
 /// Shell run detached after a switch: waits for this process to exit (so
 /// the single-instance socket is free), removes the old bundle id's
 /// folders (absolute paths built by [`bundle_id_traces`]) and opens the new
-/// bundle. Arguments: pid, new bundle, then the paths to remove.
+/// bundle. Arguments: pid, new bundle, a copy that could not be moved to the
+/// Trash ("" for none; shown in Finder so the user can drag it there), then
+/// the paths to remove.
 pub const RELAUNCH_SCRIPT: &str = r#"
-PID="$1"; NEW="$2"; shift 2
+PID="$1"; NEW="$2"; LEFT="$3"; shift 3
 i=0; while kill -0 "$PID" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
 for d in "$@"; do case "$d" in "$HOME"/Library/*) /bin/rm -rf -- "$d" ;; esac; done
 /usr/bin/open -n "$NEW"
+if [ -n "$LEFT" ] && [ -e "$LEFT" ]; then /usr/bin/open -R "$LEFT"; fi
 "#;
+
+/// Move app bundles to the Trash the way Finder does
+/// (`NSWorkspace recycleURLs`). Deleting another app's bundle directly makes
+/// macOS ask for (and list the app under) Privacy → App Management; the
+/// Trash route does not. Waits up to `wait` and returns the paths that are
+/// still there.
+pub fn trash(paths: &[PathBuf], wait: std::time::Duration) -> Vec<PathBuf> {
+    let paths: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
+    if paths.is_empty() {
+        return vec![];
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSWorkspace;
+        use objc2_foundation::{NSArray, NSString, NSURL};
+        let urls: Vec<_> = paths
+            .iter()
+            .map(|p| NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy())))
+            .collect();
+        let arr = NSArray::from_retained_slice(&urls);
+        // No completion handler: it is delivered on the main queue, which
+        // may be the thread waiting here. Poll the file system instead.
+        NSWorkspace::sharedWorkspace().recycleURLs_completionHandler(&arr, None);
+    }
+    let until = std::time::Instant::now() + wait;
+    loop {
+        let left: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
+        if left.is_empty() || std::time::Instant::now() >= until {
+            return left;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
 
 // The switch only uses std, tauri and macOS command-line tools, so it is
 // compiled (and clippy-checked) everywhere; it refuses to run off macOS.
@@ -425,6 +461,9 @@ mod mac {
 
     /// The whole switch. Blocking; on success the process exits shortly
     /// after and the new bundle starts. Returns the new bundle's name.
+    /// How long to wait for Finder to move a bundle to the Trash.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
     pub fn apply(app: &AppHandle, d: &'static Disguise) -> Result<String, &'static str> {
         if !cfg!(target_os = "macos") {
             return Err("disguise_unsupported");
@@ -480,7 +519,9 @@ mod mac {
             if !ours {
                 return Err("disguise_target_exists");
             }
-            std::fs::remove_dir_all(&dst).map_err(|_| "disguise_failed")?;
+            if !super::trash(std::slice::from_ref(&dst), WAIT).is_empty() {
+                return Err("disguise_failed");
+            }
         }
         let icon_src = app
             .path()
@@ -531,32 +572,39 @@ mod mac {
         st.relaunching
             .store(true, std::sync::atomic::Ordering::SeqCst);
         st.quitting.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = std::fs::remove_dir_all(&src);
-        // Any other copy of this app (original name or an older disguise) in
-        // the Applications folders would give the app away: remove the ones
-        // that are verifiably ours (by their executable name), never others.
+        // This copy, and any other copy of this app (original name or an
+        // older disguise) in the Applications folders, would give the app
+        // away: move the ones that are verifiably ours (by their executable
+        // name) to the Trash, never others.
+        let mut old = vec![src.clone()];
         for dir in [PathBuf::from("/Applications"), home.join("Applications")] {
             for other in &DISGUISES {
                 let p = dir.join(format!("{}.app", other.name));
-                if p == dst || !p.exists() {
+                if p == dst || p == src || !p.exists() {
                     continue;
                 }
                 let ours = std::fs::read_to_string(p.join("Contents/Info.plist"))
                     .map(|x| is_our_bundle(&x))
                     .unwrap_or(false);
                 if ours {
-                    let _ = std::fs::remove_dir_all(&p);
-                    applog::log("disguise: removed an older copy");
+                    old.push(p);
                 }
             }
         }
+        let left = super::trash(&old, WAIT);
+        applog::log(&format!(
+            "disguise: {} older cop(ies) to the Trash, {} left",
+            old.len() - left.len(),
+            left.len()
+        ));
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
             .arg(RELAUNCH_SCRIPT)
             .arg("relaunch")
             .arg(std::process::id().to_string())
-            .arg(&dst);
+            .arg(&dst)
+            .arg(left.first().map(|p| p.as_os_str()).unwrap_or_default());
         for p in bundle_id_traces(&home, cur.bundle_id) {
             cmd.arg(p);
         }
