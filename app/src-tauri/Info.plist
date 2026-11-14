@@ -5,5 +5,13 @@
 	<!-- Menu bar app: no Dock icon, no app menu. -->
 	<key>LSUIElement</key>
 	<true/>
+	<!-- The apps a vault starts (browsers, Telegram, Slack) are this app's
+	     child processes, so macOS asks for microphone/camera access on
+	     behalf of this app. Without these keys it kills the child at the
+	     first call or video meeting. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Apps started from here use the microphone for calls and meetings.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Apps started from here use the camera for video calls and meetings.</string>
 </dict>
 </plist>

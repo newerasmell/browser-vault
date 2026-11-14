@@ -941,6 +941,14 @@ mod tests {
     }
 
     #[test]
+    fn declares_microphone_and_camera_for_child_apps() {
+        let plist = include_str!("../Info.plist");
+        for key in ["NSMicrophoneUsageDescription", "NSCameraUsageDescription"] {
+            assert!(plist.contains(key), "{key} missing: calls would crash");
+        }
+    }
+
+    #[test]
     fn base_bundle_id_matches_tauri_conf() {
         let conf: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
