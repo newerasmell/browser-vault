@@ -27,6 +27,7 @@ const err = (code, extra = {}) => Object.assign(new Error(code), { code, ...extr
 
 const vaults = [
   { id: 'v1', name: 'Work – Brave', browser: 'brave', mode: 'fido2', status: 'unlocked', sizeGb: 20,
+    app_in_vault: false, app_outside: '/Applications/Brave Browser.app',
     original: { profileName: 'Default', sizeMb: 842, reviewed: true, state: 'pending' } },
   { id: 'v2', name: 'Ads accounts – Firefox', browser: 'firefox', mode: 'totp', status: 'locked', sizeGb: 20,
     original: { profileName: 'default-release', sizeMb: 516, reviewed: false, state: 'pending' } },
@@ -63,13 +64,18 @@ const mock = {
   detect_browsers: async () => ({
     brave: { found: true, path: '/Applications/Brave Browser.app' },
     firefox: { found: true, path: '/Applications/Firefox.app' },
-    telegram: { found: true, path: '/Applications/Telegram.app' }
+    telegram: { found: true, path: '/Applications/Telegram.app' },
+    whatsapp: { found: true, path: '/Applications/Brave Browser.app' },
+    slack: { found: true, path: '/Applications/Slack.app' }
   }),
   open_window: async ({ view, params }) => {
     location.hash = view + (params ? '?' + new URLSearchParams(params) : '');
   },
   close_window: async () => { location.hash = 'tray'; },
   focus_browser: async () => {},
+  install_update: async () => null,
+  move_app_into_vault: async () => ({ ok: true }),
+  remove_app_outside: async () => ({ ok: true }),
   quit_app: async () => {},
 
   unlock_vault: async ({ id, password, pin, code }) => {

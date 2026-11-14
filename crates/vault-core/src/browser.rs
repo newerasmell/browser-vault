@@ -18,6 +18,12 @@ pub enum Browser {
     /// Telegram Desktop (telegram.org, `com.tdesktop.Telegram`), not the
     /// App Store "Telegram" app, which cannot be told where to keep data.
     Telegram,
+    /// WhatsApp Web in its own app-style window (Brave `--app=`): the Mac
+    /// WhatsApp app keeps its data in a sandbox container that cannot be
+    /// moved into a vault.
+    WhatsApp,
+    /// Slack desktop (slack.com, `com.tinyspeck.slackmacgap`, Electron).
+    Slack,
 }
 
 impl Browser {
@@ -26,7 +32,23 @@ impl Browser {
             Browser::Brave => "brave",
             Browser::Firefox => "firefox",
             Browser::Telegram => "telegram",
+            Browser::WhatsApp => "whatsapp",
+            Browser::Slack => "slack",
         }
+    }
+
+    /// The installed app that runs this vault kind (WhatsApp runs in Brave).
+    pub fn engine(self) -> Browser {
+        match self {
+            Browser::WhatsApp => Browser::Brave,
+            b => b,
+        }
+    }
+
+    /// Chromium-based: `--user-data-dir`, and the mock keychain for
+    /// Mac-independent cookie/password keys.
+    pub fn is_chromium(self) -> bool {
+        matches!(self.engine(), Browser::Brave | Browser::Slack)
     }
 
     pub fn parse(s: &str) -> Option<Browser> {
@@ -34,6 +56,8 @@ impl Browser {
             "brave" => Some(Browser::Brave),
             "firefox" => Some(Browser::Firefox),
             "telegram" => Some(Browser::Telegram),
+            "whatsapp" => Some(Browser::WhatsApp),
+            "slack" => Some(Browser::Slack),
             _ => None,
         }
     }
@@ -41,17 +65,19 @@ impl Browser {
     /// `.app` bundle name and the binary inside `Contents/MacOS/`.
     fn bundle(self) -> (&'static str, &'static str) {
         match self {
-            Browser::Brave => ("Brave Browser.app", "Brave Browser"),
+            Browser::Brave | Browser::WhatsApp => ("Brave Browser.app", "Brave Browser"),
             Browser::Firefox => ("Firefox.app", "firefox"),
             Browser::Telegram => ("Telegram.app", "Telegram"),
+            Browser::Slack => ("Slack.app", "Slack"),
         }
     }
 
     pub fn download_url(self) -> &'static str {
         match self {
-            Browser::Brave => "https://brave.com/download/",
+            Browser::Brave | Browser::WhatsApp => "https://brave.com/download/",
             Browser::Firefox => "https://www.mozilla.org/firefox/new/",
             Browser::Telegram => "https://desktop.telegram.org/",
+            Browser::Slack => "https://slack.com/downloads/mac",
         }
     }
 }
@@ -68,7 +94,9 @@ pub fn binary_in_app(browser: Browser, app: &Path) -> PathBuf {
 pub fn required_bundle_id(browser: Browser) -> Option<&'static str> {
     match browser {
         Browser::Telegram => Some("com.tdesktop.Telegram"),
-        Browser::Brave | Browser::Firefox => None,
+        // The App Store Slack is sandboxed as well.
+        Browser::Slack => Some("com.tinyspeck.slackmacgap"),
+        Browser::Brave | Browser::Firefox | Browser::WhatsApp => None,
     }
 }
 
@@ -107,6 +135,59 @@ pub fn detect(browser: Browser) -> Option<PathBuf> {
         .map(|a| binary_in_app(browser, &a))
 }
 
+/// Where a vault keeps its own copy of the app (`<mnt>/app/<Name>.app`),
+/// so the app is not in /Applications while the vault is locked.
+pub fn vault_app(browser: Browser, mnt: &Path) -> PathBuf {
+    mnt.join("app").join(browser.bundle().0)
+}
+
+/// The vault's own copy, if it has a usable one.
+pub fn vault_binary(browser: Browser, mnt: &Path) -> Option<PathBuf> {
+    let app = vault_app(browser, mnt);
+    app_is_usable(browser, &app).then(|| binary_in_app(browser, &app))
+}
+
+/// Copy `src_app` into the mounted vault as its own copy (replacing an
+/// older one). `ditto` keeps the code signature, extended attributes and
+/// symlinks intact; the copy goes to a temporary name first, so a failed
+/// copy never leaves a half app where [`vault_binary`] would find it.
+pub fn copy_app_into(browser: Browser, src_app: &Path, mnt: &Path) -> Result<PathBuf> {
+    if !app_is_usable(browser, src_app) {
+        return Err(Error::BrowserMissing);
+    }
+    let dst = vault_app(browser, mnt);
+    let dir = dst.parent().ok_or(Error::Invalid("bad app path"))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".copy-{}.app", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let tool = if cfg!(target_os = "macos") {
+        ("/usr/bin/ditto", vec![])
+    } else {
+        ("cp", vec!["-a"])
+    };
+    let ok = Command::new(tool.0)
+        .args(tool.1)
+        .arg(src_app)
+        .arg(&tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok || !app_is_usable(browser, &tmp) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(Error::Command {
+            tool: "ditto",
+            detail: "copying the app failed".into(),
+        });
+    }
+    if dst.exists() {
+        std::fs::remove_dir_all(&dst)?;
+    }
+    std::fs::rename(&tmp, &dst)?;
+    Ok(dst)
+}
+
 pub fn profile_dir(mnt: &Path) -> PathBuf {
     mnt.join("profile")
 }
@@ -117,14 +198,17 @@ pub fn cache_dir(mnt: &Path) -> PathBuf {
 
 /// Command-line arguments for a vault instance (SPEC §5).
 pub fn launch_args(browser: Browser, mnt: &Path) -> Result<Vec<OsString>> {
+    let user_data = || {
+        let mut a = OsString::from("--user-data-dir=");
+        a.push(profile_dir(mnt));
+        a
+    };
     match browser {
-        Browser::Brave => {
-            let mut user_data = OsString::from("--user-data-dir=");
-            user_data.push(profile_dir(mnt));
+        Browser::Brave | Browser::WhatsApp => {
             let mut disk_cache = OsString::from("--disk-cache-dir=");
             disk_cache.push(cache_dir(mnt));
-            Ok(vec![
-                user_data,
+            let mut args = vec![
+                user_data(),
                 disk_cache,
                 "--no-first-run".into(),
                 "--no-default-browser-check".into(),
@@ -132,7 +216,11 @@ pub fn launch_args(browser: Browser, mnt: &Path) -> Result<Vec<OsString>> {
                 // keep Crashpad from writing dumps under ~/Library.
                 "--disable-crash-reporter".into(),
                 "--disable-breakpad".into(),
-            ])
+            ];
+            if browser == Browser::WhatsApp {
+                args.push(format!("--app={WHATSAPP_URL}").into());
+            }
+            Ok(args)
         }
         // Cache location etc. come from the managed block in `user.js`
         // (see [`write_firefox_user_js`]).
@@ -150,15 +238,21 @@ pub fn launch_args(browser: Browser, mnt: &Path) -> Result<Vec<OsString>> {
             dir.push(profile_dir(mnt));
             Ok(vec!["-workdir".into(), dir])
         }
+        // Electron: user data (session, cache, logs, Crashpad) follows
+        // Chromium's --user-data-dir.
+        Browser::Slack => Ok(vec![user_data()]),
     }
 }
+
+/// The page a WhatsApp vault opens as its app window.
+pub const WHATSAPP_URL: &str = "https://web.whatsapp.com/";
 
 /// Environment for a vault instance (paths/flags only, never secrets).
 /// Firefox: no crash reporter, so no minidumps under
 /// `~/Library/Application Support/Firefox/Crash Reports`.
 pub fn launch_env(browser: Browser) -> Vec<(&'static str, &'static str)> {
     match browser {
-        Browser::Brave | Browser::Telegram => vec![],
+        Browser::Brave | Browser::Telegram | Browser::WhatsApp | Browser::Slack => vec![],
         Browser::Firefox => vec![("MOZ_CRASHREPORTER_DISABLE", "1")],
     }
 }
@@ -270,7 +364,7 @@ pub fn launch_with(
         return Err(Error::BrowserMissing);
     }
     let mut args = launch_args(browser, mnt)?;
-    if portable_keys && browser == Browser::Brave {
+    if portable_keys && browser.is_chromium() {
         args.push(crate::portable::MOCK_KEYCHAIN_FLAG.into());
     }
     Command::new(binary)
@@ -361,6 +455,51 @@ mod tests {
     }
 
     #[test]
+    fn app_copied_into_vault_is_preferred() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("Applications/Brave Browser.app");
+        let bin = binary_in_app(Browser::Brave, &src);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"exe").unwrap();
+        let mnt = d.path().join("mnt");
+        assert_eq!(vault_binary(Browser::Brave, &mnt), None);
+        let dst = copy_app_into(Browser::Brave, &src, &mnt).unwrap();
+        assert_eq!(dst, mnt.join("app/Brave Browser.app"));
+        assert_eq!(
+            vault_binary(Browser::Brave, &mnt).unwrap(),
+            mnt.join("app/Brave Browser.app/Contents/MacOS/Brave Browser")
+        );
+        // Replacing an older copy works; no temp dirs are left.
+        copy_app_into(Browser::Brave, &src, &mnt).unwrap();
+        let names: Vec<_> = std::fs::read_dir(mnt.join("app"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["Brave Browser.app"]);
+        // Not an app of that kind: refused.
+        assert!(copy_app_into(Browser::Firefox, &src, &mnt).is_err());
+    }
+
+    #[test]
+    fn whatsapp_and_slack_args() {
+        let mnt = Path::new("/mnt/x");
+        let wa = launch_args(Browser::WhatsApp, mnt).unwrap();
+        assert_eq!(wa[0], "--user-data-dir=/mnt/x/profile");
+        assert_eq!(wa.last().unwrap(), "--app=https://web.whatsapp.com/");
+        assert_eq!(
+            binary_in_app(Browser::WhatsApp, Path::new("/A/Brave Browser.app")),
+            Path::new("/A/Brave Browser.app/Contents/MacOS/Brave Browser")
+        );
+        assert_eq!(Browser::WhatsApp.engine(), Browser::Brave);
+        assert_eq!(
+            launch_args(Browser::Slack, mnt).unwrap(),
+            ["--user-data-dir=/mnt/x/profile"]
+        );
+        assert!(Browser::Slack.is_chromium() && Browser::WhatsApp.is_chromium());
+        assert!(!Browser::Telegram.is_chromium() && !Browser::Firefox.is_chromium());
+    }
+
+    #[test]
     fn telegram_args_point_inside_mount() {
         let args = launch_args(Browser::Telegram, Path::new("/mnt/x")).unwrap();
         assert_eq!(args, ["-workdir", "/mnt/x/profile"]);
@@ -420,7 +559,13 @@ mod tests {
 
     #[test]
     fn parse_roundtrip() {
-        for b in [Browser::Brave, Browser::Firefox, Browser::Telegram] {
+        for b in [
+            Browser::Brave,
+            Browser::Firefox,
+            Browser::Telegram,
+            Browser::WhatsApp,
+            Browser::Slack,
+        ] {
             assert_eq!(Browser::parse(b.as_str()), Some(b));
         }
         assert_eq!(Browser::parse("Chrome"), None);

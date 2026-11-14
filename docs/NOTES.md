@@ -219,3 +219,16 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 - Импорт: копира `~/Library/Application Support/Telegram Desktop/tdata` → `<mnt>/profile/tdata` (проверка на `key_datas` + списък/размери). Почистването на оригинала трие цялата `Telegram Desktop` папка и `com.tdesktop.Telegram.savedState`.
 - Следа извън сейфа: известията (macOS пази текста им). Wizard-ът подканя да се изключат „Show sender name“ и „Show message preview“ в Telegram.
 - Самото `Telegram.app` остава в /Applications (следващ етап: приложението в сейфа).
+
+## Обновяване без сваляне на маскировката (About → „Install an update“)
+
+- Избира се изтегленото `.dmg` (или `.app`). DMG-то се закачва read-only, намира се нашето `.app` (по `CFBundleExecutable`), копира се до текущото под скрито име и се преименува/подписва точно като при смяна на маскировка (`build_copy_from`), със същата маскировка. Текущото копие отива в кошчето (`NSWorkspace recycleURLs`), новото заема пътя му и се стартира. Данни, настройки и store не се пипат. Всички сейфове трябва да са заключени.
+
+## Приложението в сейфа
+
+- `<mnt>/app/<Name>.app`: бутон „Keep <App> inside this vault“ (сейфът отключен) копира инсталираното приложение с `ditto`; при пускане собственото копие на сейфа има приоритет (`browser::vault_binary`). „Remove <App> from Applications“ мести инсталираното в кошчето (отказва, докато обикновената инстанция работи). Други сейфове от същия вид първо трябва да имат свое копие.
+
+## WhatsApp и Slack
+
+- `whatsapp`: WhatsApp Web в отделен прозорец (`--app=https://web.whatsapp.com/`) през Brave, с отделен профил в сейфа и преносими ключове (mock keychain). Приложението WhatsApp за Mac пази данните в sandbox контейнер и не може да се затвори в сейф. Без импорт: свързва се с QR код.
+- `slack`: Slack Desktop (`com.tinyspeck.slackmacgap`, Electron) с `--user-data-dir=<mnt>/profile` и mock keychain. Без импорт: нов вход. Версията от App Store се отказва (sandbox).

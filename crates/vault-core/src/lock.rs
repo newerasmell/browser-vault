@@ -52,9 +52,10 @@ mod platform {
 /// and the regular browser (SPEC §6 step 4).
 fn saved_state_bundle(browser: Browser) -> &'static str {
     match browser {
-        Browser::Brave => "com.brave.Browser",
+        Browser::Brave | Browser::WhatsApp => "com.brave.Browser",
         Browser::Firefox => "org.mozilla.firefox",
         Browser::Telegram => "com.tdesktop.Telegram",
+        Browser::Slack => "com.tinyspeck.slackmacgap",
     }
 }
 

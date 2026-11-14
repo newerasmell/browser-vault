@@ -374,7 +374,7 @@ impl Store {
         // Fresh Brave vaults start portable (logins work on any Mac). An
         // imported profile becomes portable only if its logins can be
         // converted below.
-        settings.portable_keys = browser == Browser::Brave && opts.import.is_none();
+        settings.portable_keys = browser.is_chromium() && opts.import.is_none();
         let nv = draft.finish(settings)?;
         let id = nv.header.vault_id.clone();
         mkdir_700(&self.root)?;
@@ -602,9 +602,11 @@ impl Store {
     pub fn launch(&self, unlocked: &Unlocked, binary: Option<&Path>) -> Result<Child> {
         let meta = unlocked.header.meta()?;
         let browser = meta.browser;
-        let bin = match binary {
-            Some(b) => b.to_path_buf(),
-            None => browser::detect(browser).ok_or(Error::BrowserMissing)?,
+        // The vault's own copy of the app wins over the installed one.
+        let bin = match (browser::vault_binary(browser, &unlocked.mountpoint), binary) {
+            (Some(own), _) => own,
+            (None, Some(b)) => b.to_path_buf(),
+            (None, None) => browser::detect(browser).ok_or(Error::BrowserMissing)?,
         };
         let child = browser::launch_with(
             browser,

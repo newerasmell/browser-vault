@@ -40,7 +40,11 @@ const ICONS = {
 const icon = (name, cls = '') =>
   h('span', { class: 'ico ' + cls, svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
 
-const BROWSERS = { brave: 'Brave', firefox: 'Firefox', telegram: 'Telegram' };
+const BROWSERS = { brave: 'Brave', firefox: 'Firefox', telegram: 'Telegram', whatsapp: 'WhatsApp', slack: 'Slack' };
+// Kinds that run inside another installed app (WhatsApp Web runs in Brave).
+const ENGINE = { whatsapp: 'brave' };
+// Kinds that start with a fresh sign-in (nothing to import).
+const NO_IMPORT = new Set(['whatsapp', 'slack']);
 const fmtSize = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB');
 // A vault's name/browser are null when its header keeps them encrypted and
 // this Mac has no index entry yet (shown as "Locked vault" until unlocked).
@@ -476,7 +480,7 @@ async function viewWizard() {
   // 5. options
   // Brave with ≥2 profiles: first choice imports all of them into this vault.
   function importChoices() {
-    const list = profiles[w.browser];
+    const list = profiles[w.browser] ?? [];
     const out = list.map((pr) => ({ id: pr.id, label: `${pr.name} · ${fmtSize(pr.sizeMb)}` }));
     if (w.browser === 'brave' && list.length >= 2) {
       const total = list.reduce((s, pr) => s + pr.sizeMb, 0);
@@ -500,7 +504,8 @@ async function viewWizard() {
         toggle(t('lock_screen'), w.lockOnScreenLock, (v) => (w.lockOnScreenLock = v)),
         w.mode === 'fido2' && toggle(t('lock_key_removal'), w.lockOnKeyRemoval, (v) => (w.lockOnKeyRemoval = v)),
         w.browser === 'firefox' && toggle(t('disable_fxa'), w.disableFxa, (v) => (w.disableFxa = v)),
-        w.browser === 'telegram'
+        NO_IMPORT.has(w.browser) ? null
+          : w.browser === 'telegram'
           ? toggle(t('import_telegram'), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_telegram_hint'))
           : toggle(t('import_profile', { browser: BROWSERS[w.browser] }), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_hint')),
         w.importProfile && choices.length && h('div', { class: 'toggle-row' },
@@ -509,7 +514,11 @@ async function viewWizard() {
             choices.map((c) => h('option', { value: c.id, selected: c.id === w.importProfileId }, c.label)))),
         w.importProfile && w.importProfileId === ALL_PROFILES &&
           h('small', { class: 'muted block', style: 'padding:0 12px 10px;margin-top:-4px' }, t('import_all_hint', { browser: BROWSERS[w.browser] }))),
-      w.browser === 'telegram'
+      w.browser === 'whatsapp'
+        ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('wa_note_title')), ' ', t('wa_note_body')))
+        : w.browser === 'slack'
+        ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('slack_note_title')), ' ', t('slack_note_body')))
+        : w.browser === 'telegram'
         ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('tg_notify_title')), ' ', t('tg_notify_body')))
         : h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('sync_warn_title')), ' ', t('sync_warn_body'))),
       nav(true, (e) => { e.preventDefault(); go(5); }, t('create_vault')));
@@ -562,6 +571,7 @@ async function viewWizard() {
     cleanup.push(off);
     if (!w.started) {
       w.started = true;
+      if (NO_IMPORT.has(w.browser)) w.importProfile = false;
       api('wizard_finish', {
         draftId: w.draftId, name: w.name.trim(), browser: w.browser, mode: w.mode, sizeGb: w.sizeGb,
         options: { idleMinutes: w.idleMinutes, lockOnScreenLock: w.lockOnScreenLock, lockOnKeyRemoval: w.lockOnKeyRemoval,
@@ -1006,6 +1016,44 @@ async function viewSettings(params) {
   const bkErr = (e) => { const k = 'err_' + (e && e.code); return t(k) !== k ? t(k) : t('err_backup_io'); };
   const bar = (pct) => { const b = h('div', { class: 'progress' }, h('i')); b.firstChild.style.width = (pct || 0) + '%'; return b; };
 
+  // The app itself inside the vault (only while unlocked).
+  function appBlock(v) {
+    if (v.status !== 'unlocked' || v.app_in_vault == null || !BROWSERS[v.browser]) return null;
+    const app = BROWSERS[ENGINE[v.browser] ?? v.browser];
+    const box = h('div', { class: 'backup-box' });
+    let busy = false, err = '';
+    const errText = (e) => { const k = 'err_' + (e && e.code); return t(k) !== k ? t(k) : t('err_app_copy_failed'); };
+    const paint = () => {
+      const rows = [];
+      if (!v.app_in_vault) {
+        rows.push(h('div', { class: 'row' },
+          h('button', { class: 'btn sm ghost', disabled: busy || !v.app_outside, onclick: async () => {
+            busy = true; err = ''; paint();
+            try { await api('move_app_into_vault', { id: v.id }); v.app_in_vault = true; toast(t('app_in_vault_done', { app })); }
+            catch (e) { err = errText(e); }
+            busy = false; paint();
+          } }, busy ? t('app_copying') : t('app_into_vault', { app })),
+          h('small', { class: 'muted' }, t('app_into_vault_hint', { app }))));
+      } else {
+        rows.push(h('div', { class: 'row' }, icon('check', 'sm'), h('small', {}, t('app_is_in_vault', { app }))));
+        if (v.app_outside) {
+          rows.push(h('div', { class: 'row' },
+            h('button', { class: 'btn sm ghost', disabled: busy, onclick: async () => {
+              busy = true; err = ''; paint();
+              try { await api('remove_app_outside', { id: v.id }); v.app_outside = null; toast(t('app_removed_done', { app })); }
+              catch (e) { err = errText(e); }
+              busy = false; paint();
+            } }, t('app_remove_outside', { app })),
+            h('small', { class: 'muted' }, t('app_remove_outside_hint', { app }))));
+        }
+      }
+      if (err) rows.push(h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', {}, err)));
+      box.replaceChildren(...rows);
+    };
+    paint();
+    return box;
+  }
+
   function backupBlock(v) {
     const box = h('div', { class: 'backup-box' });
     const paint = () => {
@@ -1089,6 +1137,7 @@ async function viewSettings(params) {
           v.browser === 'brave' && !v.portable && act('make_portable', t('act_portable_btn')),
           act('recovery_reset', t('act_recovery_link')),
           act('delete', t('delete_vault'), 'danger push')),
+        appBlock(v),
         backupBlock(v));
     }));
     return h('div', { class: 'form' },
@@ -1116,9 +1165,23 @@ async function viewSettings(params) {
   }
 
   function about() {
+    const updErr = h('p', { class: 'error', role: 'alert' });
+    const upd = h('button', { class: 'btn', type: 'button', onclick: async () => {
+      updErr.textContent = ''; upd.disabled = true;
+      try {
+        const r = await api('install_update');
+        if (r) { upd.textContent = t('update_restarting'); return; }
+      } catch (e) {
+        const k = 'err_' + (e && e.code);
+        updErr.textContent = t(k) !== k ? t(k) : t('err_update_failed');
+      }
+      upd.disabled = false;
+    } }, t('update_btn'));
     return h('div', { class: 'form' },
       h('div', { class: 'about-head' }, h('div', { class: 'brand on lg' }, icon('shield', 'lg')),
         h('div', {}, h('h2', {}, t('app_name')), h('small', { class: 'muted' }, `${t('version')} ${info.version}${info.build ? ' · build ' + info.build : ''}`))),
+      h('div', { class: 'group' }, h('div', { class: 'toggle-row' },
+        h('span', { class: 'toggle-text' }, t('update_title'), h('small', {}, t('update_hint'))), upd), updErr),
       h('h3', {}, t('limits_title')),
       h('ul', { class: 'limits' }, t('limits').map((l, i) => h('li', { class: i === 0 ? 'good' : '' }, icon(i === 0 ? 'check' : 'alert', 'sm'), l))));
   }

@@ -123,15 +123,19 @@ impl Roots {
 
     pub fn saved_state(&self, browser: Browser) -> PathBuf {
         let bundle = match browser {
-            Browser::Brave => "com.brave.Browser.savedState",
+            Browser::Brave | Browser::WhatsApp => "com.brave.Browser.savedState",
             Browser::Firefox => "org.mozilla.firefox.savedState",
             Browser::Telegram => "com.tdesktop.Telegram.savedState",
+            Browser::Slack => "com.tinyspeck.slackmacgap.savedState",
         };
         self.home
             .join("Library/Saved Application State")
             .join(bundle)
     }
 }
+
+/// WhatsApp and Slack vaults start with a fresh sign-in.
+pub const ERR_NO_IMPORT: &str = "this vault kind has nothing to import";
 
 /// The one Telegram Desktop "profile": its `tdata` directory.
 pub const TELEGRAM_PROFILE: &str = "tdata";
@@ -201,6 +205,8 @@ pub fn detect_profiles_in(roots: &Roots, browser: Browser) -> Result<Vec<Detecte
                 });
             }
         }
+        // Nothing to import: these start with a fresh sign-in.
+        Browser::WhatsApp | Browser::Slack => {}
         // One session per working directory: its `tdata`.
         Browser::Telegram => {
             let path = roots.telegram_data().join(TELEGRAM_PROFILE);
@@ -296,9 +302,10 @@ pub fn regular_browser_running(browser: Browser) -> bool {
 /// [`regular_browser_running`] on a given `ps` listing (one command per line).
 pub fn regular_running_in(browser: Browser, ps: &str) -> bool {
     let exe = match browser {
-        Browser::Brave => "/Contents/MacOS/Brave Browser",
+        Browser::Brave | Browser::WhatsApp => "/Contents/MacOS/Brave Browser",
         Browser::Firefox => "/Contents/MacOS/firefox",
         Browser::Telegram => "/Contents/MacOS/Telegram",
+        Browser::Slack => "/Contents/MacOS/Slack",
     };
     ps.lines().any(|line| {
         let line = line.trim();
@@ -359,6 +366,7 @@ fn key_files(browser: Browser) -> &'static [&'static str] {
         Browser::Firefox => &["cookies.sqlite", "logins.json", "key4.db", "places.sqlite"],
         // The local key that decrypts the rest of tdata.
         Browser::Telegram => &["key_datas"],
+        Browser::WhatsApp | Browser::Slack => &[],
     }
 }
 
@@ -370,6 +378,7 @@ pub fn import_destination(browser: Browser, mnt: &Path) -> PathBuf {
         Browser::Brave => browser::profile_dir(mnt).join("Default"),
         Browser::Firefox => browser::profile_dir(mnt),
         Browser::Telegram => browser::profile_dir(mnt).join(TELEGRAM_PROFILE),
+        Browser::WhatsApp | Browser::Slack => browser::profile_dir(mnt),
     }
 }
 
@@ -396,6 +405,9 @@ pub(crate) fn import_with_hook(
     notify: Notify<'_>,
     after_copy: &dyn Fn(&Path),
 ) -> Result<Original> {
+    if matches!(browser, Browser::WhatsApp | Browser::Slack) {
+        return Err(Error::Invalid(ERR_NO_IMPORT));
+    }
     if profile_id == ALL_PROFILES && browser != Browser::Brave {
         return Err(Error::Invalid("only Brave can import all profiles"));
     }
@@ -869,6 +881,7 @@ pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<Clea
                 saved_state,
             })
         }
+        Browser::WhatsApp | Browser::Slack => Err(Error::Invalid(ERR_NO_IMPORT)),
         // The whole default working directory (tdata, pending updates,
         // logs): it only ever holds the one session that was imported.
         Browser::Telegram => {
@@ -1038,7 +1051,7 @@ pub fn cleanup_original(
         Browser::Brave => brave_forget_profiles(roots, &ids)?,
         Browser::Firefox => firefox_forget_profile(roots, &o.profile_id)?,
         // No profile list to edit.
-        Browser::Telegram => {}
+        Browser::Telegram | Browser::WhatsApp | Browser::Slack => {}
     }
     notify(Event::CleanupProgress { pct: 20 });
     let n = t.profiles.len().max(1);

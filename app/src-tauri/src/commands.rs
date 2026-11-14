@@ -77,6 +77,10 @@ pub struct VaultInfo {
     original: Option<OriginalInfo>,
     /// Brave logins use the Mac-independent key (vault works on any Mac).
     portable: bool,
+    /// Only known while unlocked: the vault has its own copy of the app.
+    app_in_vault: Option<bool>,
+    /// The installed app outside the vault (/Applications), if any.
+    app_outside: Option<String>,
 }
 
 /// `fido2` if the vault has a YubiKey slot, else `totp`.
@@ -160,8 +164,77 @@ fn vault_info(st: &AppState, l: &Listed) -> VaultInfo {
         },
         // Unknown browser: nothing to offer until the first unlock.
         portable: label.is_none_or(|e| e.browser != Browser::Brave || e.portable_keys),
+        app_in_vault: (status == "unlocked")
+            .then(|| {
+                label.map(|e| browser::vault_binary(e.browser, &st.store.mountpoint(&id)).is_some())
+            })
+            .flatten(),
+        app_outside: label
+            .and_then(|e| browser_binary(st, e.browser))
+            .and_then(|b| app_bundle_of(&b))
+            .map(|p| p.to_string_lossy().into_owned()),
         id,
     }
+}
+
+/// The open vault's app kind and mountpoint (`vault_locked` otherwise).
+fn open_vault(st: &AppState, id: &str) -> CmdResult<(Browser, PathBuf)> {
+    let sessions = lock(&st.sessions);
+    let s = sessions.get(id).ok_or(CmdError::new("vault_locked"))?;
+    Ok((
+        s.unlocked.header.meta()?.browser,
+        s.unlocked.mountpoint.clone(),
+    ))
+}
+
+/// Copy the installed app into the open vault, so the vault runs its own
+/// copy from now on (`app_copy_failed`, `browser_missing`).
+#[tauri::command]
+pub async fn move_app_into_vault(app: AppHandle, id: String) -> CmdResult<Value> {
+    blocking(move || {
+        let st = state::get(&app);
+        let (b, mnt) = open_vault(&st, &id)?;
+        let src = browser_binary(&st, b)
+            .and_then(|bin| app_bundle_of(&bin))
+            .ok_or(CmdError::new("browser_missing"))?;
+        browser::copy_app_into(b, &src, &mnt).map_err(|e| {
+            crate::applog::log(&format!("app copy into {id} failed: {e}"));
+            CmdError::new("app_copy_failed")
+        })?;
+        crate::applog::log(&format!("app copied into vault {id}"));
+        lockctl::vaults_changed(&app);
+        Ok(json!(OK))
+    })
+    .await
+}
+
+/// Move the installed app (outside the vault) to the Trash once this open
+/// vault has its own copy. Refused while that app runs outside a vault
+/// (`browser_running`) or before the copy exists (`app_not_in_vault`).
+#[tauri::command]
+pub async fn remove_app_outside(app: AppHandle, id: String) -> CmdResult<Value> {
+    blocking(move || {
+        let st = state::get(&app);
+        let (b, mnt) = open_vault(&st, &id)?;
+        if browser::vault_binary(b, &mnt).is_none() {
+            return Err(CmdError::new("app_not_in_vault"));
+        }
+        if vault_core::profiles::regular_browser_running(b) {
+            return Err(CmdError::new("browser_running"));
+        }
+        let src = browser_binary(&st, b)
+            .and_then(|bin| app_bundle_of(&bin))
+            .filter(|p| !p.starts_with(st.store.root()))
+            .ok_or(CmdError::new("browser_missing"))?;
+        let left = crate::disguise::trash(&[src], std::time::Duration::from_secs(8));
+        if !left.is_empty() {
+            return Err(CmdError::new("app_remove_failed"));
+        }
+        crate::applog::log(&format!("installed app of vault {id} moved to the Trash"));
+        lockctl::vaults_changed(&app);
+        Ok(json!(OK))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -190,7 +263,7 @@ fn browser_binary(st: &AppState, b: Browser) -> Option<PathBuf> {
     let manual = st
         .settings()
         .browser_paths
-        .get(b.as_str())
+        .get(b.engine().as_str())
         .filter(|app| browser::app_is_usable(b, Path::new(app)))
         .map(|app| browser::binary_in_app(b, Path::new(app)));
     manual.or_else(|| browser::detect(b))
@@ -207,6 +280,8 @@ pub async fn detect_browsers(app: AppHandle) -> Value {
         "brave": one(Browser::Brave),
         "firefox": one(Browser::Firefox),
         "telegram": one(Browser::Telegram),
+        "whatsapp": one(Browser::WhatsApp),
+        "slack": one(Browser::Slack),
     })
 }
 
@@ -229,8 +304,10 @@ pub async fn pick_browser_path(app: AppHandle, browser: String) -> CmdResult<Opt
         let st = state::get(&app);
         let s = {
             let mut s = lock(&st.settings);
-            s.browser_paths
-                .insert(b.as_str().into(), path.to_string_lossy().into_owned());
+            s.browser_paths.insert(
+                b.engine().as_str().into(),
+                path.to_string_lossy().into_owned(),
+            );
             s.clone()
         };
         s.save(st.store.root())?;
@@ -1247,6 +1324,34 @@ pub async fn apply_disguise(app: AppHandle, disguise: String) -> CmdResult<Value
     blocking(move || {
         crate::disguise::apply(&app, d)
             .map(|name| json!({ "name": name }))
+            .map_err(CmdError::new)
+    })
+    .await
+}
+
+/// Pick a downloaded update (`.dmg` or `.app`) and install it over this
+/// bundle, keeping the current disguise. `null` when the picker was
+/// cancelled; on success the app restarts and `{ name }` is returned first.
+/// Codes: `disguise_unlocked`, `disguise_install_first`, `update_not_ours`,
+/// `update_failed`, `disguise_unsupported`.
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> CmdResult<Option<Value>> {
+    blocking(move || {
+        let picked = app
+            .dialog()
+            .file()
+            .add_filter("Update", &["dmg", "app"])
+            .set_directory(
+                std::env::var_os("HOME")
+                    .map(|h| Path::new(&h).join("Downloads"))
+                    .unwrap_or_default(),
+            )
+            .blocking_pick_file();
+        let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
+            return Ok(None);
+        };
+        crate::disguise::install_update(&app, &path)
+            .map(|name| Some(json!({ "name": name })))
             .map_err(CmdError::new)
     })
     .await

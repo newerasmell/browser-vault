@@ -367,7 +367,7 @@ pub fn trash(paths: &[PathBuf], wait: std::time::Duration) -> Vec<PathBuf> {
 
 // The switch only uses std, tauri and macOS command-line tools, so it is
 // compiled (and clippy-checked) everywhere; it refuses to run off macOS.
-pub use mac::apply;
+pub use mac::{apply, install_update};
 
 mod mac {
     use std::path::{Path, PathBuf};
@@ -406,21 +406,32 @@ mod mac {
         icon_src: &Path,
         d: &Disguise,
     ) -> Result<(), &'static str> {
-        const FAIL: &str = "disguise_failed";
+        let exe_now = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.file_name().map(|n| n.to_os_string()))
+            .ok_or("disguise_failed")?;
+        build_copy_from(src, &exe_now, dst, icon_src, d, "disguise_failed")
+    }
+
+    /// [`build_copy`] for a bundle whose executable is `exe_now`.
+    fn build_copy_from(
+        src: &Path,
+        exe_now: &std::ffi::OsStr,
+        dst: &Path,
+        icon_src: &Path,
+        d: &Disguise,
+        fail: &'static str,
+    ) -> Result<(), &'static str> {
         if !run("/usr/bin/ditto", &[src.as_os_str(), dst.as_os_str()]) {
-            return Err(FAIL);
+            return Err(fail);
         }
         // Quarantine and other xattrs: codesign refuses "detritus".
         let _ = run("/usr/bin/xattr", &["-cr".as_ref(), dst.as_os_str()]);
         let macos = dst.join("Contents/MacOS");
-        let exe_now = std::env::current_exe()
-            .ok()
-            .and_then(|e| e.file_name().map(|n| n.to_os_string()))
-            .ok_or(FAIL)?;
         if exe_now != d.exe {
-            std::fs::rename(macos.join(&exe_now), macos.join(d.exe)).map_err(|_| FAIL)?;
+            std::fs::rename(macos.join(exe_now), macos.join(d.exe)).map_err(|_| fail)?;
         }
-        std::fs::copy(icon_src, dst.join("Contents/Resources").join(d.icon)).map_err(|_| FAIL)?;
+        std::fs::copy(icon_src, dst.join("Contents/Resources").join(d.icon)).map_err(|_| fail)?;
         let plist = dst.join("Contents/Info.plist");
         for edit in plist_edits(d) {
             let mut args: Vec<&std::ffi::OsStr> = edit.iter().map(|s| s.as_ref()).collect();
@@ -428,12 +439,12 @@ mod mac {
             let ok = run("/usr/bin/plutil", &args);
             // `-remove` of a key that is not there fails harmlessly.
             if !ok && edit[0] != "-remove" {
-                return Err(FAIL);
+                return Err(fail);
             }
         }
-        let xml = std::fs::read_to_string(&plist).map_err(|_| FAIL)?;
+        let xml = std::fs::read_to_string(&plist).map_err(|_| fail)?;
         if !plist_matches(&xml, d) {
-            return Err(FAIL);
+            return Err(fail);
         }
         let _ = run("/usr/bin/xattr", &["-cr".as_ref(), dst.as_os_str()]);
         if !run(
@@ -454,7 +465,7 @@ mod mac {
                 dst.as_os_str(),
             ],
         ) {
-            return Err(FAIL);
+            return Err(fail);
         }
         Ok(())
     }
@@ -621,6 +632,178 @@ mod mac {
             app.exit(0);
         });
         Ok(d.name.to_string())
+    }
+
+    /// Mounts `dmg` read-only and returns the mountpoint and our app in it.
+    fn mount_update(dmg: &Path) -> Result<(PathBuf, PathBuf), &'static str> {
+        let mnt = std::env::temp_dir().join(format!("upd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&mnt);
+        if !run(
+            "/usr/bin/hdiutil",
+            &[
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-readonly".as_ref(),
+                "-noautoopen".as_ref(),
+                "-mountpoint".as_ref(),
+                mnt.as_os_str(),
+                dmg.as_os_str(),
+            ],
+        ) {
+            let _ = std::fs::remove_dir(&mnt);
+            return Err("update_not_ours");
+        }
+        match find_our_app(&mnt) {
+            Some(app) => Ok((mnt, app)),
+            None => {
+                unmount_update(&mnt);
+                Err("update_not_ours")
+            }
+        }
+    }
+
+    fn unmount_update(mnt: &Path) {
+        let _ = run(
+            "/usr/bin/hdiutil",
+            &["detach".as_ref(), "-force".as_ref(), mnt.as_os_str()],
+        );
+        let _ = std::fs::remove_dir(mnt);
+    }
+
+    /// An `.app` directly in `dir` that is a build of this app (any
+    /// disguise, by its executable name).
+    fn find_our_app(dir: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "app"))
+            .find(|p| {
+                std::fs::read_to_string(p.join("Contents/Info.plist"))
+                    .is_ok_and(|x| is_our_bundle(&x))
+            })
+    }
+
+    /// Install a new version from a downloaded `.dmg` (or a plain `.app`)
+    /// over this bundle, keeping the current disguise: the new build is
+    /// copied next to this one under a hidden name, renamed, re-iconed and
+    /// re-signed exactly like a disguise switch, then swapped in (the old
+    /// bundle goes to the Trash) and started. Data, settings and the store
+    /// are untouched: the disguise, and so the store name, stays the same.
+    /// All vaults must be locked. Returns the app's name.
+    pub fn install_update(app: &AppHandle, source: &Path) -> Result<String, &'static str> {
+        if !cfg!(target_os = "macos") {
+            return Err("disguise_unsupported");
+        }
+        let st = state::get(app);
+        let cur = super::current();
+        let src = current_bundle().ok_or("disguise_unsupported")?;
+        if !is_installed_location(&src) {
+            return Err("disguise_install_first");
+        }
+        if !lockctl::lockable_ids(&st).is_empty() || !lock(&st.drafts).is_empty() {
+            return Err("disguise_unlocked");
+        }
+        if super::mounted_under(&super::mount_output(), st.store.root()) {
+            return Err("disguise_unlocked");
+        }
+        let is_dmg = source
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("dmg"));
+        let (mnt, new_app) = if is_dmg {
+            let (m, a) = mount_update(source)?;
+            (Some(m), a)
+        } else {
+            let ours = std::fs::read_to_string(source.join("Contents/Info.plist"))
+                .is_ok_and(|x| is_our_bundle(&x));
+            if !ours {
+                return Err("update_not_ours");
+            }
+            (None, source.to_path_buf())
+        };
+        let parent = src.parent().ok_or("update_failed")?.to_path_buf();
+        let staging = parent.join(format!(".{}-update-{}.app", cur.exe, std::process::id()));
+        let built = (|| {
+            if new_app == src {
+                return Err("update_not_ours");
+            }
+            let info = std::fs::read_to_string(new_app.join("Contents/Info.plist"))
+                .map_err(|_| "update_not_ours")?;
+            let new_exe =
+                identity::plist_string(&info, "CFBundleExecutable").ok_or("update_not_ours")?;
+            let icon_src = [
+                new_app.join("Contents/Resources/disguises").join(cur.icon),
+                app.path()
+                    .resource_dir()
+                    .map_err(|_| "update_failed")?
+                    .join("disguises")
+                    .join(cur.icon),
+            ]
+            .into_iter()
+            .find(|p| p.is_file())
+            .ok_or("update_failed")?;
+            let _ = std::fs::remove_dir_all(&staging);
+            build_copy_from(
+                &new_app,
+                std::ffi::OsStr::new(&new_exe),
+                &staging,
+                &icon_src,
+                cur,
+                "update_failed",
+            )
+        })();
+        if let Some(m) = &mnt {
+            unmount_update(m);
+        }
+        if let Err(e) = built {
+            let _ = std::fs::remove_dir_all(&staging);
+            applog::log("update: building the new copy failed");
+            return Err(e);
+        }
+
+        // Swap: the running bundle goes to the Trash, the new one takes its
+        // path. A running app's bundle can be moved; this process keeps
+        // its open files until it exits right after.
+        st.relaunching
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        st.quitting.store(true, std::sync::atomic::Ordering::SeqCst);
+        if !super::trash(std::slice::from_ref(&src), WAIT).is_empty()
+            || std::fs::rename(&staging, &src).is_err()
+        {
+            // Put things back as far as possible.
+            if !src.exists() {
+                let _ = std::fs::rename(&staging, &src);
+            }
+            let _ = std::fs::remove_dir_all(&staging);
+            st.relaunching
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            st.quitting
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            applog::log("update: could not replace the app");
+            return Err("update_failed");
+        }
+        applog::log("update: installed; restarting");
+        applog::suspend();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(RELAUNCH_SCRIPT)
+            .arg("relaunch")
+            .arg(std::process::id().to_string())
+            .arg(&src)
+            .arg("");
+        use std::os::unix::process::CommandExt;
+        let _ = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            app.exit(0);
+        });
+        Ok(cur.name.to_string())
     }
 }
 
