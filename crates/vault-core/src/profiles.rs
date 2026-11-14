@@ -115,16 +115,26 @@ impl Roots {
         self.home.join("Library/Caches/Firefox")
     }
 
+    /// Telegram Desktop's default working directory (`tdata` inside).
+    pub fn telegram_data(&self) -> PathBuf {
+        self.home
+            .join("Library/Application Support/Telegram Desktop")
+    }
+
     pub fn saved_state(&self, browser: Browser) -> PathBuf {
         let bundle = match browser {
             Browser::Brave => "com.brave.Browser.savedState",
             Browser::Firefox => "org.mozilla.firefox.savedState",
+            Browser::Telegram => "com.tdesktop.Telegram.savedState",
         };
         self.home
             .join("Library/Saved Application State")
             .join(bundle)
     }
 }
+
+/// The one Telegram Desktop "profile": its `tdata` directory.
+pub const TELEGRAM_PROFILE: &str = "tdata";
 
 // ---------------------------------------------------------------------------
 // Detection
@@ -186,6 +196,18 @@ pub fn detect_profiles_in(roots: &Roots, browser: Browser) -> Result<Vec<Detecte
                 out.push(DetectedProfile {
                     id: id.to_string(),
                     name: get(kv, "Name").unwrap_or(id).to_string(),
+                    size_bytes: dir_size(&path),
+                    path,
+                });
+            }
+        }
+        // One session per working directory: its `tdata`.
+        Browser::Telegram => {
+            let path = roots.telegram_data().join(TELEGRAM_PROFILE);
+            if is_real_dir(&path) {
+                out.push(DetectedProfile {
+                    id: TELEGRAM_PROFILE.into(),
+                    name: "Telegram Desktop".into(),
                     size_bytes: dir_size(&path),
                     path,
                 });
@@ -276,6 +298,7 @@ pub fn regular_running_in(browser: Browser, ps: &str) -> bool {
     let exe = match browser {
         Browser::Brave => "/Contents/MacOS/Brave Browser",
         Browser::Firefox => "/Contents/MacOS/firefox",
+        Browser::Telegram => "/Contents/MacOS/Telegram",
     };
     ps.lines().any(|line| {
         let line = line.trim();
@@ -334,6 +357,8 @@ fn key_files(browser: Browser) -> &'static [&'static str] {
             "Preferences",
         ],
         Browser::Firefox => &["cookies.sqlite", "logins.json", "key4.db", "places.sqlite"],
+        // The local key that decrypts the rest of tdata.
+        Browser::Telegram => &["key_datas"],
     }
 }
 
@@ -344,6 +369,7 @@ pub fn import_destination(browser: Browser, mnt: &Path) -> PathBuf {
     match browser {
         Browser::Brave => browser::profile_dir(mnt).join("Default"),
         Browser::Firefox => browser::profile_dir(mnt),
+        Browser::Telegram => browser::profile_dir(mnt).join(TELEGRAM_PROFILE),
     }
 }
 
@@ -843,6 +869,17 @@ pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<Clea
                 saved_state,
             })
         }
+        // The whole default working directory (tdata, pending updates,
+        // logs): it only ever holds the one session that was imported.
+        Browser::Telegram => {
+            if profile_id != TELEGRAM_PROFILE {
+                return Err(Error::Invalid("bad profile id"));
+            }
+            Ok(CleanupTargets {
+                profiles: vec![(roots.telegram_data(), None)],
+                saved_state,
+            })
+        }
     }
 }
 
@@ -1000,6 +1037,8 @@ pub fn cleanup_original(
     match o.browser {
         Browser::Brave => brave_forget_profiles(roots, &ids)?,
         Browser::Firefox => firefox_forget_profile(roots, &o.profile_id)?,
+        // No profile list to edit.
+        Browser::Telegram => {}
     }
     notify(Event::CleanupProgress { pct: 20 });
     let n = t.profiles.len().max(1);

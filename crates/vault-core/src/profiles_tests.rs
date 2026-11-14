@@ -982,3 +982,52 @@ fn all_profiles_ids_come_only_from_recorded_brave_dirs() {
     o.paths = vec![s(b.join("Profile 1"))];
     assert!(targets_of(&roots, &o).is_err());
 }
+
+#[test]
+fn telegram_session_detect_import_and_targets() {
+    let (d, roots) = fake_home();
+    // Nothing there yet.
+    assert!(detect_profiles_in(&roots, Browser::Telegram)
+        .unwrap()
+        .is_empty());
+
+    let tg = roots.telegram_data();
+    write(&tg.join("tdata/key_datas"), b"local key");
+    write(&tg.join("tdata/D877F783D5D3EF8C/maps"), b"maps");
+    write(&tg.join("log.txt"), b"log");
+    let found = detect_profiles_in(&roots, Browser::Telegram).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, TELEGRAM_PROFILE);
+
+    let m = mnt(&d);
+    let o = import_profile(&roots, Browser::Telegram, TELEGRAM_PROFILE, &m, &ignore).unwrap();
+    // Lands where `-workdir <mnt>/profile` looks for it.
+    assert_eq!(
+        fs::read(m.join("profile/tdata/key_datas")).unwrap(),
+        b"local key"
+    );
+    assert_eq!(
+        fs::read(m.join("profile/tdata/D877F783D5D3EF8C/maps")).unwrap(),
+        b"maps"
+    );
+    assert_eq!(o.browser, Browser::Telegram);
+    // The original is only read.
+    assert!(tg.join("tdata/key_datas").exists());
+
+    // Cleanup deletes the whole default working dir, nothing else.
+    let t = targets(&roots, Browser::Telegram, TELEGRAM_PROFILE).unwrap();
+    assert_eq!(t.profiles, vec![(tg.clone(), None)]);
+    assert!(t
+        .saved_state
+        .ends_with("Saved Application State/com.tdesktop.Telegram.savedState"));
+    assert!(targets(&roots, Browser::Telegram, "../x").is_err());
+}
+
+#[test]
+fn telegram_vault_instance_is_not_the_regular_one() {
+    let regular = "/Applications/Telegram.app/Contents/MacOS/Telegram";
+    let vault = "/Applications/Telegram.app/Contents/MacOS/Telegram -workdir /Users/a/Library/Application Support/X/mnt/8b4c7f0e-7a63-4d55-9a1e-2f0d9d3b6a11/profile";
+    assert!(regular_running_in(Browser::Telegram, regular));
+    assert!(!regular_running_in(Browser::Telegram, vault));
+    assert!(!regular_running_in(Browser::Brave, regular));
+}

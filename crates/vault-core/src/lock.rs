@@ -54,6 +54,7 @@ fn saved_state_bundle(browser: Browser) -> &'static str {
     match browser {
         Browser::Brave => "com.brave.Browser",
         Browser::Firefox => "org.mozilla.firefox",
+        Browser::Telegram => "com.tdesktop.Telegram",
     }
 }
 

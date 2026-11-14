@@ -62,7 +62,8 @@ const mock = {
   list_vaults: async () => structuredClone(vaults),
   detect_browsers: async () => ({
     brave: { found: true, path: '/Applications/Brave Browser.app' },
-    firefox: { found: true, path: '/Applications/Firefox.app' }
+    firefox: { found: true, path: '/Applications/Firefox.app' },
+    telegram: { found: true, path: '/Applications/Telegram.app' }
   }),
   open_window: async ({ view, params }) => {
     location.hash = view + (params ? '?' + new URLSearchParams(params) : '');

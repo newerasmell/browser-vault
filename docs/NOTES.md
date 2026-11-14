@@ -211,3 +211,11 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 
 **Тествано само на Linux (unit тестове):** таблицата, plist ключовете и редакциите (`plist_edits` върху модел), пътищата, преместване/осиновяване на папки, `mount` парсване, dispatch на клавишите, настройки (round-trip, стари файлове, reveal ≠ panic). Самото превключване (`ditto`/`plutil`/`codesign`/`open`), `set_visible`, позицията на менюто, single-instance и Reopen трябва да се проверят на истински Mac.
 
+
+## Telegram Desktop в сейф
+
+- Нов тип сейф `telegram`: само Telegram Desktop от telegram.org (`com.tdesktop.Telegram`). Telegram от App Store също е `Telegram.app`, но пази данните в sandbox контейнер, който не може да се премести — разпознава се по bundle id (`plutil`) и се отказва.
+- Пуска се с `-workdir <mnt>/profile`; цялото `tdata` (сесия, кеш, медия, логове, crash dumps) е в сейфа. Single-instance заключването на Telegram е по работна директория, така че обикновен Telegram може да работи паралелно.
+- Импорт: копира `~/Library/Application Support/Telegram Desktop/tdata` → `<mnt>/profile/tdata` (проверка на `key_datas` + списък/размери). Почистването на оригинала трие цялата `Telegram Desktop` папка и `com.tdesktop.Telegram.savedState`.
+- Следа извън сейфа: известията (macOS пази текста им). Wizard-ът подканя да се изключат „Show sender name“ и „Show message preview“ в Telegram.
+- Самото `Telegram.app` остава в /Applications (следващ етап: приложението в сейфа).

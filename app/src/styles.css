@@ -127,6 +127,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
 .badge { width: 28px; height: 28px; border-radius: 8px; display: inline-grid; place-items: center; font-weight: 700; color: #fff; flex: none; font-size: 13px; }
 .badge-brave { background: linear-gradient(140deg, #ff6a3d, #e2391c); }
 .badge-firefox { background: linear-gradient(140deg, #ffa436, #8c3dd8); }
+.badge-telegram { background: linear-gradient(140deg, #3fb6f0, #1f7fc4); }
 .badge-unknown { background: var(--muted, #8a8f98); }
 .status { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px; white-space: nowrap; }
 .status-locked { color: var(--muted); background: var(--surface-2); }
@@ -196,6 +197,7 @@ body[data-view="tray"] { background: transparent; }
 
 .choices { display: grid; gap: 10px; }
 .choices.two { grid-template-columns: 1fr 1fr; }
+.choices.three { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 .choice { display: flex; align-items: center; gap: 10px; padding: 12px; border-radius: var(--r); background: var(--surface); border: 1.5px solid var(--line); }
 .choice:has(input:checked) { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
 .choice input { position: absolute; opacity: 0; pointer-events: none; }

@@ -191,8 +191,8 @@ fn browser_binary(st: &AppState, b: Browser) -> Option<PathBuf> {
         .settings()
         .browser_paths
         .get(b.as_str())
-        .map(|app| browser::binary_in_app(b, Path::new(app)))
-        .filter(|p| p.is_file());
+        .filter(|app| browser::app_is_usable(b, Path::new(app)))
+        .map(|app| browser::binary_in_app(b, Path::new(app)));
     manual.or_else(|| browser::detect(b))
 }
 
@@ -203,7 +203,11 @@ pub async fn detect_browsers(app: AppHandle) -> Value {
         let path = browser_binary(&st, b).and_then(|bin| app_bundle_of(&bin));
         json!({ "found": path.is_some(), "path": path.map(|p| p.to_string_lossy().into_owned()) })
     };
-    json!({ "brave": one(Browser::Brave), "firefox": one(Browser::Firefox) })
+    json!({
+        "brave": one(Browser::Brave),
+        "firefox": one(Browser::Firefox),
+        "telegram": one(Browser::Telegram),
+    })
 }
 
 #[tauri::command]
@@ -219,7 +223,7 @@ pub async fn pick_browser_path(app: AppHandle, browser: String) -> CmdResult<Opt
         let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
             return Ok(None);
         };
-        if !browser::binary_in_app(b, &path).is_file() {
+        if !browser::app_is_usable(b, &path) {
             return Err(CmdError::new("browser_missing"));
         }
         let st = state::get(&app);

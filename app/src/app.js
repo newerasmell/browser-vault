@@ -40,7 +40,7 @@ const ICONS = {
 const icon = (name, cls = '') =>
   h('span', { class: 'ico ' + cls, svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
 
-const BROWSERS = { brave: 'Brave', firefox: 'Firefox' };
+const BROWSERS = { brave: 'Brave', firefox: 'Firefox', telegram: 'Telegram' };
 const fmtSize = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB');
 // A vault's name/browser are null when its header keeps them encrypted and
 // this Mac has no index entry yet (shown as "Locked vault" until unlocked).
@@ -271,10 +271,11 @@ async function viewWizard() {
   const browsers = await api('detect_browsers');
   const profiles = {
     brave: browsers.brave.found ? await api('detect_profiles', { browser: 'brave' }) : [],
-    firefox: browsers.firefox.found ? await api('detect_profiles', { browser: 'firefox' }) : []
+    firefox: browsers.firefox.found ? await api('detect_profiles', { browser: 'firefox' }) : [],
+    telegram: browsers.telegram?.found ? await api('detect_profiles', { browser: 'telegram' }) : []
   };
   const w = {
-    step: 0, draftId: null, name: '', browser: browsers.brave.found ? 'brave' : 'firefox',
+    step: 0, draftId: null, name: '', browser: Object.keys(BROWSERS).find((b) => browsers[b]?.found) ?? 'brave',
     mode: null, keys: [], totpOk: false, words: null, ack: false, verifyIdx: null,
     sizeGb: 20, idleMinutes: 15, lockOnScreenLock: true, lockOnKeyRemoval: true,
     disableFxa: false, importProfile: false, importProfileId: null, progress: null, vaultId: null
@@ -313,7 +314,7 @@ async function viewWizard() {
     setTimeout(() => name.focus(), 0);
     return h('form', { class: 'form' },
       h('label', { class: 'field' }, h('span', {}, t('vault_name')), name),
-      h('div', { class: 'field' }, h('span', {}, t('browser')), h('div', { class: 'choices two' }, choice('brave'), choice('firefox'))),
+      h('div', { class: 'field' }, h('span', {}, t('app_kind')), h('div', { class: 'choices three' }, Object.keys(BROWSERS).map(choice))),
       navEl);
   }
 
@@ -499,14 +500,18 @@ async function viewWizard() {
         toggle(t('lock_screen'), w.lockOnScreenLock, (v) => (w.lockOnScreenLock = v)),
         w.mode === 'fido2' && toggle(t('lock_key_removal'), w.lockOnKeyRemoval, (v) => (w.lockOnKeyRemoval = v)),
         w.browser === 'firefox' && toggle(t('disable_fxa'), w.disableFxa, (v) => (w.disableFxa = v)),
-        toggle(t('import_profile', { browser: BROWSERS[w.browser] }), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_hint')),
+        w.browser === 'telegram'
+          ? toggle(t('import_telegram'), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_telegram_hint'))
+          : toggle(t('import_profile', { browser: BROWSERS[w.browser] }), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_hint')),
         w.importProfile && choices.length && h('div', { class: 'toggle-row' },
           h('span', { class: 'toggle-text' }, t('import_which')),
           h('select', { class: 'input select', onchange: (e) => { w.importProfileId = e.target.value; render(); } },
             choices.map((c) => h('option', { value: c.id, selected: c.id === w.importProfileId }, c.label)))),
         w.importProfile && w.importProfileId === ALL_PROFILES &&
           h('small', { class: 'muted block', style: 'padding:0 12px 10px;margin-top:-4px' }, t('import_all_hint', { browser: BROWSERS[w.browser] }))),
-      h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('sync_warn_title')), ' ', t('sync_warn_body'))),
+      w.browser === 'telegram'
+        ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('tg_notify_title')), ' ', t('tg_notify_body')))
+        : h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('sync_warn_title')), ' ', t('sync_warn_body'))),
       nav(true, (e) => { e.preventDefault(); go(5); }, t('create_vault')));
   }
 

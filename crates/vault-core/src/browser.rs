@@ -15,6 +15,9 @@ use crate::error::{Error, Result};
 pub enum Browser {
     Brave,
     Firefox,
+    /// Telegram Desktop (telegram.org, `com.tdesktop.Telegram`), not the
+    /// App Store "Telegram" app, which cannot be told where to keep data.
+    Telegram,
 }
 
 impl Browser {
@@ -22,6 +25,7 @@ impl Browser {
         match self {
             Browser::Brave => "brave",
             Browser::Firefox => "firefox",
+            Browser::Telegram => "telegram",
         }
     }
 
@@ -29,6 +33,7 @@ impl Browser {
         match s.to_ascii_lowercase().as_str() {
             "brave" => Some(Browser::Brave),
             "firefox" => Some(Browser::Firefox),
+            "telegram" => Some(Browser::Telegram),
             _ => None,
         }
     }
@@ -38,6 +43,7 @@ impl Browser {
         match self {
             Browser::Brave => ("Brave Browser.app", "Brave Browser"),
             Browser::Firefox => ("Firefox.app", "firefox"),
+            Browser::Telegram => ("Telegram.app", "Telegram"),
         }
     }
 
@@ -45,6 +51,7 @@ impl Browser {
         match self {
             Browser::Brave => "https://brave.com/download/",
             Browser::Firefox => "https://www.mozilla.org/firefox/new/",
+            Browser::Telegram => "https://desktop.telegram.org/",
         }
     }
 }
@@ -52,6 +59,38 @@ impl Browser {
 /// Binary path inside an `.app` bundle.
 pub fn binary_in_app(browser: Browser, app: &Path) -> PathBuf {
     app.join("Contents/MacOS").join(browser.bundle().1)
+}
+
+/// Bundle id an app must have to be used for `browser`, when the bundle
+/// name alone is ambiguous: the App Store "Telegram" is also
+/// `Telegram.app` (same executable name) but keeps its data in a
+/// sandbox container that cannot be moved into a vault.
+pub fn required_bundle_id(browser: Browser) -> Option<&'static str> {
+    match browser {
+        Browser::Telegram => Some("com.tdesktop.Telegram"),
+        Browser::Brave | Browser::Firefox => None,
+    }
+}
+
+/// `CFBundleIdentifier` of an `.app` (via `plutil`, which reads binary and
+/// XML plists alike).
+fn bundle_id_of(app: &Path) -> Option<String> {
+    let out = Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+        .arg(app.join("Contents/Info.plist"))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Whether `app` is an installation this vault type can run.
+pub fn app_is_usable(browser: Browser, app: &Path) -> bool {
+    binary_in_app(browser, app).is_file()
+        && required_bundle_id(browser).is_none_or(|want| bundle_id_of(app).as_deref() == Some(want))
 }
 
 /// Auto-detect in `/Applications`, then `~/Applications` (SPEC §5).
@@ -63,8 +102,9 @@ pub fn detect(browser: Browser) -> Option<PathBuf> {
     }
     roots
         .into_iter()
-        .map(|r| binary_in_app(browser, &r.join(app)))
-        .find(|p| p.is_file())
+        .map(|r| r.join(app))
+        .find(|a| app_is_usable(browser, a))
+        .map(|a| binary_in_app(browser, &a))
 }
 
 pub fn profile_dir(mnt: &Path) -> PathBuf {
@@ -101,6 +141,15 @@ pub fn launch_args(browser: Browser, mnt: &Path) -> Result<Vec<OsString>> {
             profile.push(profile_dir(mnt));
             Ok(vec!["--new-instance".into(), "-profile".into(), profile])
         }
+        // All of Telegram Desktop's data (tdata: session, cache, media,
+        // logs, crash dumps) lives under its working directory. Its
+        // single-instance lock is per working directory, so a regular
+        // Telegram can run next to it.
+        Browser::Telegram => {
+            let mut dir = OsString::new();
+            dir.push(profile_dir(mnt));
+            Ok(vec!["-workdir".into(), dir])
+        }
     }
 }
 
@@ -109,7 +158,7 @@ pub fn launch_args(browser: Browser, mnt: &Path) -> Result<Vec<OsString>> {
 /// `~/Library/Application Support/Firefox/Crash Reports`.
 pub fn launch_env(browser: Browser) -> Vec<(&'static str, &'static str)> {
     match browser {
-        Browser::Brave => vec![],
+        Browser::Brave | Browser::Telegram => vec![],
         Browser::Firefox => vec![("MOZ_CRASHREPORTER_DISABLE", "1")],
     }
 }
@@ -312,6 +361,17 @@ mod tests {
     }
 
     #[test]
+    fn telegram_args_point_inside_mount() {
+        let args = launch_args(Browser::Telegram, Path::new("/mnt/x")).unwrap();
+        assert_eq!(args, ["-workdir", "/mnt/x/profile"]);
+        assert!(launch_env(Browser::Telegram).is_empty());
+        assert_eq!(
+            binary_in_app(Browser::Telegram, Path::new("/Applications/Telegram.app")),
+            Path::new("/Applications/Telegram.app/Contents/MacOS/Telegram")
+        );
+    }
+
+    #[test]
     fn user_js_written_and_rewritten() {
         let d = tempfile::tempdir().unwrap();
         let mnt = d.path().join("m \"q\"");
@@ -360,7 +420,7 @@ mod tests {
 
     #[test]
     fn parse_roundtrip() {
-        for b in [Browser::Brave, Browser::Firefox] {
+        for b in [Browser::Brave, Browser::Firefox, Browser::Telegram] {
             assert_eq!(Browser::parse(b.as_str()), Some(b));
         }
         assert_eq!(Browser::parse("Chrome"), None);
