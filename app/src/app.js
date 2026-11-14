@@ -1043,7 +1043,13 @@ async function viewSettings(params) {
           } }, busy ? t('app_copying') : t('app_into_vault', { app })),
           h('small', { class: 'muted' }, t('app_into_vault_hint', { app }))));
       } else {
-        rows.push(h('div', { class: 'row' }, icon('check', 'sm'), h('small', {}, t('app_is_in_vault', { app }))));
+        rows.push(h('div', { class: 'row' }, icon('check', 'sm'), h('small', { class: 'grow' }, t('app_is_in_vault', { app })),
+          v.app_outside && h('button', { class: 'btn sm ghost', disabled: busy, onclick: async () => {
+            busy = true; err = ''; paint();
+            try { await api('move_app_into_vault', { id: v.id }); toast(t('app_refreshed_done', { app })); }
+            catch (e) { err = errText(e); }
+            busy = false; paint();
+          } }, busy ? t('app_copying') : t('app_refresh'))));
         if (v.app_outside) {
           const remove = async () => {
             busy = true; err = ''; confirming = false; paint();

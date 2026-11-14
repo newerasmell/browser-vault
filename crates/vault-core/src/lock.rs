@@ -80,7 +80,19 @@ fn cleanup_traces_in(home: &Path, browser: Browser, regular_running: bool) -> Re
         return Ok(false);
     }
     remove_dir_if_exists(&saved_state_dir(home, browser))?;
+    for dir in extra_trace_dirs(home, browser) {
+        remove_dir_if_exists(&dir)?;
+    }
     Ok(true)
+}
+
+/// Per-app folders outside the profile that only say "this app was used"
+/// (no user data): Slack's updater (Squirrel/ShipIt) staging area.
+fn extra_trace_dirs(home: &Path, browser: Browser) -> Vec<PathBuf> {
+    match browser {
+        Browser::Slack => vec![home.join("Library/Caches/com.tinyspeck.slackmacgap.ShipIt")],
+        _ => vec![],
+    }
 }
 
 /// SPEC §6 step 4: remove `~/Library/Saved Application State/<bundle>.savedState`
@@ -583,6 +595,19 @@ mod tests {
         c.kill().unwrap();
         c.wait().unwrap();
         assert!(!pid_belongs_to_mount(pid, Path::new("/some/vault/mnt/xyz")));
+    }
+
+    #[test]
+    fn slack_updater_staging_is_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let ship = d
+            .path()
+            .join("Library/Caches/com.tinyspeck.slackmacgap.ShipIt");
+        fs::create_dir_all(ship.join("update.x")).unwrap();
+        assert!(!cleanup_traces_in(d.path(), Browser::Slack, true).unwrap());
+        assert!(ship.exists(), "left alone while the regular Slack runs");
+        assert!(cleanup_traces_in(d.path(), Browser::Slack, false).unwrap());
+        assert!(!ship.exists());
     }
 
     #[test]
