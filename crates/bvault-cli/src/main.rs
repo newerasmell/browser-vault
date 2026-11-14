@@ -280,7 +280,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 println!("{}", unlocked.mountpoint.display());
                 return Ok(());
             }
-            let mut child = match store.launch(&unlocked, browser_path.as_deref()) {
+            let child = match store.launch(&unlocked, browser_path.as_deref()) {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = store.lock(&h.vault_id);
@@ -293,7 +293,7 @@ fn run(cli: Cli) -> Result<(), Error> {
                 }
             };
             eprintln!("Vault unlocked. It locks when the browser quits (or run `bvault lock`).");
-            let _ = child.wait();
+            child.wait();
             store.lock(&h.vault_id)?;
             drop(unlocked);
             eprintln!("Vault locked.");

@@ -6,6 +6,7 @@ mod commands;
 mod disguise;
 mod error;
 mod hotkey;
+mod launcher;
 mod lockctl;
 mod original;
 mod settings;
@@ -139,6 +140,8 @@ fn main() {
             // Vault names arrive from the Keychain on a background thread;
             // refresh every list when they do (see index::keychain).
             let _ = APP.set(handle.clone());
+            #[cfg(target_os = "macos")]
+            vault_core::browser::set_launcher(launcher::launch);
             vault_core::index::set_on_ready(|| {
                 if let Some(h) = APP.get() {
                     lockctl::vaults_changed(h);

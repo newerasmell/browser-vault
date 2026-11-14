@@ -7,7 +7,6 @@
 //! 5. manual / panic hotkey — tray menu, `lock_all`, global shortcut.
 
 use std::collections::HashMap;
-use std::process::Child;
 use std::thread;
 use std::time::Duration;
 
@@ -34,9 +33,14 @@ pub fn is_fido2(u: &Unlocked) -> bool {
 /// Trigger 1: lock when the vault's browser exits. Owning the `Child` and
 /// waiting on it also reaps the process (no zombie that `kill(pid, 0)` would
 /// still report as alive).
-pub fn watch_browser(app: AppHandle, id: String, generation: u64, mut child: Child) {
+pub fn watch_browser(
+    app: AppHandle,
+    id: String,
+    generation: u64,
+    child: vault_core::browser::Launched,
+) {
     thread::spawn(move || {
-        let _ = child.wait();
+        child.wait();
         let st = state::get(&app);
         let mnt = st.store.mountpoint(&id);
         // A browser may quit and relaunch itself under a new PID (Firefox

@@ -346,20 +346,73 @@ pub fn write_firefox_user_js(mnt: &Path, disable_fxa: Option<bool>) -> Result<()
     Ok(())
 }
 
-/// Start the browser binary directly (not `open -a`) so we own the PID and get
-/// a separate instance even when the regular browser is running.
-pub fn launch(browser: Browser, binary: &Path, mnt: &Path) -> Result<Child> {
+/// What a platform launcher needs to start a vault app.
+pub struct LaunchSpec<'a> {
+    pub binary: &'a Path,
+    /// The `.app` that contains `binary`.
+    pub app_bundle: Option<PathBuf>,
+    pub args: Vec<OsString>,
+    pub env: Vec<(&'static str, &'static str)>,
+}
+
+/// Starts an app as its own process (not a child of this one) and returns
+/// its PID. Set by the app on macOS ([`set_launcher`]): an app spawned as
+/// our child is "ours" to macOS privacy checks, so its microphone/camera
+/// requests and self-updates were attributed to (and blocked for) this app.
+pub type Launcher = fn(&LaunchSpec<'_>) -> std::result::Result<u32, String>;
+
+static LAUNCHER: std::sync::OnceLock<Launcher> = std::sync::OnceLock::new();
+
+pub fn set_launcher(f: Launcher) {
+    let _ = LAUNCHER.set(f);
+}
+
+/// A started vault app.
+pub enum Launched {
+    /// Spawned as our child (no launcher, tests, other platforms).
+    Child(Child),
+    /// Started through the platform launcher.
+    Pid(u32),
+}
+
+impl Launched {
+    pub fn id(&self) -> u32 {
+        match self {
+            Launched::Child(c) => c.id(),
+            Launched::Pid(p) => *p,
+        }
+    }
+
+    /// Block until the process exits.
+    pub fn wait(self) {
+        match self {
+            Launched::Child(mut c) => {
+                let _ = c.wait();
+            }
+            Launched::Pid(p) => {
+                while is_alive(p as i32) {
+                    sleep(Duration::from_millis(500));
+                }
+            }
+        }
+    }
+}
+
+/// Start the vault app with our arguments as a separate instance (even when
+/// the regular app is running) and get its PID.
+pub fn launch(browser: Browser, binary: &Path, mnt: &Path) -> Result<Launched> {
     launch_with(browser, binary, mnt, false)
 }
 
-/// Like [`launch`]; `portable_keys` makes Brave use a Mac-independent key
-/// for cookies and saved passwords (`--use-mock-keychain`, see portable.rs).
+/// Like [`launch`]; `portable_keys` makes Chromium apps use a
+/// Mac-independent key for cookies and saved passwords
+/// (`--use-mock-keychain`, see portable.rs).
 pub fn launch_with(
     browser: Browser,
     binary: &Path,
     mnt: &Path,
     portable_keys: bool,
-) -> Result<Child> {
+) -> Result<Launched> {
     if !binary.is_file() {
         return Err(Error::BrowserMissing);
     }
@@ -367,13 +420,32 @@ pub fn launch_with(
     if portable_keys && browser.is_chromium() {
         args.push(crate::portable::MOCK_KEYCHAIN_FLAG.into());
     }
+    let env = launch_env(browser);
+    let app_bundle = binary
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+        .map(Path::to_path_buf);
+    if let (Some(launcher), Some(_)) = (LAUNCHER.get(), &app_bundle) {
+        let spec = LaunchSpec {
+            binary,
+            app_bundle: app_bundle.clone(),
+            args: args.clone(),
+            env: env.clone(),
+        };
+        match launcher(&spec) {
+            Ok(pid) => return Ok(Launched::Pid(pid)),
+            // Still usable as our child; only privacy prompts suffer.
+            Err(e) => crate::trace::emit(&format!("launcher failed, spawning directly: {e}")),
+        }
+    }
     Command::new(binary)
         .args(args)
-        .envs(launch_env(browser))
+        .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+        .map(Launched::Child)
         .map_err(Error::Io)
 }
 

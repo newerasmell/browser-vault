@@ -12,7 +12,6 @@
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Child;
 
 use crate::browser::{self, Browser};
 use crate::error::{Error, Result};
@@ -599,7 +598,7 @@ impl Store {
     }
 
     /// Launch the vault's browser against the mounted volume and record its PID.
-    pub fn launch(&self, unlocked: &Unlocked, binary: Option<&Path>) -> Result<Child> {
+    pub fn launch(&self, unlocked: &Unlocked, binary: Option<&Path>) -> Result<browser::Launched> {
         let meta = unlocked.header.meta()?;
         let browser = meta.browser;
         // The vault's own copy of the app wins over the installed one.
