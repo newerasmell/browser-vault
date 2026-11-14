@@ -1024,7 +1024,7 @@ async function viewSettings(params) {
   // The app itself inside the vault (only while unlocked).
   function appBlock(v) {
     // WhatsApp runs in the shared Brave: never offer to move or remove it here.
-    if (v.status !== 'unlocked' || v.app_in_vault == null || !BROWSERS[v.browser] || ENGINE[v.browser]) return null;
+    if (v.status !== 'unlocked' || v.appInVault == null || !BROWSERS[v.browser] || ENGINE[v.browser]) return null;
     const app = BROWSERS[v.browser];
     // Browsers are also used for normal browsing: removing one needs a second, explicit click.
     const isBrowser = v.browser === 'brave' || v.browser === 'firefox';
@@ -1033,24 +1033,24 @@ async function viewSettings(params) {
     const errText = (e) => { const k = 'err_' + (e && e.code); return t(k) !== k ? t(k) : t('err_app_copy_failed'); };
     const paint = () => {
       const rows = [];
-      if (!v.app_in_vault) {
+      if (!v.appInVault) {
         rows.push(h('div', { class: 'row' },
-          h('button', { class: 'btn sm ghost', disabled: busy || !v.app_outside, onclick: async () => {
+          h('button', { class: 'btn sm ghost', disabled: busy || !v.appOutside, onclick: async () => {
             busy = true; err = ''; paint();
-            try { await api('move_app_into_vault', { id: v.id }); v.app_in_vault = true; toast(t('app_in_vault_done', { app })); }
+            try { await api('move_app_into_vault', { id: v.id }); v.appInVault = true; toast(t('app_in_vault_done', { app })); }
             catch (e) { err = errText(e); }
             busy = false; paint();
           } }, busy ? t('app_copying') : t('app_into_vault', { app })),
           h('small', { class: 'muted' }, t('app_into_vault_hint', { app }))));
       } else {
         rows.push(h('div', { class: 'row' }, icon('check', 'sm'), h('small', { class: 'grow' }, t('app_is_in_vault', { app })),
-          v.app_outside && h('button', { class: 'btn sm ghost', disabled: busy, onclick: async () => {
+          v.appOutside && h('button', { class: 'btn sm ghost', disabled: busy, onclick: async () => {
             busy = true; err = ''; paint();
             try { await api('move_app_into_vault', { id: v.id }); toast(t('app_refreshed_done', { app })); }
             catch (e) { err = errText(e); }
             busy = false; paint();
           } }, busy ? t('app_copying') : t('app_refresh'))));
-        if (v.app_outside) {
+        if (v.appOutside) {
           const remove = async () => {
             busy = true; err = ''; confirming = false; paint();
             try { await api('remove_app_outside', { id: v.id }); shown = true; }

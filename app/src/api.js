@@ -27,7 +27,7 @@ const err = (code, extra = {}) => Object.assign(new Error(code), { code, ...extr
 
 const vaults = [
   { id: 'v1', name: 'Work – Brave', browser: 'brave', mode: 'fido2', status: 'unlocked', sizeGb: 20,
-    app_in_vault: false, app_outside: '/Applications/Brave Browser.app',
+    appInVault: false, appOutside: '/Applications/Brave Browser.app',
     original: { profileName: 'Default', sizeMb: 842, reviewed: true, state: 'pending' } },
   { id: 'v2', name: 'Ads accounts – Firefox', browser: 'firefox', mode: 'totp', status: 'locked', sizeGb: 20,
     original: { profileName: 'default-release', sizeMb: 516, reviewed: false, state: 'pending' } },

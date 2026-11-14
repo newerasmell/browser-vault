@@ -896,10 +896,15 @@ pub fn save_settings(
 // ---------------------------------------------------------------- factors / actions
 
 pub fn factors(h: &Header) -> Vec<Value> {
+    // Key labels: the real ones once the metadata is open, else "YubiKey N"
+    // (a v2 header keeps them sealed).
+    let mut keys = vault_core::fido2::keys(h).into_iter();
     h.slots
         .iter()
         .filter_map(|s| match s {
-            Slot::Fido2 { label, .. } => Some(json!({ "type": "fido2", "label": label })),
+            Slot::Fido2 { .. } => keys
+                .next()
+                .map(|k| json!({ "type": "fido2", "label": k.label })),
             Slot::Totp { .. } => Some(json!({ "type": "totp", "label": "Authenticator" })),
             Slot::Recovery { .. } => {
                 Some(json!({ "type": "recovery", "label": "Recovery phrase" }))
@@ -911,7 +916,12 @@ pub fn factors(h: &Header) -> Vec<Value> {
 
 #[tauri::command]
 pub async fn list_factors(app: AppHandle, id: String) -> CmdResult<Vec<Value>> {
-    Ok(factors(&state::get(&app).store.load(&id)?))
+    let st = state::get(&app);
+    // An open vault has its metadata (and so the key labels) decrypted.
+    if let Some(s) = lock(&st.sessions).get(&id) {
+        return Ok(factors(&s.unlocked.header));
+    }
+    Ok(factors(&st.store.load(&id)?))
 }
 
 fn message(app: &AppHandle, text: &str) {
