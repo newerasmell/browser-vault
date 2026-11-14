@@ -1029,7 +1029,7 @@ async function viewSettings(params) {
     // Browsers are also used for normal browsing: removing one needs a second, explicit click.
     const isBrowser = v.browser === 'brave' || v.browser === 'firefox';
     const box = h('div', { class: 'backup-box' });
-    let busy = false, err = '', confirming = false;
+    let busy = false, err = '', confirming = false, shown = false;
     const errText = (e) => { const k = 'err_' + (e && e.code); return t(k) !== k ? t(k) : t('err_app_copy_failed'); };
     const paint = () => {
       const rows = [];
@@ -1047,7 +1047,7 @@ async function viewSettings(params) {
         if (v.app_outside) {
           const remove = async () => {
             busy = true; err = ''; confirming = false; paint();
-            try { await api('remove_app_outside', { id: v.id }); v.app_outside = null; toast(t('app_removed_done', { app })); }
+            try { await api('remove_app_outside', { id: v.id }); shown = true; }
             catch (e) { err = errText(e); }
             busy = false; paint();
           };
@@ -1066,6 +1066,7 @@ async function viewSettings(params) {
           }
         }
       }
+      if (shown) rows.push(h('div', { class: 'callout ok' }, icon('check', 'sm'), h('p', {}, t('app_drag_to_trash', { app }))));
       if (err) rows.push(h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', {}, err)));
       box.replaceChildren(...rows);
     };

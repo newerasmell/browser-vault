@@ -212,9 +212,13 @@ pub async fn move_app_into_vault(app: AppHandle, id: String) -> CmdResult<Value>
     .await
 }
 
-/// Move the installed app (outside the vault) to the Trash once this open
-/// vault has its own copy. Refused while that app runs outside a vault
-/// (`browser_running`) or before the copy exists (`app_not_in_vault`).
+/// Show the installed app (outside the vault) selected in the Finder, once
+/// this open vault has its own copy, so the user drags it to the Trash.
+/// The app never moves another developer's app itself: macOS blocks that
+/// unless the app is allowed under Privacy & Security → App Management
+/// (and lists it there), while the Finder may. Refused while that app runs
+/// outside a vault (`browser_running`) or before the copy exists
+/// (`app_not_in_vault`).
 #[tauri::command]
 pub async fn remove_app_outside(app: AppHandle, id: String) -> CmdResult<Value> {
     blocking(move || {
@@ -234,13 +238,15 @@ pub async fn remove_app_outside(app: AppHandle, id: String) -> CmdResult<Value> 
             .and_then(|bin| app_bundle_of(&bin))
             .filter(|p| !p.starts_with(st.store.root()))
             .ok_or(CmdError::new("browser_missing"))?;
-        let left = crate::disguise::trash(&[src], std::time::Duration::from_secs(8));
-        if !left.is_empty() {
+        let shown = std::process::Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&src)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !shown {
             return Err(CmdError::new("app_remove_failed"));
         }
-        crate::applog::log(&format!("installed app of vault {id} moved to the Trash"));
-        lockctl::vaults_changed(&app);
-        Ok(json!(OK))
+        Ok(json!({ "ok": true, "path": src.to_string_lossy() }))
     })
     .await
 }
