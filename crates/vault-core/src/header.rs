@@ -362,6 +362,13 @@ impl Header {
     }
 
     fn to_disk(&self) -> Result<Disk> {
+        self.to_disk_with(true)
+    }
+
+    /// `blank_labels: false` is the v2 form written by versions before the
+    /// YubiKey labels moved into the sealed metadata (only used to verify
+    /// the MAC of such a header).
+    fn to_disk_with(&self, blank_labels: bool) -> Result<Disk> {
         match self.version {
             HEADER_VERSION_V1 => {
                 let m = self
@@ -393,7 +400,9 @@ impl Header {
                     .cloned()
                     .map(|mut s| {
                         if let Slot::Fido2 { label, .. } = &mut s {
-                            label.clear();
+                            if blank_labels {
+                                label.clear();
+                            }
                         }
                         s
                     })
@@ -536,6 +545,10 @@ impl Header {
     /// has its own MAC, see [`Slot::Totp`]), so failed unlock attempts keep
     /// the header intact. For v2 that includes the sealed metadata.
     fn mac_input(&self) -> Result<Vec<u8>> {
+        self.mac_input_with(true)
+    }
+
+    fn mac_input_with(&self, blank_labels: bool) -> Result<Vec<u8>> {
         let mut h = self.clone();
         h.mac = B64::default();
         for slot in &mut h.slots {
@@ -553,7 +566,7 @@ impl Header {
                 *state_mac = B64::default();
             }
         }
-        Ok(serde_json::to_vec(&h.to_disk()?)?)
+        Ok(serde_json::to_vec(&h.to_disk_with(blank_labels)?)?)
     }
 
     fn mac_key(vmk: &Key) -> Key {
@@ -575,10 +588,26 @@ impl Header {
 
     /// SPEC §8: checked after unlock; `false` means the header was tampered with.
     pub fn verify_mac(&self, vmk: &Key) -> bool {
-        match self.mac_input() {
-            Ok(input) => crypto::hmac_sha256_verify(&Self::mac_key(vmk), &input, &self.mac.0),
+        let key = Self::mac_key(vmk);
+        let ok = |blank| match self.mac_input_with(blank) {
+            Ok(input) => crypto::hmac_sha256_verify(&key, &input, &self.mac.0),
             Err(_) => false,
-        }
+        };
+        // A v2 header from before the labels were sealed was MACed with the
+        // labels in the clear. Both forms are bound to the VMK; the next
+        // save writes the current one.
+        ok(true) || (self.has_clear_labels() && ok(false))
+    }
+
+    /// A v2 header as written before YubiKey labels moved into the sealed
+    /// metadata (labels still in the clear). Only meaningful on a header
+    /// fresh from disk, before [`Header::open_meta`].
+    pub fn has_clear_labels(&self) -> bool {
+        self.version == HEADER_VERSION
+            && self
+                .slots
+                .iter()
+                .any(|s| matches!(s, Slot::Fido2 { label, .. } if !label.is_empty()))
     }
 
     pub fn load(dir: &Path) -> Result<Header> {
@@ -985,6 +1014,42 @@ mod tests {
             .filter(|s| matches!(s, Slot::Fido2 { .. }))
             .count();
         assert_eq!(fewer.meta().unwrap().key_labels.len(), n);
+    }
+
+    #[test]
+    fn header_with_clear_labels_still_verifies_and_migrates() {
+        let vmk = crypto::random_key();
+        let mut h = sample_v2(&vmk);
+        // Re-MAC in the old form: labels in the clear on disk.
+        let tag = crypto::hmac_sha256(&Header::mac_key(&vmk), &h.mac_input_with(false).unwrap());
+        h.mac = B64(tag.to_vec());
+        let legacy = serde_json::to_vec(&h.to_disk_with(false).unwrap()).unwrap();
+        assert!(String::from_utf8_lossy(&legacy).contains("YubiKey main"));
+
+        let mut back = Header::from_json(&legacy).unwrap();
+        assert!(back.has_clear_labels());
+        assert!(back.verify_mac(&vmk), "old headers must keep working");
+        assert!(!back.verify_mac(&crypto::random_key()));
+        back.open_meta(&vmk).unwrap();
+        assert!(back.verify_mac(&vmk));
+        back.seal_mac(&vmk).unwrap();
+        let json = back.to_json().unwrap();
+        assert!(!String::from_utf8_lossy(&json).contains("YubiKey main"));
+        let mut again = Header::from_json(&json).unwrap();
+        assert!(!again.has_clear_labels());
+        assert!(again.verify_mac(&vmk));
+        again.open_meta(&vmk).unwrap();
+        assert_eq!(again.slots, back.slots, "labels survive the migration");
+
+        // Tampering with a clear label is still caught.
+        let mut t: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+        for slot in t["slots"].as_array_mut().unwrap() {
+            if slot.get("label").is_some() {
+                slot["label"] = serde_json::json!("evil");
+            }
+        }
+        let t = Header::from_json(&serde_json::to_vec(&t).unwrap()).unwrap();
+        assert!(!t.verify_mac(&vmk));
     }
 
     #[test]

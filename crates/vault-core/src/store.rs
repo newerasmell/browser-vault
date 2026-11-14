@@ -324,13 +324,19 @@ impl Store {
         if !h.verify_mac(key.vmk()) {
             return Err(Error::Invalid("header was modified outside the app"));
         }
+        // v2 written before the YubiKey labels were sealed: re-seal so the
+        // labels leave the file.
+        let clear_labels = h.has_clear_labels();
         h.open_meta(key.vmk())?;
-        if h.upgrade(key.vmk())? {
+        if clear_labels {
+            h.seal_mac(key.vmk())?;
+        }
+        if h.upgrade(key.vmk())? || clear_labels {
             let dir = self.vault_dir(id);
             h.save(&dir)?;
             // Second save: the .bak (the old v1 file) becomes v2 as well.
             h.save(&dir)?;
-            crate::trace::emit(&format!("header {id}: upgraded to v2"));
+            crate::trace::emit(&format!("header {id}: upgraded"));
         }
         self.index_put(&h);
         Ok(h)
