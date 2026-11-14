@@ -194,6 +194,10 @@ pub async fn move_app_into_vault(app: AppHandle, id: String) -> CmdResult<Value>
     blocking(move || {
         let st = state::get(&app);
         let (b, mnt) = open_vault(&st, &id)?;
+        // WhatsApp runs in the shared Brave; that is Brave's business.
+        if b.engine() != b {
+            return Err(CmdError::invalid());
+        }
         let src = browser_binary(&st, b)
             .and_then(|bin| app_bundle_of(&bin))
             .ok_or(CmdError::new("browser_missing"))?;
@@ -216,6 +220,10 @@ pub async fn remove_app_outside(app: AppHandle, id: String) -> CmdResult<Value> 
     blocking(move || {
         let st = state::get(&app);
         let (b, mnt) = open_vault(&st, &id)?;
+        // WhatsApp runs in the shared Brave; that is Brave's business.
+        if b.engine() != b {
+            return Err(CmdError::invalid());
+        }
         if browser::vault_binary(b, &mnt).is_none() {
             return Err(CmdError::new("app_not_in_vault"));
         }

@@ -1023,10 +1023,13 @@ async function viewSettings(params) {
 
   // The app itself inside the vault (only while unlocked).
   function appBlock(v) {
-    if (v.status !== 'unlocked' || v.app_in_vault == null || !BROWSERS[v.browser]) return null;
-    const app = BROWSERS[ENGINE[v.browser] ?? v.browser];
+    // WhatsApp runs in the shared Brave: never offer to move or remove it here.
+    if (v.status !== 'unlocked' || v.app_in_vault == null || !BROWSERS[v.browser] || ENGINE[v.browser]) return null;
+    const app = BROWSERS[v.browser];
+    // Browsers are also used for normal browsing: removing one needs a second, explicit click.
+    const isBrowser = v.browser === 'brave' || v.browser === 'firefox';
     const box = h('div', { class: 'backup-box' });
-    let busy = false, err = '';
+    let busy = false, err = '', confirming = false;
     const errText = (e) => { const k = 'err_' + (e && e.code); return t(k) !== k ? t(k) : t('err_app_copy_failed'); };
     const paint = () => {
       const rows = [];
@@ -1042,14 +1045,25 @@ async function viewSettings(params) {
       } else {
         rows.push(h('div', { class: 'row' }, icon('check', 'sm'), h('small', {}, t('app_is_in_vault', { app }))));
         if (v.app_outside) {
-          rows.push(h('div', { class: 'row' },
-            h('button', { class: 'btn sm ghost', disabled: busy, onclick: async () => {
-              busy = true; err = ''; paint();
-              try { await api('remove_app_outside', { id: v.id }); v.app_outside = null; toast(t('app_removed_done', { app })); }
-              catch (e) { err = errText(e); }
-              busy = false; paint();
-            } }, t('app_remove_outside', { app })),
-            h('small', { class: 'muted' }, t('app_remove_outside_hint', { app }))));
+          const remove = async () => {
+            busy = true; err = ''; confirming = false; paint();
+            try { await api('remove_app_outside', { id: v.id }); v.app_outside = null; toast(t('app_removed_done', { app })); }
+            catch (e) { err = errText(e); }
+            busy = false; paint();
+          };
+          if (isBrowser && confirming) {
+            rows.push(h('div', { class: 'callout warn col' },
+              h('p', {}, t('app_remove_browser_warn', { app })),
+              h('div', { class: 'row' },
+                h('button', { class: 'btn sm danger-solid', disabled: busy, onclick: remove }, t('app_remove_browser_yes', { app })),
+                h('button', { class: 'btn sm ghost', onclick: () => { confirming = false; paint(); } }, t('cancel')))));
+          } else {
+            rows.push(h('div', { class: 'row' },
+              h('button', { class: 'btn sm ghost', disabled: busy, onclick: () => {
+                if (isBrowser) { confirming = true; paint(); } else remove();
+              } }, t('app_remove_outside', { app })),
+              h('small', { class: 'muted' }, t('app_remove_outside_hint', { app }))));
+          }
         }
       }
       if (err) rows.push(h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', {}, err)));
