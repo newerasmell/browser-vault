@@ -19,6 +19,23 @@ static LOCK: Mutex<()> = Mutex::new(());
 /// Set once the log directory was renamed for a disguise: from then on
 /// nothing is written, so the old directory is not recreated on exit.
 static SUSPENDED: AtomicBool = AtomicBool::new(false);
+/// Settings → Diagnostic log (off in ghost mode).
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Turn the log on or off; off deletes what was written so far.
+pub fn set_enabled(on: bool) {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ENABLED.store(on, Ordering::SeqCst);
+    if !on {
+        if let Some(p) = path() {
+            let _ = fs::remove_file(&p);
+            let _ = fs::remove_file(p.with_extension("log.1"));
+            if let Some(dir) = p.parent() {
+                let _ = fs::remove_dir(dir);
+            }
+        }
+    }
+}
 
 fn path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -34,7 +51,7 @@ pub fn suspend() {
 pub fn log(msg: &str) {
     let Some(p) = path() else { return };
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if SUSPENDED.load(Ordering::SeqCst) {
+    if SUSPENDED.load(Ordering::SeqCst) || !ENABLED.load(Ordering::SeqCst) {
         return;
     }
     if let Some(dir) = p.parent() {

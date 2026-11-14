@@ -707,6 +707,7 @@ async function viewSettings(params) {
       h('h3', {}, t('privacy')),
       h('div', { class: 'group' },
         toggle(t('ghost_mode'), s.ghostMode, (v) => save({ ghostMode: v }), t('ghost_hint')),
+        toggle(t('diag_log'), s.diagnosticLog && !s.ghostMode, (v) => save({ diagnosticLog: v }), t('diag_log_hint')),
         hotkeyRow(t('reveal_hotkey'), 'revealHotkey', [t('reveal_hint'), ' ', revealCmd(appName)]),
         disguiseRow(dg)),
       h('p', { class: 'muted' }, h('small', {}, t('privacy_limits'))));

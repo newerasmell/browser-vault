@@ -41,7 +41,7 @@ const reveal = (v) => { if (v._real) { Object.assign(v, v._real); delete v._real
 let settings = {
   language: 'bg', launchAtLogin: true, idleMinutes: 15,
   lockOnScreenLock: true, lockOnKeyRemoval: true, panicHotkey: '⌃⌥⌘L',
-  ghostMode: false, revealHotkey: '⌃⌥⌘B', disguise: 'none'
+  ghostMode: false, revealHotkey: '⌃⌥⌘B', disguise: 'none', diagnosticLog: true
 };
 // Mirrors app/src-tauri/src/disguise.rs DISGUISES (invented names, own icons).
 const DISGUISES = [

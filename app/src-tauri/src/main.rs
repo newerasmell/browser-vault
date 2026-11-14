@@ -38,6 +38,10 @@ fn main() {
     applog::install();
     let store = Store::default_location().expect("HOME must be set");
     let app_state = Arc::new(AppState::new(store));
+    applog::set_enabled(app_state.settings().log_enabled());
+    // Best effort, off the startup path: drop macOS's record of where this
+    // app's download came from.
+    std::thread::spawn(vault_core::traces::scrub_download_records);
 
     let app = tauri::Builder::default()
         // First: a second launch hands over its arguments and exits before

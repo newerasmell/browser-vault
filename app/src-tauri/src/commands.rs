@@ -843,6 +843,7 @@ pub fn save_settings(
     panic_hotkey: Option<String>,
     ghost_mode: Option<bool>,
     reveal_hotkey: Option<String>,
+    diagnostic_log: Option<bool>,
 ) -> CmdResult<Settings> {
     let st = state::get(&app);
     let (before, after) = {
@@ -857,6 +858,7 @@ pub fn save_settings(
             panic_hotkey,
             ghost_mode,
             reveal_hotkey,
+            diagnostic_log,
         })
         .map_err(|e| {
             CmdError::new(if e == "hotkey clash" {
@@ -868,6 +870,9 @@ pub fn save_settings(
         (before, s.clone())
     };
     after.save(st.store.root())?;
+    if before.log_enabled() != after.log_enabled() {
+        crate::applog::set_enabled(after.log_enabled());
+    }
     if before.panic_hotkey != after.panic_hotkey
         || before.reveal_hotkey != after.reveal_hotkey
         || before.ghost_mode != after.ghost_mode

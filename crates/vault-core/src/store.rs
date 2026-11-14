@@ -648,6 +648,9 @@ impl Store {
             crate::trace::emit(&format!("lock {id}: browser stopped (forced: {killed})"));
             let _ = fs::remove_file(self.pid_path(id));
         }
+        // The vault's own app copies leave LaunchServices' database before
+        // their volume goes away.
+        crate::traces::unregister_apps_in(&self.mountpoint(id).join("app"));
         let r = hdiutil::detach_with_retries(&self.mountpoint(id));
         crate::trace::emit(&format!(
             "lock {id}: detach {}",

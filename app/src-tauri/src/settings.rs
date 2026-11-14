@@ -37,6 +37,16 @@ pub struct Settings {
     /// Active disguise id (`disguise::DISGUISES`), "none" by default.
     /// Written by `apply_disguise` only, not by `save_settings`.
     pub disguise: String,
+    /// Diagnostic log (`applog`). Always off in ghost mode; turning it off
+    /// deletes the existing log.
+    pub diagnostic_log: bool,
+}
+
+impl Settings {
+    /// Whether `applog` writes at all.
+    pub fn log_enabled(&self) -> bool {
+        self.diagnostic_log && !self.ghost_mode
+    }
 }
 
 /// "bg" if the user's first preferred macOS language is Bulgarian, else "en".
@@ -72,6 +82,7 @@ impl Default for Settings {
             ghost_mode: false,
             reveal_hotkey: hotkey::DEFAULT_REVEAL.into(),
             disguise: "none".into(),
+            diagnostic_log: true,
         }
     }
 }
@@ -87,6 +98,7 @@ pub struct Patch {
     pub panic_hotkey: Option<String>,
     pub ghost_mode: Option<bool>,
     pub reveal_hotkey: Option<String>,
+    pub diagnostic_log: Option<bool>,
 }
 
 impl Settings {
@@ -146,6 +158,9 @@ impl Settings {
         }
         if let Some(v) = p.ghost_mode {
             next.ghost_mode = v;
+        }
+        if let Some(v) = p.diagnostic_log {
+            next.diagnostic_log = v;
         }
         if let Some(h) = p.reveal_hotkey {
             if !hotkey::allowed(&h) {

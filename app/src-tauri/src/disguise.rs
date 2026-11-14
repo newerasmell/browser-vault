@@ -602,6 +602,9 @@ mod mac {
                 }
             }
         }
+        for p in &old {
+            vault_core::traces::unregister_app(p);
+        }
         let left = super::trash(&old, WAIT);
         applog::log(&format!(
             "disguise: {} older cop(ies) to the Trash, {} left",
@@ -767,6 +770,7 @@ mod mac {
         st.relaunching
             .store(true, std::sync::atomic::Ordering::SeqCst);
         st.quitting.store(true, std::sync::atomic::Ordering::SeqCst);
+        vault_core::traces::unregister_app(&src);
         if !super::trash(std::slice::from_ref(&src), WAIT).is_empty()
             || std::fs::rename(&staging, &src).is_err()
         {

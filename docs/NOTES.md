@@ -236,3 +236,9 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 ## Пускане през LaunchServices
 
 - Приложенията на сейфовете се пускат с `NSWorkspace openApplicationAtURL:configuration:` (аргументи, нова инстанция, без Recent Items), не като наши подпроцеси. macOS приписва поверителни действия на „отговорния“ процес: като наш подпроцес Telegram/Brave искаха микрофон/камера от наше име (и бяха убивани без usage description), а самообновяването на Telegram/Slack излизаше като „Browser Vault was prevented from modifying apps“. Сега всяко приложение е само за себе си: собствени разрешения, собствени обновявания. Ако LaunchServices откаже, пада обратно на директно пускане. Наблюдението на изхода е по PID (`Launched::Pid`).
+
+## По-малко следи
+
+- **Диагностичен лог:** Settings → Privacy → „Diagnostic log“. Винаги изключен в призрачен режим; изключването изтрива `app.log` и `app.log.1`.
+- **Запис за изтегляне:** при всеки старт приложението трие от `~/Library/Preferences/com.apple.LaunchServices.QuarantineEventsV2` записите, чийто URL съдържа `browser-vault` (DMG/artifact от GitHub). Историята на браузъра не се пипа.
+- **LaunchServices:** при заключване `lsregister -u` за всяко `.app` в `<mnt>/app` (собствените копия на сейфа); при смяна на маскировка и при обновяване — за старите копия, преди да отидат в кошчето.
