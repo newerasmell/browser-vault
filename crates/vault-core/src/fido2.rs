@@ -42,6 +42,8 @@ pub const MAX_LABEL_CHARS: usize = 64;
 pub const ERR_PIN_NOT_SET: &str = "the security key has no PIN; set a PIN first";
 pub const ERR_UNSUPPORTED_KEY: &str = "this security key does not support FIDO2 hmac-secret";
 pub const ERR_NO_KEY: &str = "no security key found; insert the key";
+/// The key is plugged in but the app cannot talk to it.
+pub const ERR_KEY_UNREACHABLE: &str = "the security key is not answering";
 pub const ERR_MULTIPLE_KEYS: &str =
     "more than one security key is plugged in; leave only the one to register";
 pub const ERR_ALREADY_REGISTERED: &str = "this security key is already registered for this vault";
@@ -335,11 +337,13 @@ pub fn unlock(
     if !pin_well_formed(pin) {
         return Err(Error::UnlockFailed);
     }
-    let found = auth
-        .find_credential(RP_ID, &ids)
-        .ok()
-        .flatten()
-        .ok_or(Error::UnlockFailed)?;
+    let found = match auth.find_credential(RP_ID, &ids) {
+        Ok(Some(id)) => id,
+        // The plugged-in key holds none of this vault's credentials (or
+        // anything else credential-dependent): generic, like a wrong password.
+        Ok(None) => return Err(Error::UnlockFailed),
+        Err(e) => return Err(device_error(e)),
+    };
     for slot in &header.slots {
         let Slot::Fido2 {
             credential_id,
@@ -358,13 +362,30 @@ pub fn unlock(
             continue;
         };
         let secret = with_touch(notify, || auth.hmac_secret(RP_ID, &found, &salt, pin))
-            .map_err(|_| Error::UnlockFailed)?;
+            .map_err(device_error)?;
         let kek = factor_kek(&pw, secret.as_ref(), KIND);
         if let Ok(vmk) = unwrap_slot(header, KIND, &kek, nonce, wrapped_vmk) {
             return Ok(unlocked(header, vmk));
         }
     }
     Err(Error::UnlockFailed)
+}
+
+/// Unlock-time FIDO error. Only failures that say nothing about the
+/// credentials (no key, several keys, the key not answering) get their own
+/// message; everything else (wrong PIN, wrong key, no touch) stays the
+/// generic [`Error::UnlockFailed`].
+fn device_error(e: FidoError) -> Error {
+    match e {
+        FidoError::NoDevice => Error::Invalid(ERR_NO_KEY),
+        FidoError::MultipleDevices => Error::Invalid(ERR_MULTIPLE_KEYS),
+        FidoError::Other(detail) => {
+            // Transport text from the HID layer; holds no secrets.
+            crate::trace::emit(&format!("fido: key not answering: {detail}"));
+            Error::Invalid(ERR_KEY_UNREACHABLE)
+        }
+        _ => Error::UnlockFailed,
+    }
 }
 
 fn check_key(header: &Header, key: &UnlockedKey) -> Result<()> {
@@ -814,13 +835,31 @@ mod hid {
                 if allow.is_empty() {
                     return Ok(None);
                 }
-                for param in devices() {
-                    let Ok(dev) = open(&param) else { continue };
-                    if let Ok(Some(id)) = probe(&dev, &rp_id, &allow) {
-                        return Ok(Some(id));
+                let devs = devices();
+                if devs.is_empty() {
+                    return Err(FidoError::NoDevice);
+                }
+                // `None` only when every key answered "not mine"; a key that
+                // could not be talked to is a transport error, not a wrong key.
+                let mut transport = None;
+                for param in devs {
+                    let dev = match open(&param) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            transport = Some(e);
+                            continue;
+                        }
+                    };
+                    match probe(&dev, &rp_id, &allow) {
+                        Ok(Some(id)) => return Ok(Some(id)),
+                        Ok(None) => {}
+                        Err(e) => transport = Some(e),
                     }
                 }
-                Ok(None)
+                match transport {
+                    Some(e @ (FidoError::Other(_) | FidoError::NoDevice)) => Err(e),
+                    _ => Ok(None),
+                }
             })
         }
 
@@ -1527,6 +1566,23 @@ mod tests {
                 .to_string(),
             ERR_FOREIGN_KEY
         );
+    }
+
+    #[test]
+    fn only_device_state_gets_its_own_unlock_error() {
+        use FidoError::*;
+        let msg = |e: Error| match e {
+            Error::Invalid(m) => m,
+            Error::UnlockFailed => "generic",
+            _ => "other",
+        };
+        assert_eq!(msg(device_error(NoDevice)), ERR_NO_KEY);
+        assert_eq!(msg(device_error(MultipleDevices)), ERR_MULTIPLE_KEYS);
+        assert_eq!(msg(device_error(Other("hid".into()))), ERR_KEY_UNREACHABLE);
+        // Credential-dependent: never distinguishable from a wrong password.
+        for e in [PinInvalid, PinBlocked, NoCredential, NoTouch, Excluded] {
+            assert_eq!(msg(device_error(e)), "generic");
+        }
     }
 
     #[test]

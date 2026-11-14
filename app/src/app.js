@@ -229,6 +229,11 @@ async function viewUnlock(params) {
           cleanup.push(() => clearInterval(iv));
           return;
         }
+        if (['fido_unreachable', 'fido_no_key', 'fido_multiple_keys'].includes(e?.code)) {
+          err.textContent = t('err_' + e.code);
+          submitBtn.disabled = false; submitBtn.textContent = t('unlock');
+          return;
+        }
         err.textContent = t('unlock_failed');
         el.querySelector('.unlock-head').classList.add('shake');
         setTimeout(() => el.querySelector('.unlock-head')?.classList.remove('shake'), 500);

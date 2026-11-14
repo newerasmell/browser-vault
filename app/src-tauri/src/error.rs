@@ -44,6 +44,16 @@ impl From<vault_core::Error> for CmdError {
             },
             // Distinguish "not built yet" from bad input so the UI can say so.
             vault_core::Error::Unsupported(_) => CmdError::unsupported(),
+            // Device state (not credentials): the unlock window says so.
+            vault_core::Error::Invalid(m) if m == vault_core::fido2::ERR_KEY_UNREACHABLE => {
+                CmdError::new("fido_unreachable")
+            }
+            vault_core::Error::Invalid(m) if m == vault_core::fido2::ERR_NO_KEY => {
+                CmdError::new("fido_no_key")
+            }
+            vault_core::Error::Invalid(m) if m == vault_core::fido2::ERR_MULTIPLE_KEYS => {
+                CmdError::new("fido_multiple_keys")
+            }
             other => CmdError::new(other.code()),
         }
     }
