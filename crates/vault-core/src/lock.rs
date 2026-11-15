@@ -57,6 +57,7 @@ fn saved_state_bundle(browser: Browser) -> &'static str {
         Browser::Telegram => "com.tdesktop.Telegram",
         Browser::Slack => "com.tinyspeck.slackmacgap",
         Browser::Vm => "com.parallels.desktop.console",
+        Browser::Obsidian => "md.obsidian",
     }
 }
 

@@ -1104,3 +1104,40 @@ fn vm_from_another_location() {
         assert!(targets(&roots, Browser::Vm, &bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn obsidian_notes_detect_import_targets_and_forget() {
+    let (d, roots) = fake_home();
+    let notes = roots.home.join("Documents/Notes");
+    write(&notes.join("Ideas.md"), b"# idea");
+    write(&notes.join(".obsidian/app.json"), b"{}");
+    let docs = roots.home.join("Documents");
+    let cfg = roots.obsidian_config();
+    write(
+        &cfg,
+        format!(
+            r#"{{"vaults":{{"a":{{"path":"{}"}},"b":{{"path":"{}"}},"c":{{"path":"/nope/x/y"}}}}}}"#,
+            notes.display(),
+            docs.display()
+        )
+        .as_bytes(),
+    );
+    // ~/Documents itself is never offered (a top-level home folder).
+    let found = detect_profiles_in(&roots, Browser::Obsidian).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, notes);
+    assert_eq!(found[0].name, "Notes");
+
+    let m = mnt(&d);
+    let id = notes.to_string_lossy().into_owned();
+    import_profile(&roots, Browser::Obsidian, &id, &m, &ignore).unwrap();
+    assert_eq!(fs::read(m.join("notes/Ideas.md")).unwrap(), b"# idea");
+
+    let t = targets(&roots, Browser::Obsidian, &id).unwrap();
+    assert_eq!(t.profiles, vec![(notes.clone(), None)]);
+    assert!(targets(&roots, Browser::Obsidian, &docs.to_string_lossy()).is_err());
+    assert!(targets(&roots, Browser::Obsidian, "/Users/someone/else/Notes").is_err());
+
+    crate::obsidian::forget_vault(&cfg, &notes).unwrap();
+    assert!(!crate::obsidian::known_vaults(&cfg).contains(&notes));
+}

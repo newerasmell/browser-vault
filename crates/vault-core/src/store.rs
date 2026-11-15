@@ -373,7 +373,9 @@ impl Store {
         // Fresh Brave vaults start portable (logins work on any Mac). An
         // imported profile becomes portable only if its logins can be
         // converted below.
-        settings.portable_keys = browser.is_chromium() && opts.import.is_none();
+        // (Only a Brave import brings logins keyed to this Mac.)
+        settings.portable_keys =
+            browser.is_chromium() && (opts.import.is_none() || browser != Browser::Brave);
         let nv = draft.finish(settings)?;
         let id = nv.header.vault_id.clone();
         mkdir_700(&self.root)?;
@@ -587,6 +589,9 @@ impl Store {
         mkdir_700(&browser::cache_dir(&mnt))?;
         if browser == Browser::Firefox {
             browser::write_firefox_user_js(&mnt, None)?;
+        }
+        if browser == Browser::Obsidian {
+            crate::obsidian::write_config(&mnt)?;
         }
         // Only vaults with an original still on disk pay the extra Argon2id.
         let cleanup_verifier = match (&header.meta()?.original, password) {

@@ -250,3 +250,9 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 - Отключване: `prlctl register <pvm> --preserve-uuid` (преместен, не копиран: Windows активацията и MAC адресите остават), `prlctl start` (resume), отваря Parallels. Маркер `run/<id>.vm` (prlctl + UUID).
 - Заключване: `prlctl suspend` (паметта отива в сейфа), `prlctl unregister`, после detach. Ако suspend не успее, сейфът остава отворен — никога не се „дърпа захранването“. Crash guard-ът прави същото преди да убива процеси.
 - Наблюдение: `prlctl status` на всеки 3 s; VM изключен/приспан → сейфът се заключва.
+
+## Obsidian
+
+- Тип `obsidian` (`md.obsidian`, Electron): `--user-data-dir=<mnt>/profile` (настройки, кеш, `obsidian.json`) + mock keychain; бележките са в `<mnt>/notes`. При всяко отключване `obsidian.json` в сейфа се пренаписва така, че Obsidian да отвори `<mnt>/notes` (id-то на записа се пази; пътят следва мястото на store-а).
+- Импорт: папка от списъка на обикновения Obsidian (`~/Library/Application Support/obsidian/obsidian.json`), само ако е истинска папка, по-дълбока от `~/<папка>` (никога `~`, `~/Documents` и т.н.). Изтриването на оригинала трие тази папка и я маха от списъка на обикновения Obsidian.
+- Apple Notes не могат да живеят в сейф (sandbox контейнер + iCloud); пренасят се с официалния Importer plugin на Obsidian.

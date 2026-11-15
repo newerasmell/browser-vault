@@ -299,6 +299,7 @@ pub async fn detect_browsers(app: AppHandle) -> Value {
         "whatsapp": one(Browser::WhatsApp),
         "slack": one(Browser::Slack),
         "vm": one(Browser::Vm),
+        "obsidian": one(Browser::Obsidian),
     })
 }
 

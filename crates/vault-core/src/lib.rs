@@ -14,6 +14,7 @@ pub mod identity;
 pub mod index;
 pub mod keyslot;
 pub mod lock;
+pub mod obsidian;
 pub mod portable;
 pub mod profiles;
 pub mod recovery;

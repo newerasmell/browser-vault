@@ -40,7 +40,7 @@ const ICONS = {
 const icon = (name, cls = '') =>
   h('span', { class: 'ico ' + cls, svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
 
-const BROWSERS = { brave: 'Brave', firefox: 'Firefox', telegram: 'Telegram', whatsapp: 'WhatsApp', slack: 'Slack', vm: 'Parallels VM' };
+const BROWSERS = { brave: 'Brave', firefox: 'Firefox', telegram: 'Telegram', whatsapp: 'WhatsApp', slack: 'Slack', vm: 'Parallels VM', obsidian: 'Obsidian' };
 // Kinds that run inside another installed app (WhatsApp Web runs in Brave).
 const ENGINE = { whatsapp: 'brave' };
 // Kinds that start with a fresh sign-in (nothing to import).
@@ -284,7 +284,8 @@ async function viewWizard() {
     brave: browsers.brave.found ? await api('detect_profiles', { browser: 'brave' }) : [],
     firefox: browsers.firefox.found ? await api('detect_profiles', { browser: 'firefox' }) : [],
     telegram: browsers.telegram?.found ? await api('detect_profiles', { browser: 'telegram' }) : [],
-    vm: browsers.vm?.found ? await api('detect_profiles', { browser: 'vm' }) : []
+    vm: browsers.vm?.found ? await api('detect_profiles', { browser: 'vm' }) : [],
+    obsidian: browsers.obsidian?.found ? await api('detect_profiles', { browser: 'obsidian' }) : []
   };
   const w = {
     step: 0, draftId: null, name: '', browser: Object.keys(BROWSERS).find((b) => browsers[b]?.found) ?? 'brave',
@@ -527,6 +528,8 @@ async function viewWizard() {
         NO_IMPORT.has(w.browser) || IMPORT_REQUIRED.has(w.browser) ? null
           : w.browser === 'telegram'
           ? toggle(t('import_telegram'), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_telegram_hint'))
+          : w.browser === 'obsidian'
+          ? toggle(t('import_obsidian'), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_obsidian_hint'))
           : toggle(t('import_profile', { browser: BROWSERS[w.browser] }), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_hint')),
         w.importProfile && choices.length && h('div', { class: 'toggle-row' },
           h('span', { class: 'toggle-text' }, t('import_which')),
@@ -544,7 +547,9 @@ async function viewWizard() {
           } }, t('choose'))),
         w.importProfile && w.importProfileId === ALL_PROFILES &&
           h('small', { class: 'muted block', style: 'padding:0 12px 10px;margin-top:-4px' }, t('import_all_hint', { browser: BROWSERS[w.browser] }))),
-      w.browser === 'vm'
+      w.browser === 'obsidian'
+        ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('obs_note_title')), ' ', t('obs_note_body')))
+        : w.browser === 'vm'
         ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t(choices.length ? 'vm_note_title' : 'vm_none_title')), ' ', t(choices.length ? 'vm_note_body' : 'vm_none_body')))
         : w.browser === 'whatsapp'
         ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('wa_note_title')), ' ', t('wa_note_body')))

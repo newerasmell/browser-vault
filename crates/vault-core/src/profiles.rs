@@ -115,6 +115,11 @@ impl Roots {
         self.home.join("Library/Caches/Firefox")
     }
 
+    /// The regular Obsidian's list of note folders.
+    pub fn obsidian_config(&self) -> PathBuf {
+        crate::obsidian::config_path(&self.home.join("Library/Application Support/obsidian"))
+    }
+
     /// Parallels Desktop's default folder for VM bundles.
     pub fn parallels_dir(&self) -> PathBuf {
         self.home.join("Parallels")
@@ -133,6 +138,7 @@ impl Roots {
             Browser::Telegram => "com.tdesktop.Telegram.savedState",
             Browser::Slack => "com.tinyspeck.slackmacgap.savedState",
             Browser::Vm => "com.parallels.desktop.console.savedState",
+            Browser::Obsidian => "md.obsidian.savedState",
         };
         self.home
             .join("Library/Saved Application State")
@@ -213,6 +219,23 @@ pub fn detect_profiles_in(roots: &Roots, browser: Browser) -> Result<Vec<Detecte
         }
         // Nothing to import: these start with a fresh sign-in.
         Browser::WhatsApp | Browser::Slack => {}
+        // Each note folder the regular Obsidian lists.
+        Browser::Obsidian => {
+            for path in crate::obsidian::known_vaults(&roots.obsidian_config()) {
+                if check_notes_dir(roots, &path).is_err() {
+                    continue;
+                }
+                out.push(DetectedProfile {
+                    id: path.to_string_lossy().into_owned(),
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    size_bytes: dir_size(&path),
+                    path,
+                });
+            }
+        }
         // Each VM bundle in ~/Parallels.
         Browser::Vm => {
             if let Ok(rd) = fs::read_dir(roots.parallels_dir()) {
@@ -258,6 +281,25 @@ fn find_profile(roots: &Roots, browser: Browser, id: &str) -> Result<DetectedPro
         .into_iter()
         .find(|p| p.id == id)
         .ok_or(Error::NotFound)
+}
+
+/// A note folder that may be imported (and later deleted): absolute, a real
+/// directory, no `..`, and deeper than a top-level folder of the home
+/// (never `~`, `~/Documents` or `/Volumes/X` itself).
+fn check_notes_dir(roots: &Roots, dir: &Path) -> Result<()> {
+    let ok = dir.is_absolute()
+        && !dir
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        && is_real_dir(dir)
+        && !roots.home.starts_with(dir)
+        && dir.parent() != Some(roots.home.as_path())
+        && dir.components().count() >= 4;
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Invalid("bad profile path"))
+    }
 }
 
 /// A VM bundle chosen anywhere (e.g. on an external drive): an absolute
@@ -381,6 +423,7 @@ pub fn regular_running_in(browser: Browser, ps: &str) -> bool {
         Browser::Telegram => "/Contents/MacOS/Telegram",
         Browser::Slack => "/Contents/MacOS/Slack",
         Browser::Vm => "/Contents/MacOS/prl_client_app",
+        Browser::Obsidian => "/Contents/MacOS/Obsidian",
     };
     ps.lines().any(|line| {
         let line = line.trim();
@@ -443,6 +486,7 @@ fn key_files(browser: Browser) -> &'static [&'static str] {
         Browser::Telegram => &["key_datas"],
         Browser::WhatsApp | Browser::Slack => &[],
         Browser::Vm => &["config.pvs"],
+        Browser::Obsidian => &[],
     }
 }
 
@@ -457,6 +501,7 @@ pub fn import_destination(browser: Browser, mnt: &Path) -> PathBuf {
         Browser::WhatsApp | Browser::Slack => browser::profile_dir(mnt),
         // Set per VM in `import_with_hook` (the bundle keeps its name).
         Browser::Vm => browser::profile_dir(mnt),
+        Browser::Obsidian => crate::obsidian::notes_dir(mnt),
     }
 }
 
@@ -969,6 +1014,17 @@ pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<Clea
             })
         }
         Browser::WhatsApp | Browser::Slack => Err(Error::Invalid(ERR_NO_IMPORT)),
+        Browser::Obsidian => {
+            let dir = PathBuf::from(profile_id);
+            if !crate::obsidian::known_vaults(&roots.obsidian_config()).contains(&dir) {
+                return Err(Error::Invalid("bad profile path"));
+            }
+            check_notes_dir(roots, &dir)?;
+            Ok(CleanupTargets {
+                profiles: vec![(dir, None)],
+                saved_state,
+            })
+        }
         Browser::Vm => Ok(CleanupTargets {
             profiles: vec![(vm_source(roots, profile_id)?, None)],
             saved_state,
@@ -1143,6 +1199,9 @@ pub fn cleanup_original(
         Browser::Firefox => firefox_forget_profile(roots, &o.profile_id)?,
         // No profile list to edit.
         Browser::Telegram | Browser::WhatsApp | Browser::Slack | Browser::Vm => {}
+        Browser::Obsidian => {
+            crate::obsidian::forget_vault(&roots.obsidian_config(), Path::new(&o.profile_id))?
+        }
     }
     notify(Event::CleanupProgress { pct: 20 });
     let n = t.profiles.len().max(1);

@@ -26,6 +26,9 @@ pub enum Browser {
     Slack,
     /// A Parallels Desktop virtual machine (see `vm.rs`).
     Vm,
+    /// Obsidian notes (obsidian.md, `md.obsidian`, Electron; see
+    /// `obsidian.rs`).
+    Obsidian,
 }
 
 impl Browser {
@@ -37,6 +40,7 @@ impl Browser {
             Browser::WhatsApp => "whatsapp",
             Browser::Slack => "slack",
             Browser::Vm => "vm",
+            Browser::Obsidian => "obsidian",
         }
     }
 
@@ -51,7 +55,10 @@ impl Browser {
     /// Chromium-based: `--user-data-dir`, and the mock keychain for
     /// Mac-independent cookie/password keys.
     pub fn is_chromium(self) -> bool {
-        matches!(self.engine(), Browser::Brave | Browser::Slack)
+        matches!(
+            self.engine(),
+            Browser::Brave | Browser::Slack | Browser::Obsidian
+        )
     }
 
     pub fn parse(s: &str) -> Option<Browser> {
@@ -62,6 +69,7 @@ impl Browser {
             "whatsapp" => Some(Browser::WhatsApp),
             "slack" => Some(Browser::Slack),
             "vm" => Some(Browser::Vm),
+            "obsidian" => Some(Browser::Obsidian),
             _ => None,
         }
     }
@@ -74,6 +82,7 @@ impl Browser {
             Browser::Telegram => ("Telegram.app", "Telegram"),
             Browser::Slack => ("Slack.app", "Slack"),
             Browser::Vm => ("Parallels Desktop.app", "prl_client_app"),
+            Browser::Obsidian => ("Obsidian.app", "Obsidian"),
         }
     }
 
@@ -84,6 +93,7 @@ impl Browser {
             Browser::Telegram => "https://desktop.telegram.org/",
             Browser::Slack => "https://slack.com/downloads/mac",
             Browser::Vm => "https://www.parallels.com/products/desktop/",
+            Browser::Obsidian => "https://obsidian.md/download",
         }
     }
 }
@@ -103,6 +113,7 @@ pub fn required_bundle_id(browser: Browser) -> Option<&'static str> {
         // The App Store Slack is sandboxed as well.
         Browser::Slack => Some("com.tinyspeck.slackmacgap"),
         Browser::Vm => Some("com.parallels.desktop.console"),
+        Browser::Obsidian => Some("md.obsidian"),
         Browser::Brave | Browser::Firefox | Browser::WhatsApp => None,
     }
 }
@@ -247,7 +258,7 @@ pub fn launch_args(browser: Browser, mnt: &Path) -> Result<Vec<OsString>> {
         }
         // Electron: user data (session, cache, logs, Crashpad) follows
         // Chromium's --user-data-dir.
-        Browser::Slack => Ok(vec![user_data()]),
+        Browser::Slack | Browser::Obsidian => Ok(vec![user_data()]),
         // Started through prlctl, not with arguments (see `vm.rs`).
         Browser::Vm => Ok(vec![]),
     }
@@ -261,10 +272,8 @@ pub const WHATSAPP_URL: &str = "https://web.whatsapp.com/";
 /// `~/Library/Application Support/Firefox/Crash Reports`.
 pub fn launch_env(browser: Browser) -> Vec<(&'static str, &'static str)> {
     match browser {
-        Browser::Brave | Browser::Telegram | Browser::WhatsApp | Browser::Slack | Browser::Vm => {
-            vec![]
-        }
         Browser::Firefox => vec![("MOZ_CRASHREPORTER_DISABLE", "1")],
+        _ => vec![],
     }
 }
 
@@ -671,6 +680,8 @@ mod tests {
             Browser::Telegram,
             Browser::WhatsApp,
             Browser::Slack,
+            Browser::Vm,
+            Browser::Obsidian,
         ] {
             assert_eq!(Browser::parse(b.as_str()), Some(b));
         }

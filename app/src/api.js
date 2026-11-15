@@ -68,7 +68,8 @@ const mock = {
     telegram: { found: true, path: '/Applications/Telegram.app' },
     whatsapp: { found: true, path: '/Applications/Brave Browser.app' },
     slack: { found: true, path: '/Applications/Slack.app' },
-    vm: { found: true, path: '/Applications/Parallels Desktop.app' }
+    vm: { found: true, path: '/Applications/Parallels Desktop.app' },
+    obsidian: { found: true, path: '/Applications/Obsidian.app' }
   }),
   open_window: async ({ view, params }) => {
     location.hash = view + (params ? '?' + new URLSearchParams(params) : '');
