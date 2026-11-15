@@ -122,6 +122,8 @@ fn main() {
             commands::ui_log,
             commands::install_update,
             commands::pick_vm,
+            commands::set_unlock_group,
+            commands::unlock_group,
             commands::move_app_into_vault,
             commands::remove_app_outside,
             commands::detect_profiles,

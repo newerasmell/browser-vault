@@ -39,6 +39,7 @@ const vaults = [
 // Unlocking reveals the encrypted name (Rust: decrypted metadata → local index).
 const reveal = (v) => { if (v._real) { Object.assign(v, v._real); delete v._real; } };
 let settings = {
+  unlockGroup: ['v4', 'v1'],
   language: 'bg', launchAtLogin: true, idleMinutes: 15,
   lockOnScreenLock: true, lockOnKeyRemoval: true, panicHotkey: '⌃⌥⌘L',
   ghostMode: false, revealHotkey: '⌃⌥⌘B', disguise: 'none', diagnosticLog: true
@@ -78,6 +79,8 @@ const mock = {
   focus_browser: async () => {},
   install_update: async () => null,
   pick_vm: async () => null,
+  set_unlock_group: async ({ ids }) => { settings.unlockGroup = ids; return structuredClone(settings); },
+  unlock_group: async () => ({ results: [], total: 0 }),
   move_app_into_vault: async () => ({ ok: true }),
   remove_app_outside: async () => ({ ok: true }),
   quit_app: async () => {},

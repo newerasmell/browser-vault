@@ -40,6 +40,9 @@ pub struct Settings {
     /// Diagnostic log (`applog`). Always off in ghost mode; turning it off
     /// deletes the existing log.
     pub diagnostic_log: bool,
+    /// Vault ids opened together with one password + PIN ("Unlock group"),
+    /// in this order. YubiKey vaults only. Written by `set_unlock_group`.
+    pub unlock_group: Vec<String>,
 }
 
 impl Settings {
@@ -83,6 +86,7 @@ impl Default for Settings {
             reveal_hotkey: hotkey::DEFAULT_REVEAL.into(),
             disguise: "none".into(),
             diagnostic_log: true,
+            unlock_group: Vec::new(),
         }
     }
 }

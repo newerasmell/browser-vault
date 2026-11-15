@@ -256,3 +256,8 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 - Тип `obsidian` (`md.obsidian`, Electron): `--user-data-dir=<mnt>/profile` (настройки, кеш, `obsidian.json`) + mock keychain; бележките са в `<mnt>/notes`. При всяко отключване `obsidian.json` в сейфа се пренаписва така, че Obsidian да отвори `<mnt>/notes` (id-то на записа се пази; пътят следва мястото на store-а).
 - Импорт: папка от списъка на обикновения Obsidian (`~/Library/Application Support/obsidian/obsidian.json`), само ако е истинска папка, по-дълбока от `~/<папка>` (никога `~`, `~/Documents` и т.н.). Изтриването на оригинала трие тази папка и я маха от списъка на обикновения Obsidian.
 - Apple Notes не могат да живеят в сейф (sandbox контейнер + iCloud); пренасят се с официалния Importer plugin на Obsidian.
+
+## Групово отключване
+
+- Settings → Vaults → „Unlock with the group“ (само YubiKey сейфове) → `settings.unlockGroup` (ред на отключване).
+- Менюто показва „Unlock group (N)“, когато ≥2 сейфа от групата са заключени. Една парола + PIN; всеки сейф иска собствено докосване на ключа (собствен credential с hmac-secret и собствена сол — това е хардуерно изискване). Ако първият сейф не се отвори (най-вероятно грешна парола), се спира, за да не се искат напразно докосвания.

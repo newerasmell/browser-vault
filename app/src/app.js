@@ -130,7 +130,8 @@ function strength(p) {
 
 // ---------- TRAY ----------
 async function viewTray() {
-  const vaults = await api('list_vaults');
+  const [vaults, settings] = await Promise.all([api('list_vaults'), api('get_settings')]);
+  const groupLocked = vaults.filter((v) => (settings.unlockGroup || []).includes(v.id) && v.status === 'locked');
   const openCount = vaults.filter((v) => v.status === 'unlocked').length;
 
   const row = (v) => {
@@ -165,6 +166,9 @@ async function viewTray() {
         h('span', {}, h('strong', {}, t('original_pending')), h('small', {}, vname(pv))),
         h('button', { class: 'btn sm ghost push', onclick: () => api('open_window', { view: 'settings', params: { tab: 'vaults' } }) }, t('review')));
     })(),
+    groupLocked.length >= 2 && h('div', { class: 'banner' }, icon('key', 'sm'),
+      h('span', {}, h('strong', {}, t('group_unlock_title', { n: groupLocked.length })), h('small', {}, groupLocked.map(vname).join(', '))),
+      h('button', { class: 'btn sm primary push', onclick: () => api('open_window', { view: 'unlock', params: { id: 'group' } }) }, t('open'))),
     vaults.length
       ? h('ul', { class: 'vault-list' }, vaults.map(row))
       : h('div', { class: 'empty' }, icon('shield', 'xl'), h('strong', {}, t('empty_title')), h('p', { class: 'muted' }, t('empty_body'))),
@@ -176,7 +180,72 @@ async function viewTray() {
 }
 
 // ---------- UNLOCK ----------
+// One password + PIN for every locked vault of the unlock group; the key is
+// touched once per vault (each has its own credential on it).
+async function viewUnlockGroup() {
+  const [vaults, settings] = await Promise.all([api('list_vaults'), api('get_settings')]);
+  const group = (settings.unlockGroup || [])
+    .map((id) => vaults.find((v) => v.id === id))
+    .filter((v) => v && v.status === 'locked' && v.mode === 'fido2');
+  const el = h('div', { class: 'pane unlock' });
+  const state = {}; // id -> 'wait' | 'touch' | 'ok' | 'fail' | 'skip'
+  let current = null, index = 0;
+  const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password', autofocus: true });
+  const pin = h('input', { class: 'input', type: 'password', inputmode: 'numeric', autocomplete: 'off' });
+  const err = h('p', { class: 'error', role: 'alert' });
+  const btn = h('button', { class: 'btn primary block', type: 'submit' }, t('unlock'));
+  const list = h('ul', { class: 'checklist steps' });
+  const paintList = () => list.replaceChildren(...group.map((v) => {
+    const st = state[v.id] || 'wait';
+    const ic = st === 'ok' ? 'check' : st === 'fail' ? 'alert' : st === 'touch' ? 'key' : 'lock';
+    return h('li', { class: st === 'ok' ? 'ok' : st === 'fail' ? 'no' : '' }, icon(ic, 'sm'),
+      h('span', {}, badge(v.browser), ' ', vname(v), st === 'touch' ? h('small', { class: 'muted' }, ' — ' + t('touch_key')) : null));
+  }));
+  paintList();
+  let overlay;
+  const offP = on('group_progress', (p) => { current = p.id; index = p.index; state[p.id] = 'touch'; paintList(); });
+  const offA = on('fido_touch_needed', () => {
+    const v = group.find((x) => x.id === current);
+    overlay = h('div', { class: 'overlay' }, touchPrompt(),
+      h('p', { class: 'center' }, h('strong', {}, v ? vname(v) : ''), ' ', t('group_step', { i: index + 1, n: group.length })));
+    el.append(overlay);
+  });
+  const offB = on('fido_touch_done', () => overlay?.remove());
+  cleanup.push(offP, offA, offB);
+
+  const form = h('form', { class: 'form', onsubmit: async (e) => {
+    e.preventDefault();
+    if (btn.disabled) return;
+    err.textContent = ''; btn.disabled = true; btn.textContent = t('unlocking');
+    try {
+      const r = await api('unlock_group', { password: pw.value, pin: pin.value });
+      for (const x of r.results) state[x.id] = x.ok ? 'ok' : 'fail';
+      for (const v of group) if (!state[v.id] || state[v.id] === 'wait' || state[v.id] === 'touch') state[v.id] = state[v.id] === 'touch' ? 'fail' : 'skip';
+      overlay?.remove(); paintList();
+      const allOk = r.results.length === group.length && r.results.every((x) => x.ok);
+      if (allOk) { pw.value = ''; pin.value = ''; api('close_window'); return; }
+      const first = r.results[0];
+      err.textContent = first && !first.ok
+        ? (['fido_unreachable', 'fido_no_key', 'fido_multiple_keys'].includes(first.code) ? t('err_' + first.code) : t('unlock_failed'))
+        : t('group_partial');
+    } catch { overlay?.remove(); err.textContent = t('unlock_failed'); }
+    btn.disabled = false; btn.textContent = t('unlock');
+  } },
+    h('label', { class: 'field' }, h('span', {}, t('password')), pw),
+    h('label', { class: 'field' }, h('span', {}, t('yubikey_pin')), pin),
+    err, btn);
+
+  el.append(...[
+    h('div', { class: 'unlock-head' },
+      h('div', { class: 'lock-art' }, icon('lock', 'lg')),
+      h('h1', {}, t('group_unlock_title', { n: group.length }))),
+    group.length ? list : h('p', { class: 'muted center' }, t('group_empty')),
+    group.length ? form : null].filter(Boolean));
+  return el;
+}
+
 async function viewUnlock(params) {
+  if (params.get('id') === 'group') return viewUnlockGroup();
   const vaults = await api('list_vaults');
   const v = vaults.find((x) => x.id === params.get('id')) || vaults[0];
   const el = h('div', { class: 'pane unlock' });
@@ -1196,6 +1265,13 @@ async function viewSettings(params) {
           v.browser === 'brave' && !v.portable && act('make_portable', t('act_portable_btn')),
           act('recovery_reset', t('act_recovery_link')),
           act('delete', t('delete_vault'), 'danger push')),
+        v.mode === 'fido2' && h('div', { class: 'row' },
+          toggle(t('group_member'), (s.unlockGroup || []).includes(v.id), async (on) => {
+            const ids = (s.unlockGroup || []).filter((x) => x !== v.id);
+            if (on) ids.push(v.id);
+            const next = await api('set_unlock_group', { ids });
+            s.unlockGroup = next.unlockGroup; toast(t('saved'));
+          }, t('group_member_hint'))),
         appBlock(v),
         backupBlock(v));
     }));

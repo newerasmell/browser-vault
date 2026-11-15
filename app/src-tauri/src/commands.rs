@@ -602,6 +602,81 @@ pub async fn unlock_vault(
     blocking(move || do_unlock(&app, &id, secret)).await
 }
 
+/// Which vaults "Unlock group" opens (YubiKey vaults only, unknown or
+/// authenticator vaults are dropped). Order is kept.
+#[tauri::command]
+pub fn set_unlock_group(app: AppHandle, ids: Vec<String>) -> CmdResult<Settings> {
+    let st = state::get(&app);
+    let mut group: Vec<String> = Vec::new();
+    for id in ids {
+        if group.contains(&id) {
+            continue;
+        }
+        if let Ok(h) = st.store.load(&id) {
+            if mode_of(&h) == "fido2" {
+                group.push(id);
+            }
+        }
+    }
+    let s = {
+        let mut s = lock(&st.settings);
+        s.unlock_group = group;
+        s.clone()
+    };
+    s.save(st.store.root())?;
+    Ok(s)
+}
+
+/// Open every locked vault of the unlock group with one password + PIN.
+/// Each vault still needs its own touch of the key (its own credential on
+/// it). Emits `group_progress { id, index, total }` before each one.
+/// Stops if the first vault fails (most likely a typo, and every further
+/// try would ask for another touch); later failures don't stop the rest.
+/// Returns `{ results: [{ id, ok, code }] }`; codes are the usual generic
+/// ones.
+#[tauri::command]
+pub async fn unlock_group(app: AppHandle, password: String, pin: String) -> CmdResult<Value> {
+    let password = Zeroizing::new(password);
+    let pin = Zeroizing::new(pin);
+    blocking(move || {
+        let st = state::get(&app);
+        let ids: Vec<String> = st
+            .settings()
+            .unlock_group
+            .into_iter()
+            .filter(|id| {
+                !lock(&st.sessions).contains_key(id)
+                    && st.store.load(id).is_ok_and(|h| mode_of(&h) == "fido2")
+            })
+            .collect();
+        let total = ids.len();
+        let mut results = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            let _ = app.emit(
+                "group_progress",
+                json!({ "id": id, "index": index, "total": total }),
+            );
+            let secret = Secret::Factors {
+                password: Zeroizing::new(password.to_string()),
+                pin: Zeroizing::new(pin.to_string()),
+                code: Zeroizing::new(String::new()),
+            };
+            let r = do_unlock(&app, id, secret);
+            let failed = r.is_err();
+            results.push(json!({
+                "id": id,
+                "ok": !failed,
+                "code": r.err().map(|e| e.code),
+            }));
+            if failed && index == 0 {
+                break;
+            }
+        }
+        Ok(json!({ "results": results, "total": total }))
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn unlock_with_recovery(app: AppHandle, id: String, phrase: String) -> CmdResult<Value> {
     let secret = Secret::Recovery(Zeroizing::new(phrase));
