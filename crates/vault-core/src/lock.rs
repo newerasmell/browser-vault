@@ -56,6 +56,7 @@ fn saved_state_bundle(browser: Browser) -> &'static str {
         Browser::Firefox => "org.mozilla.firefox",
         Browser::Telegram => "com.tdesktop.Telegram",
         Browser::Slack => "com.tinyspeck.slackmacgap",
+        Browser::Vm => "com.parallels.desktop.console",
     }
 }
 
@@ -348,10 +349,22 @@ pub fn pids_matching(ps: &str, mnt: &Path, real: &Path, own_pid: i32) -> Vec<i32
 /// its own once the vault is locked normally (mount gone). Arguments are a
 /// PID and a path — no secrets.
 pub fn spawn_crash_guard(app_pid: u32, browser_pid: u32, mnt: &Path) -> Result<()> {
+    spawn_crash_guard_with(app_pid, browser_pid, mnt, None)
+}
+
+/// [`spawn_crash_guard`]; with `vm = (prlctl, uuid)` the guard first
+/// suspends that VM (its memory goes into the vault) and unregisters it,
+/// so it is never killed like a browser.
+pub fn spawn_crash_guard_with(
+    app_pid: u32,
+    browser_pid: u32,
+    mnt: &Path,
+    vm: Option<(PathBuf, String)>,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let real_mnt = std::fs::canonicalize(mnt).unwrap_or_else(|_| mnt.to_path_buf());
     const SCRIPT: &str = r#"
-APP="$1"; BR="$2"; MNT="$3"; ORIG="$4"
+APP="$1"; BR="$2"; MNT="$3"; ORIG="$4"; PRL="$5"; VMID="$6"
 mounted() { /sbin/mount | /usr/bin/grep -qF " on $MNT ("; }
 while kill -0 "$APP" 2>/dev/null; do
   mounted || exit 0
@@ -361,7 +374,12 @@ mounted || exit 0
 # Every process using the vault (the browser may have relaunched itself
 # under a new PID), never this guard itself.
 users() { /bin/ps -axww -o pid=,command= | /usr/bin/grep -F -e "$MNT" -e "$ORIG" | /usr/bin/grep -v -e "$0" -e grep | /usr/bin/awk '{print $1}'; }
-kill -TERM "$BR" 2>/dev/null
+if [ -n "$PRL" ] && [ -n "$VMID" ]; then
+  "$PRL" suspend "$VMID" >/dev/null 2>&1
+  i=0; while "$PRL" status "$VMID" 2>/dev/null | /usr/bin/grep -qv -e suspended -e stopped && [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done
+  "$PRL" unregister "$VMID" >/dev/null 2>&1
+fi
+[ "$BR" -gt 0 ] 2>/dev/null && kill -TERM "$BR" 2>/dev/null
 for p in $(users); do kill -TERM "$p" 2>/dev/null; done
 i=0; while [ -n "$(users)" ] && [ $i -lt 8 ]; do sleep 1; i=$((i+1)); done
 for p in $(users); do kill -KILL "$p" 2>/dev/null; done
@@ -381,6 +399,10 @@ done
         // browser's command line has the path as we passed it.
         .arg(&real_mnt)
         .arg(mnt)
+        .args(match &vm {
+            Some((prl, id)) => vec![prl.as_os_str().to_owned(), id.into()],
+            None => vec![],
+        })
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

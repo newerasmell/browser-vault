@@ -194,8 +194,9 @@ pub async fn move_app_into_vault(app: AppHandle, id: String) -> CmdResult<Value>
     blocking(move || {
         let st = state::get(&app);
         let (b, mnt) = open_vault(&st, &id)?;
-        // WhatsApp runs in the shared Brave; that is Brave's business.
-        if b.engine() != b {
+        // WhatsApp runs in the shared Brave; a VM vault holds the VM, not
+        // Parallels itself.
+        if b.engine() != b || b == Browser::Vm {
             return Err(CmdError::invalid());
         }
         let src = browser_binary(&st, b)
@@ -224,8 +225,9 @@ pub async fn remove_app_outside(app: AppHandle, id: String) -> CmdResult<Value> 
     blocking(move || {
         let st = state::get(&app);
         let (b, mnt) = open_vault(&st, &id)?;
-        // WhatsApp runs in the shared Brave; that is Brave's business.
-        if b.engine() != b {
+        // WhatsApp runs in the shared Brave; a VM vault holds the VM, not
+        // Parallels itself.
+        if b.engine() != b || b == Browser::Vm {
             return Err(CmdError::invalid());
         }
         if browser::vault_binary(b, &mnt).is_none() {
@@ -296,6 +298,7 @@ pub async fn detect_browsers(app: AppHandle) -> Value {
         "telegram": one(Browser::Telegram),
         "whatsapp": one(Browser::WhatsApp),
         "slack": one(Browser::Slack),
+        "vm": one(Browser::Vm),
     })
 }
 
@@ -462,17 +465,21 @@ fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
                 activate_pid(pid);
                 return Ok(json!(OK));
             }
+            if st.store.focus_running_vm(id) {
+                return Ok(json!(OK));
+            }
             let bin = browser_binary(&st, s.unlocked.header.meta()?.browser);
             let child = st.store.launch(&s.unlocked, bin.as_deref())?;
             let pid = child.id();
-            s.browser_pid = Some(pid);
+            s.browser_pid = (pid > 0).then_some(pid);
             let generation = s.generation;
             drop(sessions);
             crate::applog::log(&format!("browser for {id} reopened as pid {pid}"));
-            if let Err(e) = vault_core::lock::spawn_crash_guard(
+            if let Err(e) = vault_core::lock::spawn_crash_guard_with(
                 std::process::id(),
                 pid,
                 &st.store.mountpoint(id),
+                child.vm(),
             ) {
                 crate::applog::log(&format!("crash guard not started: {e}"));
             }
@@ -531,15 +538,20 @@ fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
         Session {
             unlocked,
             generation,
-            browser_pid: Some(pid),
+            // A VM has no process of ours (`Launched::Vm`).
+            browser_pid: (pid > 0).then_some(pid),
         },
     );
     lock(&st.errors).remove(id);
     // If this app ever dies while the vault is open, a detached guard
-    // stops the vault's browser and detaches the volume (SPEC §6).
-    if let Err(e) =
-        vault_core::lock::spawn_crash_guard(std::process::id(), pid, &st.store.mountpoint(id))
-    {
+    // stops the vault's browser (suspends its VM) and detaches the volume
+    // (SPEC §6).
+    if let Err(e) = vault_core::lock::spawn_crash_guard_with(
+        std::process::id(),
+        pid,
+        &st.store.mountpoint(id),
+        child.vm(),
+    ) {
         crate::applog::log(&format!("crash guard not started: {e}"));
     }
     triggers::watch_browser(app.clone(), id.to_string(), generation, child);

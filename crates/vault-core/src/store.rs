@@ -450,29 +450,45 @@ impl Store {
             mkdir_700(&browser::profile_dir(&mnt))?;
             mkdir_700(&browser::cache_dir(&mnt))?;
             let imported = opts.import.as_ref().map(|req| {
-                profiles::import_profile(&req.roots, browser, &req.profile_id, &mnt, notify).map(
-                    |original| {
-                        // Re-encrypt the COPY's logins for other Macs. If the
-                        // Keychain can't be read (user clicked Deny), the
-                        // vault stays tied to this Mac and still works here.
-                        let portable = browser == Browser::Brave
-                            && match crate::portable::convert_mount_with(&mnt, req.roots.brave_key)
-                            {
-                                Ok(st) => {
-                                    crate::trace::emit(&format!(
+                // A VM must be down (suspended/shut down) while it is copied.
+                let vm = if browser == Browser::Vm {
+                    Some(vm_import_check(&req.roots, &req.profile_id)?)
+                } else {
+                    None
+                };
+                let r =
+                    profiles::import_profile(&req.roots, browser, &req.profile_id, &mnt, notify)
+                        .map(|original| {
+                            // Re-encrypt the COPY's logins for other Macs. If the
+                            // Keychain can't be read (user clicked Deny), the
+                            // vault stays tied to this Mac and still works here.
+                            let portable = browser == Browser::Brave
+                                && match crate::portable::convert_mount_with(
+                                    &mnt,
+                                    req.roots.brave_key,
+                                ) {
+                                    Ok(st) => {
+                                        crate::trace::emit(&format!(
                                         "portable: converted {} values ({} unreadable) in {} dbs",
                                         st.converted, st.failed, st.databases
                                     ));
-                                    true
-                                }
-                                Err(e) => {
-                                    crate::trace::emit(&format!("portable: skipped: {e}"));
-                                    false
-                                }
-                            };
-                        (original, portable)
-                    },
-                )
+                                        true
+                                    }
+                                    Err(e) => {
+                                        crate::trace::emit(&format!("portable: skipped: {e}"));
+                                        false
+                                    }
+                                };
+                            (original, portable)
+                        });
+                // Moved, not copied: the original leaves Parallels' list so
+                // the vault copy can be registered under the same UUID. Its
+                // files stay until the user deletes the original.
+                if let (Ok(_), Some((prlctl, uuid))) = (&r, vm) {
+                    crate::vm::unregister(&prlctl, &uuid);
+                    crate::trace::emit("vm: original unregistered after the copy");
+                }
+                r
             });
             // After the import, so our managed block wins over an imported user.js.
             if browser == Browser::Firefox {
@@ -601,6 +617,9 @@ impl Store {
     pub fn launch(&self, unlocked: &Unlocked, binary: Option<&Path>) -> Result<browser::Launched> {
         let meta = unlocked.header.meta()?;
         let browser = meta.browser;
+        if browser == Browser::Vm {
+            return self.launch_vm(unlocked, binary);
+        }
         // The vault's own copy of the app wins over the installed one.
         let bin = match (browser::vault_binary(browser, &unlocked.mountpoint), binary) {
             (Some(own), _) => own,
@@ -619,6 +638,66 @@ impl Store {
             child.id().to_string(),
         )?;
         Ok(child)
+    }
+
+    fn vm_marker(&self, id: &str) -> PathBuf {
+        self.root.join("run").join(format!("{id}.vm"))
+    }
+
+    /// An open VM vault whose VM is up: bring Parallels to the front and
+    /// return `true` (nothing to start).
+    pub fn focus_running_vm(&self, id: &str) -> bool {
+        let Some((prlctl, uuid)) = fs::read_to_string(self.vm_marker(id))
+            .ok()
+            .and_then(|m| crate::vm::parse_marker(&m))
+        else {
+            return false;
+        };
+        if !crate::vm::status(&prlctl, &uuid).is_some_and(|s| crate::vm::is_active(&s)) {
+            return false;
+        }
+        if let Some(app) = prlctl
+            .ancestors()
+            .find(|p| p.extension().is_some_and(|e| e == "app"))
+        {
+            let _ = std::process::Command::new("/usr/bin/open")
+                .arg("-a")
+                .arg(app)
+                .status();
+        }
+        true
+    }
+
+    /// VM vault: register the bundle in the vault (keeping its UUID), start
+    /// or resume it and show Parallels. The marker tells a later lock (or
+    /// the crash guard's caller) how to suspend it.
+    fn launch_vm(&self, unlocked: &Unlocked, binary: Option<&Path>) -> Result<browser::Launched> {
+        let bin = match binary {
+            Some(b) => b.to_path_buf(),
+            None => browser::detect(Browser::Vm).ok_or(Error::BrowserMissing)?,
+        };
+        let app = bin
+            .ancestors()
+            .find(|p| p.extension().is_some_and(|e| e == "app"))
+            .ok_or(Error::BrowserMissing)?;
+        let prlctl = crate::vm::prlctl_for(app).ok_or(Error::BrowserMissing)?;
+        let pvm = crate::vm::find_pvm(&unlocked.mountpoint)
+            .ok_or(Error::Invalid("no virtual machine in this vault"))?;
+        let uuid =
+            crate::vm::vm_uuid(&pvm).ok_or(Error::Invalid("no virtual machine in this vault"))?;
+        mkdir_700(&self.root.join("run"))?;
+        fs::write(
+            self.vm_marker(&unlocked.header.vault_id),
+            crate::vm::marker_text(&prlctl, &uuid),
+        )?;
+        crate::vm::register(&prlctl, &pvm)?;
+        crate::vm::start(&prlctl, &uuid)?;
+        let _ = std::process::Command::new("/usr/bin/open")
+            .arg("-a")
+            .arg(app)
+            .status();
+        crate::trace::emit("vm: started");
+        Ok(browser::Launched::Vm { prlctl, uuid })
     }
 
     /// Record a new browser PID for an open vault (the browser relaunched
@@ -642,6 +721,18 @@ impl Store {
     pub fn lock(&self, id: &str) -> Result<()> {
         check_id(id)?;
         crate::trace::emit(&format!("lock {id}: start"));
+        // A VM is suspended (memory into the vault), never killed; if that
+        // fails the vault stays open rather than pulling the plug on it.
+        if let Some((prlctl, uuid)) = fs::read_to_string(self.vm_marker(id))
+            .ok()
+            .and_then(|m| crate::vm::parse_marker(&m))
+        {
+            crate::trace::emit(&format!("lock {id}: suspending the VM"));
+            crate::vm::suspend(&prlctl, &uuid)?;
+            crate::vm::unregister(&prlctl, &uuid);
+            let _ = fs::remove_file(self.vm_marker(id));
+            crate::trace::emit(&format!("lock {id}: VM suspended and unregistered"));
+        }
         if let Some(pid) = self.browser_pid(id) {
             crate::trace::emit(&format!("lock {id}: terminate pid {pid}"));
             let killed = browser::terminate(pid, browser::TERMINATE_GRACE);
@@ -668,6 +759,24 @@ impl Store {
         }
         first_err.map_or(Ok(()), Err)
     }
+}
+
+/// `(prlctl, uuid)` of the VM about to be imported, refusing while it runs.
+fn vm_import_check(roots: &profiles::Roots, profile_id: &str) -> Result<(PathBuf, String)> {
+    let app = browser::detect(Browser::Vm)
+        .and_then(|b| {
+            b.ancestors()
+                .find(|p| p.extension().is_some_and(|e| e == "app"))
+                .map(Path::to_path_buf)
+        })
+        .ok_or(Error::BrowserMissing)?;
+    let prlctl = crate::vm::prlctl_for(&app).ok_or(Error::BrowserMissing)?;
+    let uuid = crate::vm::vm_uuid(&roots.parallels_dir().join(profile_id))
+        .ok_or(Error::Invalid("not a Parallels virtual machine"))?;
+    if crate::vm::status(&prlctl, &uuid).is_some_and(|s| crate::vm::is_active(&s)) {
+        return Err(Error::BrowserRunning);
+    }
+    Ok((prlctl, uuid))
 }
 
 #[cfg(test)]

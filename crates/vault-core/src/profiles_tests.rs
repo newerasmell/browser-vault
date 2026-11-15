@@ -1031,3 +1031,35 @@ fn telegram_vault_instance_is_not_the_regular_one() {
     assert!(!regular_running_in(Browser::Telegram, vault));
     assert!(!regular_running_in(Browser::Brave, regular));
 }
+
+#[test]
+fn parallels_vms_detect_import_and_targets() {
+    let (d, roots) = fake_home();
+    let par = roots.parallels_dir();
+    write(
+        &par.join("Windows 11 Work.pvm/config.pvs"),
+        b"<VmUuid>{5681d811-e628-4c9b-9e4e-46a5cec0418a}</VmUuid>",
+    );
+    write(&par.join("Windows 11 Work.pvm/harddisk.hdd/data"), b"disk");
+    write(&par.join("notes.txt"), b"not a vm");
+    let found = detect_profiles_in(&roots, Browser::Vm).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, "Windows 11 Work.pvm");
+    assert_eq!(found[0].name, "Windows 11 Work");
+
+    let m = mnt(&d);
+    import_profile(&roots, Browser::Vm, "Windows 11 Work.pvm", &m, &ignore).unwrap();
+    assert_eq!(
+        fs::read(m.join("profile/Windows 11 Work.pvm/harddisk.hdd/data")).unwrap(),
+        b"disk"
+    );
+    assert_eq!(
+        crate::vm::find_pvm(&m),
+        Some(m.join("profile/Windows 11 Work.pvm"))
+    );
+    let t = targets(&roots, Browser::Vm, "Windows 11 Work.pvm").unwrap();
+    assert_eq!(t.profiles, vec![(par.join("Windows 11 Work.pvm"), None)]);
+    for bad in ["../x.pvm", "x", ".pvm", "a/b.pvm"] {
+        assert!(targets(&roots, Browser::Vm, bad).is_err(), "{bad}");
+    }
+}

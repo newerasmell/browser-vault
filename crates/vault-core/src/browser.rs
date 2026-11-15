@@ -24,6 +24,8 @@ pub enum Browser {
     WhatsApp,
     /// Slack desktop (slack.com, `com.tinyspeck.slackmacgap`, Electron).
     Slack,
+    /// A Parallels Desktop virtual machine (see `vm.rs`).
+    Vm,
 }
 
 impl Browser {
@@ -34,6 +36,7 @@ impl Browser {
             Browser::Telegram => "telegram",
             Browser::WhatsApp => "whatsapp",
             Browser::Slack => "slack",
+            Browser::Vm => "vm",
         }
     }
 
@@ -58,6 +61,7 @@ impl Browser {
             "telegram" => Some(Browser::Telegram),
             "whatsapp" => Some(Browser::WhatsApp),
             "slack" => Some(Browser::Slack),
+            "vm" => Some(Browser::Vm),
             _ => None,
         }
     }
@@ -69,6 +73,7 @@ impl Browser {
             Browser::Firefox => ("Firefox.app", "firefox"),
             Browser::Telegram => ("Telegram.app", "Telegram"),
             Browser::Slack => ("Slack.app", "Slack"),
+            Browser::Vm => ("Parallels Desktop.app", "prl_client_app"),
         }
     }
 
@@ -78,6 +83,7 @@ impl Browser {
             Browser::Firefox => "https://www.mozilla.org/firefox/new/",
             Browser::Telegram => "https://desktop.telegram.org/",
             Browser::Slack => "https://slack.com/downloads/mac",
+            Browser::Vm => "https://www.parallels.com/products/desktop/",
         }
     }
 }
@@ -96,6 +102,7 @@ pub fn required_bundle_id(browser: Browser) -> Option<&'static str> {
         Browser::Telegram => Some("com.tdesktop.Telegram"),
         // The App Store Slack is sandboxed as well.
         Browser::Slack => Some("com.tinyspeck.slackmacgap"),
+        Browser::Vm => Some("com.parallels.desktop.console"),
         Browser::Brave | Browser::Firefox | Browser::WhatsApp => None,
     }
 }
@@ -241,6 +248,8 @@ pub fn launch_args(browser: Browser, mnt: &Path) -> Result<Vec<OsString>> {
         // Electron: user data (session, cache, logs, Crashpad) follows
         // Chromium's --user-data-dir.
         Browser::Slack => Ok(vec![user_data()]),
+        // Started through prlctl, not with arguments (see `vm.rs`).
+        Browser::Vm => Ok(vec![]),
     }
 }
 
@@ -252,7 +261,9 @@ pub const WHATSAPP_URL: &str = "https://web.whatsapp.com/";
 /// `~/Library/Application Support/Firefox/Crash Reports`.
 pub fn launch_env(browser: Browser) -> Vec<(&'static str, &'static str)> {
     match browser {
-        Browser::Brave | Browser::Telegram | Browser::WhatsApp | Browser::Slack => vec![],
+        Browser::Brave | Browser::Telegram | Browser::WhatsApp | Browser::Slack | Browser::Vm => {
+            vec![]
+        }
         Browser::Firefox => vec![("MOZ_CRASHREPORTER_DISABLE", "1")],
     }
 }
@@ -373,6 +384,9 @@ pub enum Launched {
     Child(Child),
     /// Started through the platform launcher.
     Pid(u32),
+    /// A Parallels VM: no process of ours to watch; its state comes from
+    /// `prlctl status`.
+    Vm { prlctl: PathBuf, uuid: String },
 }
 
 impl Launched {
@@ -380,6 +394,15 @@ impl Launched {
         match self {
             Launched::Child(c) => c.id(),
             Launched::Pid(p) => *p,
+            Launched::Vm { .. } => 0,
+        }
+    }
+
+    /// `(prlctl, uuid)` for a VM vault.
+    pub fn vm(&self) -> Option<(PathBuf, String)> {
+        match self {
+            Launched::Vm { prlctl, uuid } => Some((prlctl.clone(), uuid.clone())),
+            _ => None,
         }
     }
 
@@ -392,6 +415,17 @@ impl Launched {
             Launched::Pid(p) => {
                 while is_alive(p as i32) {
                     sleep(Duration::from_millis(500));
+                }
+            }
+            // Down (suspended or shut down) on two checks in a row.
+            Launched::Vm { prlctl, uuid } => {
+                let mut down = 0;
+                while down < 2 {
+                    sleep(Duration::from_secs(3));
+                    match crate::vm::status(&prlctl, &uuid) {
+                        Some(s) if crate::vm::is_active(&s) => down = 0,
+                        _ => down += 1,
+                    }
                 }
             }
         }

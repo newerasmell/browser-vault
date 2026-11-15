@@ -242,3 +242,11 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 - **Диагностичен лог:** Settings → Privacy → „Diagnostic log“. Винаги изключен в призрачен режим; изключването изтрива `app.log` и `app.log.1`.
 - **Запис за изтегляне:** при всеки старт приложението трие от `~/Library/Preferences/com.apple.LaunchServices.QuarantineEventsV2` записите, чийто URL съдържа `browser-vault` (DMG/artifact от GitHub). Историята на браузъра не се пипа.
 - **LaunchServices:** при заключване `lsregister -u` за всяко `.app` в `<mnt>/app` (собствените копия на сейфа); при смяна на маскировка и при обновяване — за старите копия, преди да отидат в кошчето.
+
+## Сейф за виртуална машина (Parallels)
+
+- Тип `vm`: Parallels Desktop (`com.parallels.desktop.console`, Pro/Business, нужен `prlctl`). Целият `.pvm` е в `<mnt>/profile/<Name>.pvm`.
+- Създаване: само с импорт на VM от `~/Parallels` (VM-ът трябва да е suspended/stopped, Parallels Desktop затворен). Копира се с проверка на `config.pvs`; оригиналът се отписва от Parallels (`prlctl unregister`), файловете му остават до „Delete original“.
+- Отключване: `prlctl register <pvm> --preserve-uuid` (преместен, не копиран: Windows активацията и MAC адресите остават), `prlctl start` (resume), отваря Parallels. Маркер `run/<id>.vm` (prlctl + UUID).
+- Заключване: `prlctl suspend` (паметта отива в сейфа), `prlctl unregister`, после detach. Ако suspend не успее, сейфът остава отворен — никога не се „дърпа захранването“. Crash guard-ът прави същото преди да убива процеси.
+- Наблюдение: `prlctl status` на всеки 3 s; VM изключен/приспан → сейфът се заключва.

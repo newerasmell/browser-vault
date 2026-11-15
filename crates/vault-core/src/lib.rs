@@ -22,6 +22,7 @@ pub mod store;
 pub mod totp;
 pub mod trace;
 pub mod traces;
+pub mod vm;
 
 pub use browser::Browser;
 pub use error::{Error, Result};

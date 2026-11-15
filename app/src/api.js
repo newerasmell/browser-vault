@@ -52,6 +52,7 @@ const WORDS = 'orbit velvet canyon mirror stable pepper ladder violin thunder co
   'silver planet frozen meadow rocket island garden copper winter shadow bamboo lantern';
 let fails = 0;
 const MOCK_PROFILES = {
+  vm: [{ id: 'Windows 11 Personal.pvm', name: 'Windows 11 Personal', sizeMb: 172032 }, { id: 'Windows 11 Work.pvm', name: 'Windows 11 Work', sizeMb: 51200 }],
   brave: [{ id: 'Default', name: 'Default', sizeMb: 842 }, { id: 'Profile 1', name: 'Work', sizeMb: 311 },
     { id: 'Profile 2', name: 'Ads', sizeMb: 204 }],
   firefox: [{ id: 'default-release', name: 'default-release', sizeMb: 516 }]
@@ -66,7 +67,8 @@ const mock = {
     firefox: { found: true, path: '/Applications/Firefox.app' },
     telegram: { found: true, path: '/Applications/Telegram.app' },
     whatsapp: { found: true, path: '/Applications/Brave Browser.app' },
-    slack: { found: true, path: '/Applications/Slack.app' }
+    slack: { found: true, path: '/Applications/Slack.app' },
+    vm: { found: true, path: '/Applications/Parallels Desktop.app' }
   }),
   open_window: async ({ view, params }) => {
     location.hash = view + (params ? '?' + new URLSearchParams(params) : '');

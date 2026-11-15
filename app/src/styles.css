@@ -129,6 +129,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; }
 .badge-firefox { background: linear-gradient(140deg, #ffa436, #8c3dd8); }
 .badge-telegram { background: linear-gradient(140deg, #3fb6f0, #1f7fc4); }
 .badge-whatsapp { background: linear-gradient(140deg, #4fd57a, #1e9e57); }
+.badge-vm { background: linear-gradient(140deg, #e8483b, #a81f1f); }
 .badge-slack { background: linear-gradient(140deg, #8a4fb3, #4a1d5e); }
 .badge-unknown { background: var(--muted, #8a8f98); }
 .status { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px; white-space: nowrap; }

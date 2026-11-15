@@ -115,6 +115,11 @@ impl Roots {
         self.home.join("Library/Caches/Firefox")
     }
 
+    /// Parallels Desktop's default folder for VM bundles.
+    pub fn parallels_dir(&self) -> PathBuf {
+        self.home.join("Parallels")
+    }
+
     /// Telegram Desktop's default working directory (`tdata` inside).
     pub fn telegram_data(&self) -> PathBuf {
         self.home
@@ -127,6 +132,7 @@ impl Roots {
             Browser::Firefox => "org.mozilla.firefox.savedState",
             Browser::Telegram => "com.tdesktop.Telegram.savedState",
             Browser::Slack => "com.tinyspeck.slackmacgap.savedState",
+            Browser::Vm => "com.parallels.desktop.console.savedState",
         };
         self.home
             .join("Library/Saved Application State")
@@ -207,6 +213,26 @@ pub fn detect_profiles_in(roots: &Roots, browser: Browser) -> Result<Vec<Detecte
         }
         // Nothing to import: these start with a fresh sign-in.
         Browser::WhatsApp | Browser::Slack => {}
+        // Each VM bundle in ~/Parallels.
+        Browser::Vm => {
+            if let Ok(rd) = fs::read_dir(roots.parallels_dir()) {
+                for e in rd.flatten() {
+                    let path = e.path();
+                    let Some(id) = e.file_name().to_str().map(str::to_string) else {
+                        continue;
+                    };
+                    if check_vm_id(&id).is_err() || !is_real_dir(&path) {
+                        continue;
+                    }
+                    out.push(DetectedProfile {
+                        name: id.trim_end_matches(".pvm").to_string(),
+                        id,
+                        size_bytes: dir_size(&path),
+                        path,
+                    });
+                }
+            }
+        }
         // One session per working directory: its `tdata`.
         Browser::Telegram => {
             let path = roots.telegram_data().join(TELEGRAM_PROFILE);
@@ -229,6 +255,17 @@ fn find_profile(roots: &Roots, browser: Browser, id: &str) -> Result<DetectedPro
         .into_iter()
         .find(|p| p.id == id)
         .ok_or(Error::NotFound)
+}
+
+/// A VM bundle name directly in ~/Parallels: `<name>.pvm`, one component.
+fn check_vm_id(id: &str) -> Result<()> {
+    let mut c = Path::new(id).components();
+    match (c.next(), c.next()) {
+        (Some(Component::Normal(_)), None) if !id.starts_with('.') && id.ends_with(".pvm") => {
+            Ok(())
+        }
+        _ => Err(Error::Invalid("bad profile id")),
+    }
 }
 
 fn check_brave_id(id: &str) -> Result<()> {
@@ -306,6 +343,7 @@ pub fn regular_running_in(browser: Browser, ps: &str) -> bool {
         Browser::Firefox => "/Contents/MacOS/firefox",
         Browser::Telegram => "/Contents/MacOS/Telegram",
         Browser::Slack => "/Contents/MacOS/Slack",
+        Browser::Vm => "/Contents/MacOS/prl_client_app",
     };
     ps.lines().any(|line| {
         let line = line.trim();
@@ -367,6 +405,7 @@ fn key_files(browser: Browser) -> &'static [&'static str] {
         // The local key that decrypts the rest of tdata.
         Browser::Telegram => &["key_datas"],
         Browser::WhatsApp | Browser::Slack => &[],
+        Browser::Vm => &["config.pvs"],
     }
 }
 
@@ -379,6 +418,8 @@ pub fn import_destination(browser: Browser, mnt: &Path) -> PathBuf {
         Browser::Firefox => browser::profile_dir(mnt),
         Browser::Telegram => browser::profile_dir(mnt).join(TELEGRAM_PROFILE),
         Browser::WhatsApp | Browser::Slack => browser::profile_dir(mnt),
+        // Set per VM in `import_with_hook` (the bundle keeps its name).
+        Browser::Vm => browser::profile_dir(mnt),
     }
 }
 
@@ -418,7 +459,12 @@ pub(crate) fn import_with_hook(
         return import_all_brave(roots, mnt, notify, after_copy);
     }
     let src = find_profile(roots, browser, profile_id)?;
-    let dst = import_destination(browser, mnt);
+    let dst = if browser == Browser::Vm {
+        check_vm_id(profile_id)?;
+        browser::profile_dir(mnt).join(profile_id)
+    } else {
+        import_destination(browser, mnt)
+    };
     if fs::read_dir(&dst)
         .map(|mut d| d.next().is_some())
         .unwrap_or(false)
@@ -882,6 +928,13 @@ pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<Clea
             })
         }
         Browser::WhatsApp | Browser::Slack => Err(Error::Invalid(ERR_NO_IMPORT)),
+        Browser::Vm => {
+            check_vm_id(profile_id)?;
+            Ok(CleanupTargets {
+                profiles: vec![(roots.parallels_dir().join(profile_id), None)],
+                saved_state,
+            })
+        }
         // The whole default working directory (tdata, pending updates,
         // logs): it only ever holds the one session that was imported.
         Browser::Telegram => {
@@ -1051,7 +1104,7 @@ pub fn cleanup_original(
         Browser::Brave => brave_forget_profiles(roots, &ids)?,
         Browser::Firefox => firefox_forget_profile(roots, &o.profile_id)?,
         // No profile list to edit.
-        Browser::Telegram | Browser::WhatsApp | Browser::Slack => {}
+        Browser::Telegram | Browser::WhatsApp | Browser::Slack | Browser::Vm => {}
     }
     notify(Event::CleanupProgress { pct: 20 });
     let n = t.profiles.len().max(1);

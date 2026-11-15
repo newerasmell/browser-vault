@@ -40,11 +40,13 @@ const ICONS = {
 const icon = (name, cls = '') =>
   h('span', { class: 'ico ' + cls, svg: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[name]}</svg>` });
 
-const BROWSERS = { brave: 'Brave', firefox: 'Firefox', telegram: 'Telegram', whatsapp: 'WhatsApp', slack: 'Slack' };
+const BROWSERS = { brave: 'Brave', firefox: 'Firefox', telegram: 'Telegram', whatsapp: 'WhatsApp', slack: 'Slack', vm: 'Parallels VM' };
 // Kinds that run inside another installed app (WhatsApp Web runs in Brave).
 const ENGINE = { whatsapp: 'brave' };
 // Kinds that start with a fresh sign-in (nothing to import).
 const NO_IMPORT = new Set(['whatsapp', 'slack']);
+// Kinds that only make sense with an import (the VM is moved into the vault).
+const IMPORT_REQUIRED = new Set(['vm']);
 const fmtSize = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB');
 // A vault's name/browser are null when its header keeps them encrypted and
 // this Mac has no index entry yet (shown as "Locked vault" until unlocked).
@@ -281,7 +283,8 @@ async function viewWizard() {
   const profiles = {
     brave: browsers.brave.found ? await api('detect_profiles', { browser: 'brave' }) : [],
     firefox: browsers.firefox.found ? await api('detect_profiles', { browser: 'firefox' }) : [],
-    telegram: browsers.telegram?.found ? await api('detect_profiles', { browser: 'telegram' }) : []
+    telegram: browsers.telegram?.found ? await api('detect_profiles', { browser: 'telegram' }) : [],
+    vm: browsers.vm?.found ? await api('detect_profiles', { browser: 'vm' }) : []
   };
   const w = {
     step: 0, draftId: null, name: '', browser: Object.keys(BROWSERS).find((b) => browsers[b]?.found) ?? 'brave',
@@ -494,14 +497,26 @@ async function viewWizard() {
     return out;
   }
 
+  // A VM vault needs room for the whole VM plus growth (the image only
+  // takes the space actually used).
+  function vmSizeGb() {
+    const pr = (profiles.vm ?? []).find((p) => p.id === w.importProfileId);
+    return pr ? Math.max(20, Math.ceil((pr.sizeMb / 1024) * 1.3 / 10) * 10) : 0;
+  }
+
   function options() {
     const choices = importChoices();
     if (!choices.some((c) => c.id === w.importProfileId)) w.importProfileId = choices[0]?.id ?? null;
+    if (IMPORT_REQUIRED.has(w.browser)) {
+      w.importProfile = choices.length > 0;
+      w.sizeGb = Math.max(w.sizeGb, vmSizeGb());
+    }
+    const maxGb = Math.max(1000, w.sizeGb);
     const sizeVal = h('output', {}, w.sizeGb + ' GB');
     return h('form', { class: 'form' },
       h('div', { class: 'field' },
         h('span', {}, t('size'), sizeVal),
-        h('input', { type: 'range', min: 5, max: 200, step: 5, value: w.sizeGb, class: 'range',
+        h('input', { type: 'range', min: 5, max: maxGb, step: 5, value: w.sizeGb, class: 'range',
           oninput: (e) => { w.sizeGb = +e.target.value; sizeVal.textContent = w.sizeGb + ' GB'; } }),
         h('small', { class: 'muted' }, t('size_hint'))),
       h('div', { class: 'group' },
@@ -509,24 +524,26 @@ async function viewWizard() {
         toggle(t('lock_screen'), w.lockOnScreenLock, (v) => (w.lockOnScreenLock = v)),
         w.mode === 'fido2' && toggle(t('lock_key_removal'), w.lockOnKeyRemoval, (v) => (w.lockOnKeyRemoval = v)),
         w.browser === 'firefox' && toggle(t('disable_fxa'), w.disableFxa, (v) => (w.disableFxa = v)),
-        NO_IMPORT.has(w.browser) ? null
+        NO_IMPORT.has(w.browser) || IMPORT_REQUIRED.has(w.browser) ? null
           : w.browser === 'telegram'
           ? toggle(t('import_telegram'), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_telegram_hint'))
           : toggle(t('import_profile', { browser: BROWSERS[w.browser] }), w.importProfile, (v) => { w.importProfile = v; render(); }, t('import_hint')),
         w.importProfile && choices.length && h('div', { class: 'toggle-row' },
           h('span', { class: 'toggle-text' }, t('import_which')),
-          h('select', { class: 'input select', onchange: (e) => { w.importProfileId = e.target.value; render(); } },
+          h('select', { class: 'input select', onchange: (e) => { w.importProfileId = e.target.value; if (IMPORT_REQUIRED.has(w.browser)) w.sizeGb = 0; render(); } },
             choices.map((c) => h('option', { value: c.id, selected: c.id === w.importProfileId }, c.label)))),
         w.importProfile && w.importProfileId === ALL_PROFILES &&
           h('small', { class: 'muted block', style: 'padding:0 12px 10px;margin-top:-4px' }, t('import_all_hint', { browser: BROWSERS[w.browser] }))),
-      w.browser === 'whatsapp'
+      w.browser === 'vm'
+        ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t(choices.length ? 'vm_note_title' : 'vm_none_title')), ' ', t(choices.length ? 'vm_note_body' : 'vm_none_body')))
+        : w.browser === 'whatsapp'
         ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('wa_note_title')), ' ', t('wa_note_body')))
         : w.browser === 'slack'
         ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('slack_note_title')), ' ', t('slack_note_body')))
         : w.browser === 'telegram'
         ? h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('tg_notify_title')), ' ', t('tg_notify_body')))
         : h('div', { class: 'callout' }, icon('alert', 'sm'), h('p', {}, h('strong', {}, t('sync_warn_title')), ' ', t('sync_warn_body'))),
-      nav(true, (e) => { e.preventDefault(); go(5); }, t('create_vault')));
+      nav(!(IMPORT_REQUIRED.has(w.browser) && !choices.length), (e) => { e.preventDefault(); go(5); }, t('create_vault')));
   }
 
   // 6. create
@@ -1025,7 +1042,7 @@ async function viewSettings(params) {
   // The app itself inside the vault (only while unlocked).
   function appBlock(v) {
     // WhatsApp runs in the shared Brave: never offer to move or remove it here.
-    if (v.status !== 'unlocked' || v.appInVault == null || !BROWSERS[v.browser] || ENGINE[v.browser]) return null;
+    if (v.status !== 'unlocked' || v.appInVault == null || !BROWSERS[v.browser] || ENGINE[v.browser] || v.browser === 'vm') return null;
     const app = BROWSERS[v.browser];
     // Browsers are also used for normal browsing: removing one needs a second, explicit click.
     const isBrowser = v.browser === 'brave' || v.browser === 'firefox';
