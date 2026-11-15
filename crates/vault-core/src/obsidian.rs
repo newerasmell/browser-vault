@@ -101,7 +101,28 @@ pub fn write_config(mnt: &Path) -> Result<()> {
     entry.insert("open".into(), Value::Bool(true));
     vaults.insert(ours, Value::Object(entry));
     obj.insert("vaults".into(), Value::Object(vaults));
-    write_json(&path, &cfg)
+    write_json(&path, &cfg)?;
+    keep_deleted_notes_inside(&notes)
+}
+
+/// Obsidian's default sends deleted notes to the macOS Trash (`~/.Trash`):
+/// outside the vault, unencrypted. Force its own `.trash` folder inside the
+/// notes instead, unless the user chose to delete permanently.
+fn keep_deleted_notes_inside(notes: &Path) -> Result<()> {
+    let dir = notes.join(".obsidian");
+    fs::create_dir_all(&dir)?;
+    let app = dir.join("app.json");
+    let mut cfg = read_json(&app)?;
+    if !cfg.is_object() {
+        cfg = json!({});
+    }
+    let obj = cfg.as_object_mut().ok_or(Error::Invalid("app.json"))?;
+    let current = obj.get("trashOption").and_then(Value::as_str);
+    if matches!(current, Some("local") | Some("none")) {
+        return Ok(());
+    }
+    obj.insert("trashOption".into(), Value::String("local".into()));
+    write_json(&app, &cfg)
 }
 
 /// Note folders the regular Obsidian knows (`vaults.*.path`), as listed.
@@ -155,6 +176,33 @@ mod tests {
         assert_eq!(v["path"], mnt.join("notes").to_string_lossy().as_ref());
         assert_eq!(v["open"], true);
         assert!(mnt.join("notes").is_dir());
+        let app = read_json(&mnt.join("notes/.obsidian/app.json")).unwrap();
+        assert_eq!(
+            app["trashOption"], "local",
+            "deleted notes stay in the vault"
+        );
+        // The user's own "delete permanently" is kept; "system" is not.
+        fs::write(
+            mnt.join("notes/.obsidian/app.json"),
+            r#"{"trashOption":"none","x":1}"#,
+        )
+        .unwrap();
+        write_config(&mnt).unwrap();
+        assert_eq!(
+            read_json(&mnt.join("notes/.obsidian/app.json")).unwrap()["trashOption"],
+            "none"
+        );
+        fs::write(
+            mnt.join("notes/.obsidian/app.json"),
+            r#"{"trashOption":"system","x":1}"#,
+        )
+        .unwrap();
+        write_config(&mnt).unwrap();
+        let app = read_json(&mnt.join("notes/.obsidian/app.json")).unwrap();
+        assert_eq!(
+            (app["trashOption"].as_str(), app["x"].as_i64()),
+            (Some("local"), Some(1))
+        );
 
         // The store moved (other disguise): same id, new path.
         let moved = d.path().join("other/mnt/one");
