@@ -354,6 +354,28 @@ pub async fn detect_profiles(browser: String) -> CmdResult<Value> {
     }
 }
 
+/// Pick a Parallels VM bundle anywhere (e.g. an external drive) for a VM
+/// vault import. `null` when cancelled.
+#[tauri::command]
+pub async fn pick_vm(app: AppHandle) -> CmdResult<Option<Value>> {
+    blocking(move || {
+        let picked = app
+            .dialog()
+            .file()
+            .add_filter("Parallels VM", &["pvm"])
+            .set_directory("/Volumes")
+            .blocking_pick_file();
+        let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
+            return Ok(None);
+        };
+        let p = vault_core::profiles::describe_vm(&path).map_err(|_| CmdError::new("not_a_vm"))?;
+        Ok(Some(
+            json!({ "id": p.id, "name": p.name, "sizeMb": bytes_to_mb(p.size_bytes) }),
+        ))
+    })
+    .await
+}
+
 #[tauri::command]
 pub fn focus_browser(app: AppHandle, id: String) -> CmdResult<()> {
     let st = state::get(&app);

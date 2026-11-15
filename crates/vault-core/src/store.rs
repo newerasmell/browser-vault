@@ -771,7 +771,7 @@ fn vm_import_check(roots: &profiles::Roots, profile_id: &str) -> Result<(PathBuf
         })
         .ok_or(Error::BrowserMissing)?;
     let prlctl = crate::vm::prlctl_for(&app).ok_or(Error::BrowserMissing)?;
-    let uuid = crate::vm::vm_uuid(&roots.parallels_dir().join(profile_id))
+    let uuid = crate::vm::vm_uuid(&profiles::vm_source(roots, profile_id)?)
         .ok_or(Error::Invalid("not a Parallels virtual machine"))?;
     if crate::vm::status(&prlctl, &uuid).is_some_and(|s| crate::vm::is_active(&s)) {
         return Err(Error::BrowserRunning);

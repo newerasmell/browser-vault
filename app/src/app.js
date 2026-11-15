@@ -532,6 +532,16 @@ async function viewWizard() {
           h('span', { class: 'toggle-text' }, t('import_which')),
           h('select', { class: 'input select', onchange: (e) => { w.importProfileId = e.target.value; if (IMPORT_REQUIRED.has(w.browser)) w.sizeGb = 0; render(); } },
             choices.map((c) => h('option', { value: c.id, selected: c.id === w.importProfileId }, c.label)))),
+        w.browser === 'vm' && h('div', { class: 'toggle-row' },
+          h('span', { class: 'toggle-text' }, t('vm_pick_other'), h('small', {}, t('vm_pick_hint'))),
+          h('button', { class: 'btn sm ghost', type: 'button', onclick: async () => {
+            try {
+              const vm = await api('pick_vm');
+              if (!vm) return;
+              profiles.vm = [...(profiles.vm ?? []).filter((p) => p.id !== vm.id), vm];
+              w.importProfileId = vm.id; w.sizeGb = 0; render();
+            } catch { toast(t('err_not_a_vm'), 'bad'); }
+          } }, t('choose'))),
         w.importProfile && w.importProfileId === ALL_PROFILES &&
           h('small', { class: 'muted block', style: 'padding:0 12px 10px;margin-top:-4px' }, t('import_all_hint', { browser: BROWSERS[w.browser] }))),
       w.browser === 'vm'

@@ -251,10 +251,47 @@ pub fn detect_profiles_in(roots: &Roots, browser: Browser) -> Result<Vec<Detecte
 }
 
 fn find_profile(roots: &Roots, browser: Browser, id: &str) -> Result<DetectedProfile> {
+    if browser == Browser::Vm && Path::new(id).is_absolute() {
+        return describe_vm(Path::new(id));
+    }
     detect_profiles_in(roots, browser)?
         .into_iter()
         .find(|p| p.id == id)
         .ok_or(Error::NotFound)
+}
+
+/// A VM bundle chosen anywhere (e.g. on an external drive): an absolute
+/// path to a real `<name>.pvm` directory (no symlink, no `..`) that holds a
+/// `config.pvs`. Its id is that path.
+pub fn describe_vm(path: &Path) -> Result<DetectedProfile> {
+    let s = path.to_string_lossy();
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        || check_vm_id(name).is_err()
+        || !is_real_dir(path)
+        || !path.join("config.pvs").is_file()
+    {
+        return Err(Error::Invalid("not a Parallels virtual machine"));
+    }
+    Ok(DetectedProfile {
+        id: s.into_owned(),
+        name: name.trim_end_matches(".pvm").to_string(),
+        size_bytes: dir_size(path),
+        path: path.to_path_buf(),
+    })
+}
+
+/// Where a VM id points: a name in ~/Parallels, or an absolute path
+/// (see [`describe_vm`]).
+pub fn vm_source(roots: &Roots, id: &str) -> Result<PathBuf> {
+    if Path::new(id).is_absolute() {
+        return describe_vm(Path::new(id)).map(|d| d.path);
+    }
+    check_vm_id(id)?;
+    Ok(roots.parallels_dir().join(id))
 }
 
 /// A VM bundle name directly in ~/Parallels: `<name>.pvm`, one component.
@@ -460,8 +497,12 @@ pub(crate) fn import_with_hook(
     }
     let src = find_profile(roots, browser, profile_id)?;
     let dst = if browser == Browser::Vm {
-        check_vm_id(profile_id)?;
-        browser::profile_dir(mnt).join(profile_id)
+        // The bundle keeps its name inside the vault.
+        let name = src
+            .path
+            .file_name()
+            .ok_or(Error::Invalid("bad profile id"))?;
+        browser::profile_dir(mnt).join(name)
     } else {
         import_destination(browser, mnt)
     };
@@ -928,13 +969,10 @@ pub fn targets(roots: &Roots, browser: Browser, profile_id: &str) -> Result<Clea
             })
         }
         Browser::WhatsApp | Browser::Slack => Err(Error::Invalid(ERR_NO_IMPORT)),
-        Browser::Vm => {
-            check_vm_id(profile_id)?;
-            Ok(CleanupTargets {
-                profiles: vec![(roots.parallels_dir().join(profile_id), None)],
-                saved_state,
-            })
-        }
+        Browser::Vm => Ok(CleanupTargets {
+            profiles: vec![(vm_source(roots, profile_id)?, None)],
+            saved_state,
+        }),
         // The whole default working directory (tdata, pending updates,
         // logs): it only ever holds the one session that was imported.
         Browser::Telegram => {

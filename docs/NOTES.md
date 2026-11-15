@@ -246,7 +246,7 @@ BVAULT_HOME=/tmp/bv npx @tauri-apps/cli@2 dev   # отделна папка за
 ## Сейф за виртуална машина (Parallels)
 
 - Тип `vm`: Parallels Desktop (`com.parallels.desktop.console`, Pro/Business, нужен `prlctl`). Целият `.pvm` е в `<mnt>/profile/<Name>.pvm`.
-- Създаване: само с импорт на VM от `~/Parallels` (VM-ът трябва да е suspended/stopped, Parallels Desktop затворен). Копира се с проверка на `config.pvs`; оригиналът се отписва от Parallels (`prlctl unregister`), файловете му остават до „Delete original“.
+- Създаване: само с импорт на VM от `~/Parallels` или от друго място („A VM from another place“, напр. външен диск; id = абсолютният път към `.pvm`, валидиран: истинска папка, не symlink, с `config.pvs`) (VM-ът трябва да е suspended/stopped, Parallels Desktop затворен). Копира се с проверка на `config.pvs`; оригиналът се отписва от Parallels (`prlctl unregister`), файловете му остават до „Delete original“.
 - Отключване: `prlctl register <pvm> --preserve-uuid` (преместен, не копиран: Windows активацията и MAC адресите остават), `prlctl start` (resume), отваря Parallels. Маркер `run/<id>.vm` (prlctl + UUID).
 - Заключване: `prlctl suspend` (паметта отива в сейфа), `prlctl unregister`, после detach. Ако suspend не успее, сейфът остава отворен — никога не се „дърпа захранването“. Crash guard-ът прави същото преди да убива процеси.
 - Наблюдение: `prlctl status` на всеки 3 s; VM изключен/приспан → сейфът се заключва.

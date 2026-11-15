@@ -76,6 +76,7 @@ const mock = {
   close_window: async () => { location.hash = 'tray'; },
   focus_browser: async () => {},
   install_update: async () => null,
+  pick_vm: async () => null,
   move_app_into_vault: async () => ({ ok: true }),
   remove_app_outside: async () => ({ ok: true }),
   quit_app: async () => {},

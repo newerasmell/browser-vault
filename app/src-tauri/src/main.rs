@@ -121,6 +121,7 @@ fn main() {
             commands::action_end,
             commands::ui_log,
             commands::install_update,
+            commands::pick_vm,
             commands::move_app_into_vault,
             commands::remove_app_outside,
             commands::detect_profiles,

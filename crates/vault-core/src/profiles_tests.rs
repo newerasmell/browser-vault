@@ -1063,3 +1063,44 @@ fn parallels_vms_detect_import_and_targets() {
         assert!(targets(&roots, Browser::Vm, bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn vm_from_another_location() {
+    let (d, roots) = fake_home();
+    let ext = d.path().join("Volumes/Ext/Windows 11 Personal.pvm");
+    write(
+        &ext.join("config.pvs"),
+        b"<VmUuid>{a3761211-d92e-4f48-8528-6ddc68eee96c}</VmUuid>",
+    );
+    write(&ext.join("disk.hdd/data"), b"big");
+    let id = ext.to_string_lossy().into_owned();
+    let found = describe_vm(&ext).unwrap();
+    assert_eq!(
+        (found.id.as_str(), found.name.as_str()),
+        (id.as_str(), "Windows 11 Personal")
+    );
+
+    let m = mnt(&d);
+    import_profile(&roots, Browser::Vm, &id, &m, &ignore).unwrap();
+    assert_eq!(
+        fs::read(m.join("profile/Windows 11 Personal.pvm/disk.hdd/data")).unwrap(),
+        b"big"
+    );
+    let t = targets(&roots, Browser::Vm, &id).unwrap();
+    assert_eq!(t.profiles, vec![(ext.clone(), None)]);
+
+    // Not a VM bundle, relative, `..`, or missing config: refused.
+    let plain = d.path().join("Volumes/Ext/photos.pvm");
+    fs::create_dir_all(&plain).unwrap();
+    for bad in [
+        plain.to_string_lossy().into_owned(),
+        "Volumes/Ext/Windows 11 Personal.pvm".into(),
+        format!(
+            "{}/../Ext/Windows 11 Personal.pvm",
+            d.path().join("Volumes/Ext").display()
+        ),
+        d.path().join("Volumes/Ext").to_string_lossy().into_owned(),
+    ] {
+        assert!(targets(&roots, Browser::Vm, &bad).is_err(), "{bad}");
+    }
+}
