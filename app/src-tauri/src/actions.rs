@@ -414,6 +414,33 @@ pub fn reset_confirm(app: &AppHandle, token: &str, code: Zeroizing<String>) -> C
 
 // ---------------------------------------------------------------- portable Brave logins
 
+/// Brave 158+: move a portable Brave vault back to Brave's standard
+/// Keychain key (vault must be locked). macOS asks once for access to
+/// "Brave Safe Storage".
+pub fn repair_logins(app: &AppHandle, token: &str) -> CmdResult<Value> {
+    let st = state::get(app);
+    with_ctx(app, token, |c| {
+        let stats = st
+            .store
+            .repair_brave_logins(&c.id, &c.key)
+            .map_err(|e| match e {
+                vault_core::Error::Invalid(m) if m == vault_core::store::ERR_LOCK_FIRST => {
+                    CmdError::new("lock_first")
+                }
+                vault_core::Error::Invalid(m) if m == vault_core::portable::ERR_KEYCHAIN => {
+                    CmdError::new("keychain_denied")
+                }
+                other => other.into(),
+            })?;
+        lockctl::vaults_changed(app);
+        applog::log(&format!(
+            "logins repaired for {}: {} converted, {} not readable",
+            c.id, stats.converted, stats.failed
+        ));
+        Ok(json!({ "converted": stats.converted, "failed": stats.failed }))
+    })
+}
+
 /// Convert an existing Brave vault's logins to the portable key (vault must
 /// be locked). macOS asks once for access to "Brave Safe Storage".
 pub fn make_portable(app: &AppHandle, token: &str) -> CmdResult<Value> {

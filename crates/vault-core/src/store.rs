@@ -374,8 +374,10 @@ impl Store {
         // imported profile becomes portable only if its logins can be
         // converted below.
         // (Only a Brave import brings logins keyed to this Mac.)
-        settings.portable_keys =
-            browser.is_chromium() && (opts.import.is_none() || browser != Browser::Brave);
+        // Brave 158+ no longer keeps logins in mock-keychain mode (see
+        // `portable::unportable_mount`), so Brave vaults use the standard
+        // Keychain key; Electron apps (Slack, Obsidian) still work portable.
+        settings.portable_keys = browser.is_chromium() && browser.engine() != Browser::Brave;
         let nv = draft.finish(settings)?;
         let id = nv.header.vault_id.clone();
         mkdir_700(&self.root)?;
@@ -532,6 +534,39 @@ impl Store {
         detached?;
         header.upgrade(key.vmk())?;
         header.meta_mut()?.settings.portable_keys = true;
+        header.seal_mac(key.vmk())?;
+        self.save_header(&header)?;
+        Ok(stats)
+    }
+
+    /// Undo portable logins for a Brave-engine vault (see
+    /// [`crate::portable::unportable_mount`]). The vault must be locked.
+    pub fn repair_brave_logins(
+        &self,
+        id: &str,
+        key: &UnlockedKey,
+    ) -> Result<crate::portable::Stats> {
+        let mut header = self.load(id)?;
+        if !header.verify_mac(key.vmk()) {
+            return Err(Error::Invalid("header was modified outside the app"));
+        }
+        header.open_meta(key.vmk())?;
+        if header.meta()?.browser.engine() != Browser::Brave {
+            return Err(Error::Invalid("only Brave vaults need this"));
+        }
+        let mnt = self.mountpoint(id);
+        if hdiutil::is_mounted(&mnt) {
+            return Err(Error::Invalid(ERR_LOCK_FIRST));
+        }
+        mkdir_700(&self.root.join("mnt"))?;
+        mkdir_700(&mnt)?;
+        hdiutil::attach(&self.image_path(id), &mnt, &key.disk_key_hex())?;
+        let r = crate::portable::unportable_mount(&mnt, crate::portable::brave_keychain_key);
+        let detached = hdiutil::detach_with_retries(&mnt);
+        let stats = r?;
+        detached?;
+        header.upgrade(key.vmk())?;
+        header.meta_mut()?.settings.portable_keys = false;
         header.seal_mac(key.vmk())?;
         self.save_header(&header)?;
         Ok(stats)

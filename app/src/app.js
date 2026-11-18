@@ -941,6 +941,19 @@ async function viewSettings(params) {
       }
     }
 
+    async function repairStep() {
+      const bar = h('div', { class: 'progress' }, h('i', { style: 'width:100%' }));
+      show(...head(t('act_repair_title'), t('act_repair_working')), bar);
+      try {
+        const r = await api('action_repair_logins', { token });
+        done(t('act_repair_done', { n: r.converted }));
+      } catch (e) {
+        const msg = e?.code === 'lock_first' ? t('act_lock_first') : e?.code === 'keychain_denied' ? t('act_keychain_denied') : errMsg(e);
+        show(h('div', { class: 'callout warn' }, icon('alert', 'sm'), h('p', {}, msg)),
+          h('div', { class: 'wiz-nav center' }, h('button', { class: 'btn primary', type: 'button', onclick: close }, t('close'))));
+      }
+    }
+
     function authStep() {
       if (action === 'recovery_reset') return recoveryAuthStep();
       const pw = h('input', { class: 'input', type: 'password', autocomplete: 'current-password' });
@@ -972,6 +985,7 @@ async function viewSettings(params) {
       if (action === 'new_recovery') return recoveryStep();
       if (action === 'add_fido2') return addKeyStep(r.keys || []);
       if (action === 'make_portable') return portableStep();
+      if (action === 'repair_logins') return repairStep();
     }
 
     function passwordStep() {
@@ -1262,7 +1276,9 @@ async function viewSettings(params) {
           act('change_password', t('change_password')),
           v.mode === 'fido2' ? act('add_fido2', t('add_yubikey')) : act('replace_totp', t('replace_authenticator')),
           act('new_recovery', t('new_recovery')),
-          v.browser === 'brave' && !v.portable && act('make_portable', t('act_portable_btn')),
+          // Only Brave vaults: a WhatsApp vault created on Brave 158 already
+          // writes the new format and keeps working as it is.
+          v.browser === 'brave' && v.portable && act('repair_logins', t('act_repair_btn')),
           act('recovery_reset', t('act_recovery_link')),
           act('delete', t('delete_vault'), 'danger push')),
         v.mode === 'fido2' && h('div', { class: 'row' },

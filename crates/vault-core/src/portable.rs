@@ -184,6 +184,33 @@ pub fn convert_mount(mnt: &Path) -> Result<Stats> {
     convert_mount_with(mnt, brave_keychain_key)
 }
 
+/// Brave 158 changed what `--use-mock-keychain` does: it writes a new value
+/// format ("v11") and no longer reads the portable "v10" values, so a
+/// portable vault looked logged out everywhere. This moves a vault back to
+/// Brave's standard storage: every portable `v10` value is re-encrypted with
+/// this Mac's "Brave Safe Storage" key, and the vault then runs without the
+/// mock keychain. Each database is first copied to `<name>.pre-repair`
+/// inside the vault. Values in the new format are left untouched.
+pub fn unportable_mount(mnt: &Path, keychain_key: fn() -> Result<ChromiumKey>) -> Result<Stats> {
+    let to = keychain_key()?;
+    let user_data = browser::profile_dir(mnt);
+    for profile in profile_dirs(&user_data) {
+        for db in DATABASES {
+            let path = profile.join(db);
+            if path.is_file() {
+                let backup = path.with_file_name(format!(
+                    "{}.pre-repair",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("db")
+                ));
+                if !backup.exists() {
+                    std::fs::copy(&path, &backup)?;
+                }
+            }
+        }
+    }
+    convert_user_data(&user_data, &ChromiumKey::mock(), &to)
+}
+
 /// [`convert_mount`] with an explicit source-key provider (see `Roots::brave_key`).
 pub fn convert_mount_with(mnt: &Path, source_key: fn() -> Result<ChromiumKey>) -> Result<Stats> {
     let from = source_key()?;
@@ -233,6 +260,34 @@ mod tests {
             .unwrap();
         let rows = st.query_map([], |r| r.get::<_, Vec<u8>>(0)).unwrap();
         rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn test_mac_key() -> Result<ChromiumKey> {
+        Ok(ChromiumKey::from_password(b"this-mac"))
+    }
+
+    #[test]
+    fn repair_moves_portable_values_to_the_keychain_key() {
+        let d = tempfile::tempdir().unwrap();
+        let mnt = d.path();
+        let db = browser::profile_dir(mnt).join("Default/Network/Cookies");
+        make_db(&db, &ChromiumKey::mock());
+        let stats = unportable_mount(mnt, test_mac_key).unwrap();
+        assert_eq!(stats.converted, 3);
+        let mac = test_mac_key().unwrap();
+        let v = values(&db);
+        assert_eq!(&*chromium::decrypt(&mac, &v[0]).unwrap(), b"alpha");
+        assert!(chromium::decrypt(&ChromiumKey::mock(), &v[0]).is_err());
+        // A copy of the database as it was stays in the vault.
+        let backup = db.with_file_name("Cookies.pre-repair");
+        assert_eq!(
+            &*chromium::decrypt(&ChromiumKey::mock(), &values(&backup)[0]).unwrap(),
+            b"alpha"
+        );
+        // Running it again changes nothing and keeps the first backup.
+        let again = unportable_mount(mnt, test_mac_key).unwrap();
+        assert_eq!(again.converted, 0);
+        assert!(chromium::decrypt(&ChromiumKey::mock(), &values(&backup)[0]).is_ok());
     }
 
     #[test]

@@ -118,6 +118,7 @@ fn main() {
             commands::action_reset_begin,
             commands::action_reset_confirm,
             commands::action_make_portable,
+            commands::action_repair_logins,
             commands::action_end,
             commands::ui_log,
             commands::install_update,

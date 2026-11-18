@@ -163,7 +163,7 @@ fn vault_info(st: &AppState, l: &Listed) -> VaultInfo {
             label.and_then(original_info)
         },
         // Unknown browser: nothing to offer until the first unlock.
-        portable: label.is_none_or(|e| e.browser != Browser::Brave || e.portable_keys),
+        portable: label.is_none_or(|e| e.browser.engine() != Browser::Brave || e.portable_keys),
         app_in_vault: (status == "unlocked")
             .then(|| {
                 label.map(|e| browser::vault_binary(e.browser, &st.store.mountpoint(&id)).is_some())
@@ -1204,6 +1204,11 @@ pub async fn action_reset_confirm(app: AppHandle, token: String, code: String) -
 #[tauri::command]
 pub async fn action_make_portable(app: AppHandle, token: String) -> CmdResult<Value> {
     blocking(move || crate::actions::make_portable(&app, &token)).await
+}
+
+#[tauri::command]
+pub async fn action_repair_logins(app: AppHandle, token: String) -> CmdResult<Value> {
+    blocking(move || crate::actions::repair_logins(&app, &token)).await
 }
 
 #[tauri::command]
