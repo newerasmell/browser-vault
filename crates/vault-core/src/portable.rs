@@ -69,6 +69,139 @@ pub fn brave_keychain_key() -> Result<ChromiumKey> {
 /// The Keychain item could not be read (missing, or the user clicked Deny).
 pub const ERR_KEYCHAIN: &str = "could not read Brave's key from the Keychain";
 
+/// This Mac's "Brave Safe Storage" password, as Brave keeps it.
+pub enum MacKey {
+    Present(zeroize::Zeroizing<Vec<u8>>),
+    /// Brave never ran on this Mac: no item yet.
+    Missing,
+    /// There, but not readable (the user clicked Deny).
+    Unreadable,
+}
+
+pub type MacKeySource = fn() -> MacKey;
+pub type MacKeySet = fn(&[u8]) -> Result<()>;
+
+#[cfg(target_os = "macos")]
+pub fn system_mac_key() -> MacKey {
+    use security_framework::passwords::get_generic_password;
+    match get_generic_password("Brave Safe Storage", "Brave") {
+        Ok(v) => MacKey::Present(zeroize::Zeroizing::new(v)),
+        // errSecItemNotFound
+        Err(e) if e.code() == -25300 => MacKey::Missing,
+        Err(_) => MacKey::Unreadable,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn system_mac_key() -> MacKey {
+    MacKey::Unreadable
+}
+
+/// Create this Mac's "Brave Safe Storage" item with `password` (only when it
+/// does not exist yet). Brave asks once to use it.
+#[cfg(target_os = "macos")]
+pub fn system_set_mac_key(password: &[u8]) -> Result<()> {
+    security_framework::passwords::set_generic_password("Brave Safe Storage", "Brave", password)
+        .map_err(|_| Error::Invalid(ERR_KEYCHAIN))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn system_set_mac_key(_password: &[u8]) -> Result<()> {
+    Err(Error::Unsupported("Keychain"))
+}
+
+/// Where a vault keeps the "Brave Safe Storage" password its logins are
+/// encrypted with (inside the encrypted volume, mode 600).
+pub fn key_file(mnt: &Path) -> PathBuf {
+    mnt.join(".bv").join("brave-key")
+}
+
+/// What [`follow_mac_key`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Followed {
+    /// First time: this Mac's key was recorded.
+    Saved,
+    /// Same Mac (same key): nothing to do.
+    Same,
+    /// Another Mac: logins re-encrypted to this Mac's key.
+    Converted(Stats),
+    /// Brave never ran here: this Mac got the vault's key, no conversion.
+    Installed,
+    /// This Mac's key could not be read; logins stay as they were.
+    Unreadable,
+}
+
+/// Keep a Brave vault's logins readable on whichever Mac opens it (Brave
+/// 158+ has no working Mac-independent mode). Runs after the vault is
+/// mounted and before Brave starts.
+pub fn follow_mac_key(mnt: &Path, current: MacKeySource, set: MacKeySet) -> Result<Followed> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = key_file(mnt);
+    let write = |pw: &[u8]| -> Result<()> {
+        let dir = file.parent().ok_or(Error::Invalid("bad key path"))?;
+        std::fs::create_dir_all(dir)?;
+        let tmp = file.with_extension("tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(pw)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &file)?;
+        Ok(())
+    };
+    let stored = match std::fs::read(&file) {
+        Ok(v) => Some(zeroize::Zeroizing::new(v)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    match (stored, current()) {
+        (None, MacKey::Present(k)) => {
+            write(&k)?;
+            Ok(Followed::Saved)
+        }
+        (None, _) => Ok(Followed::Unreadable),
+        (Some(s), MacKey::Present(k)) if *s == *k => Ok(Followed::Same),
+        (Some(s), MacKey::Present(k)) => {
+            let user_data = browser::profile_dir(mnt);
+            backup_databases(&user_data, "pre-move")?;
+            let stats = convert_user_data(
+                &user_data,
+                &ChromiumKey::from_password(&s),
+                &ChromiumKey::from_password(&k),
+            )?;
+            write(&k)?;
+            Ok(Followed::Converted(stats))
+        }
+        (Some(s), MacKey::Missing) => {
+            set(&s)?;
+            Ok(Followed::Installed)
+        }
+        (Some(_), MacKey::Unreadable) => Ok(Followed::Unreadable),
+    }
+}
+
+/// Copy each Brave database to `<name>.<suffix>` (once) before rewriting it.
+fn backup_databases(user_data: &Path, suffix: &str) -> Result<()> {
+    for profile in profile_dirs(user_data) {
+        for db in DATABASES {
+            let path = profile.join(db);
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("db");
+            let backup = path.with_file_name(format!("{name}.{suffix}"));
+            if !backup.exists() {
+                std::fs::copy(&path, &backup)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -194,20 +327,7 @@ pub fn convert_mount(mnt: &Path) -> Result<Stats> {
 pub fn unportable_mount(mnt: &Path, keychain_key: fn() -> Result<ChromiumKey>) -> Result<Stats> {
     let to = keychain_key()?;
     let user_data = browser::profile_dir(mnt);
-    for profile in profile_dirs(&user_data) {
-        for db in DATABASES {
-            let path = profile.join(db);
-            if path.is_file() {
-                let backup = path.with_file_name(format!(
-                    "{}.pre-repair",
-                    path.file_name().and_then(|n| n.to_str()).unwrap_or("db")
-                ));
-                if !backup.exists() {
-                    std::fs::copy(&path, &backup)?;
-                }
-            }
-        }
-    }
+    backup_databases(&user_data, "pre-repair")?;
     convert_user_data(&user_data, &ChromiumKey::mock(), &to)
 }
 
@@ -264,6 +384,64 @@ mod tests {
 
     fn test_mac_key() -> Result<ChromiumKey> {
         Ok(ChromiumKey::from_password(b"this-mac"))
+    }
+
+    use std::sync::Mutex;
+    static KEYCHAIN: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+    fn fake_get() -> MacKey {
+        match KEYCHAIN.lock().unwrap().clone() {
+            Some(v) => MacKey::Present(zeroize::Zeroizing::new(v)),
+            None => MacKey::Missing,
+        }
+    }
+    fn fake_set(pw: &[u8]) -> Result<()> {
+        *KEYCHAIN.lock().unwrap() = Some(pw.to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn logins_follow_the_mac_that_opens_the_vault() {
+        let d = tempfile::tempdir().unwrap();
+        let mnt = d.path();
+        let db = browser::profile_dir(mnt).join("Default/Network/Cookies");
+        let mac_a = ChromiumKey::from_password(b"mac-a");
+        make_db(&db, &mac_a);
+
+        // Mac A, first unlock: its key is recorded; again: nothing to do.
+        *KEYCHAIN.lock().unwrap() = Some(b"mac-a".to_vec());
+        assert_eq!(
+            follow_mac_key(mnt, fake_get, fake_set).unwrap(),
+            Followed::Saved
+        );
+        assert_eq!(
+            follow_mac_key(mnt, fake_get, fake_set).unwrap(),
+            Followed::Same
+        );
+        assert_eq!(std::fs::read(key_file(mnt)).unwrap(), b"mac-a");
+
+        // Mac B with its own Brave key: logins move to it.
+        *KEYCHAIN.lock().unwrap() = Some(b"mac-b".to_vec());
+        match follow_mac_key(mnt, fake_get, fake_set).unwrap() {
+            Followed::Converted(st) => assert_eq!(st.converted, 3),
+            other => panic!("{other:?}"),
+        }
+        let v = values(&db);
+        let mac_b = ChromiumKey::from_password(b"mac-b");
+        assert_eq!(&*chromium::decrypt(&mac_b, &v[0]).unwrap(), b"alpha");
+        assert!(db.with_file_name("Cookies.pre-move").is_file());
+        assert_eq!(std::fs::read(key_file(mnt)).unwrap(), b"mac-b");
+
+        // Mac C where Brave never ran: it gets the vault's key as is.
+        *KEYCHAIN.lock().unwrap() = None;
+        assert_eq!(
+            follow_mac_key(mnt, fake_get, fake_set).unwrap(),
+            Followed::Installed
+        );
+        assert_eq!(KEYCHAIN.lock().unwrap().as_deref(), Some(&b"mac-b"[..]));
+        assert_eq!(
+            &*chromium::decrypt(&mac_b, &values(&db)[0]).unwrap(),
+            b"alpha"
+        );
     }
 
     #[test]

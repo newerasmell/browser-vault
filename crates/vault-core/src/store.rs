@@ -628,6 +628,18 @@ impl Store {
         if browser == Browser::Obsidian {
             crate::obsidian::write_config(&mnt)?;
         }
+        // Brave vaults on Brave's standard key: keep their logins readable
+        // on whichever Mac opens them (best effort; never blocks an unlock).
+        if browser.engine() == Browser::Brave && !header.meta()?.settings.portable_keys {
+            match crate::portable::follow_mac_key(
+                &mnt,
+                crate::portable::system_mac_key,
+                crate::portable::system_set_mac_key,
+            ) {
+                Ok(f) => crate::trace::emit(&format!("brave key: {f:?}")),
+                Err(e) => crate::trace::emit(&format!("brave key: not followed: {e}")),
+            }
+        }
         // Only vaults with an original still on disk pay the extra Argon2id.
         let cleanup_verifier = match (&header.meta()?.original, password) {
             (Some(o), Some(pw)) if o.state != crate::header::OriginalState::Deleted => {
