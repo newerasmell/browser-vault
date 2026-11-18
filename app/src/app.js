@@ -1276,9 +1276,7 @@ async function viewSettings(params) {
           act('change_password', t('change_password')),
           v.mode === 'fido2' ? act('add_fido2', t('add_yubikey')) : act('replace_totp', t('replace_authenticator')),
           act('new_recovery', t('new_recovery')),
-          // Only Brave vaults: a WhatsApp vault created on Brave 158 already
-          // writes the new format and keeps working as it is.
-          v.browser === 'brave' && v.portable && act('repair_logins', t('act_repair_btn')),
+
           act('recovery_reset', t('act_recovery_link')),
           act('delete', t('delete_vault'), 'danger push')),
         v.mode === 'fido2' && h('div', { class: 'row' },
