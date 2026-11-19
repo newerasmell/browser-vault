@@ -280,6 +280,33 @@ async function viewUnlock(params) {
     const offB = on('fido_touch_done', () => overlay?.remove());
     cleanup.push(offA, offB);
 
+    // The vault is open but its app was updated since it last ran: ask.
+    async function versionQuestion() {
+      let ver = null;
+      try { ver = await api('app_version_status', { id: v.id }); } catch {}
+      const app = BROWSERS[ENGINE[v.browser] ?? v.browser] ?? '';
+      const busy = (b) => { for (const x of el.querySelectorAll('.version-q button')) x.disabled = b; };
+      el.replaceChildren(h('div', { class: 'pane-inner version-q' },
+        h('div', { class: 'unlock-head' }, h('div', { class: 'lock-art' }, icon('alert', 'lg')),
+          h('h1', {}, t('ver_title', { app }))),
+        h('div', { class: 'callout warn col' },
+          h('p', {}, t('ver_body', { app, old: ver?.old ?? '?', new: ver?.new ?? '?' })),
+          h('p', {}, h('strong', {}, t('ver_advice')))),
+        h('div', { class: 'form' },
+          h('button', { class: 'btn block', type: 'button', onclick: async () => {
+            busy(true); await api('lock_vault', { id: v.id });
+            await api('open_window', { view: 'settings', params: { tab: 'vaults' } }); api('close_window');
+          } }, t('ver_backup_first')),
+          h('button', { class: 'btn ghost block', type: 'button', onclick: async () => {
+            busy(true); await api('lock_vault', { id: v.id }); api('close_window');
+          } }, t('ver_cancel')),
+          h('button', { class: 'btn danger-solid block', type: 'button', onclick: async () => {
+            busy(true);
+            try { await api('open_vault_app', { id: v.id, allowNewVersion: true }); api('close_window'); }
+            catch { busy(false); }
+          } }, t('ver_open_anyway', { app })))));
+    }
+
     async function submit() {
       if (submitBtn.disabled) return;
       err.textContent = '';
@@ -300,6 +327,7 @@ async function viewUnlock(params) {
           cleanup.push(() => clearInterval(iv));
           return;
         }
+        if (e?.code === 'app_version_changed') { await versionQuestion(); return; }
         if (['fido_unreachable', 'fido_no_key', 'fido_multiple_keys'].includes(e?.code)) {
           err.textContent = t('err_' + e.code);
           submitBtn.disabled = false; submitBtn.textContent = t('unlock');

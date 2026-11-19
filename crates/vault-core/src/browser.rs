@@ -133,6 +133,34 @@ fn bundle_id_of(app: &Path) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// `CFBundleShortVersionString` of an `.app` (e.g. `158.1.100.58`).
+pub fn app_version(app: &Path) -> Option<String> {
+    let out = Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
+        .arg(app.join("Contents/Info.plist"))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !v.is_empty()).then_some(v)
+}
+
+/// The major version: the first number (`158` of `158.1.100.58`).
+pub fn major_version(v: &str) -> Option<u64> {
+    v.split(|c: char| !c.is_ascii_digit())
+        .find(|p| !p.is_empty())
+        .and_then(|p| p.parse().ok())
+}
+
+/// The `.app` that contains `binary`.
+pub fn app_of(binary: &Path) -> Option<PathBuf> {
+    binary
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+        .map(Path::to_path_buf)
+}
+
 /// Whether `app` is an installation this vault type can run.
 pub fn app_is_usable(browser: Browser, app: &Path) -> bool {
     binary_in_app(browser, app).is_file()
@@ -612,6 +640,14 @@ mod tests {
         );
         assert!(Browser::Slack.is_chromium() && Browser::WhatsApp.is_chromium());
         assert!(!Browser::Telegram.is_chromium() && !Browser::Firefox.is_chromium());
+    }
+
+    #[test]
+    fn major_versions() {
+        assert_eq!(major_version("158.1.100.58"), Some(158));
+        assert_eq!(major_version("1.99.57"), Some(1));
+        assert_eq!(major_version("v27.1.0 (58756)"), Some(27));
+        assert_eq!(major_version(""), None);
     }
 
     #[test]

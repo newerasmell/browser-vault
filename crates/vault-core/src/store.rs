@@ -656,6 +656,66 @@ impl Store {
         Ok(())
     }
 
+    /// The `.app` a launch of this vault would run.
+    fn app_to_run(&self, unlocked: &Unlocked, binary: Option<&Path>) -> Option<PathBuf> {
+        let browser = unlocked.header.meta().ok()?.browser;
+        let bin = match (
+            (browser != Browser::Vm)
+                .then(|| browser::vault_binary(browser, &unlocked.mountpoint))
+                .flatten(),
+            binary,
+        ) {
+            (Some(own), _) => own,
+            (None, Some(b)) => b.to_path_buf(),
+            (None, None) => browser::detect(browser)?,
+        };
+        browser::app_of(&bin)
+    }
+
+    fn app_version_file(mnt: &Path) -> PathBuf {
+        mnt.join(".bv").join("app-version")
+    }
+
+    /// `(last version this vault ran with, version it would run with now)`
+    /// when their major versions differ. `None` on first use, an unchanged
+    /// major version, or an unknown version.
+    pub fn app_version_change(
+        &self,
+        unlocked: &Unlocked,
+        binary: Option<&Path>,
+    ) -> Option<(String, String)> {
+        let now = browser::app_version(&self.app_to_run(unlocked, binary)?)?;
+        let last = fs::read_to_string(Self::app_version_file(&unlocked.mountpoint)).ok()?;
+        let last = last.trim().to_string();
+        (browser::major_version(&last) != browser::major_version(&now)).then_some((last, now))
+    }
+
+    /// [`Store::launch`], but refusing ([`Error::AppVersionChanged`]) when
+    /// the app's major version changed since this vault last ran, unless
+    /// `allow_version_change`. Records the version it starts.
+    pub fn launch_guarded(
+        &self,
+        unlocked: &Unlocked,
+        binary: Option<&Path>,
+        allow_version_change: bool,
+    ) -> Result<browser::Launched> {
+        if !allow_version_change && self.app_version_change(unlocked, binary).is_some() {
+            return Err(Error::AppVersionChanged);
+        }
+        let version = self
+            .app_to_run(unlocked, binary)
+            .and_then(|a| browser::app_version(&a));
+        let launched = self.launch(unlocked, binary)?;
+        if let Some(v) = version {
+            let f = Self::app_version_file(&unlocked.mountpoint);
+            if let Some(dir) = f.parent() {
+                let _ = mkdir_700(dir);
+            }
+            let _ = fs::write(&f, v);
+        }
+        Ok(launched)
+    }
+
     /// Launch the vault's browser against the mounted volume and record its PID.
     pub fn launch(&self, unlocked: &Unlocked, binary: Option<&Path>) -> Result<browser::Launched> {
         let meta = unlocked.header.meta()?;

@@ -43,6 +43,9 @@ pub struct Settings {
     /// Vault ids opened together with one password + PIN ("Unlock group"),
     /// in this order. YubiKey vaults only. Written by `set_unlock_group`.
     pub unlock_group: Vec<String>,
+    /// Installed app versions seen last (by app kind), to tell the user
+    /// when one was updated. Written by `updates::check`.
+    pub seen_versions: BTreeMap<String, String>,
 }
 
 impl Settings {
@@ -87,6 +90,7 @@ impl Default for Settings {
             disguise: "none".into(),
             diagnostic_log: true,
             unlock_group: Vec::new(),
+            seen_versions: BTreeMap::new(),
         }
     }
 }

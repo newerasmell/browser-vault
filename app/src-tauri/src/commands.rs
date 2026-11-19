@@ -274,6 +274,16 @@ fn app_bundle_of(binary: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// The installed (outside any vault) app for a kind, per these settings.
+pub fn installed_app(s: &crate::settings::Settings, b: Browser) -> Option<PathBuf> {
+    let manual = s
+        .browser_paths
+        .get(b.engine().as_str())
+        .filter(|app| browser::app_is_usable(b, Path::new(app)))
+        .map(PathBuf::from);
+    manual.or_else(|| browser::detect(b).and_then(|bin| app_bundle_of(&bin)))
+}
+
 /// Binary to launch: manual path from settings if valid, else auto-detect.
 fn browser_binary(st: &AppState, b: Browser) -> Option<PathBuf> {
     let manual = st
@@ -476,39 +486,49 @@ enum Secret {
     Recovery(Zeroizing<String>),
 }
 
+/// An already unlocked vault: bring its app to the front, or start it again
+/// if it was closed while the vault stayed open. `None` when not unlocked.
+/// `allow_new_version`: start it even if the app's major version changed
+/// since the vault last ran (see `Store::launch_guarded`).
+fn reopen(app: &AppHandle, id: &str, allow_new_version: bool) -> Option<CmdResult<Value>> {
+    let st = state::get(app);
+    let mut sessions = lock(&st.sessions);
+    let s = sessions.get_mut(id)?;
+    if let Some(pid) = s.browser_pid.filter(|p| browser::is_alive(*p as i32)) {
+        drop(sessions);
+        activate_pid(pid);
+        return Some(Ok(json!(OK)));
+    }
+    if st.store.focus_running_vm(id) {
+        return Some(Ok(json!(OK)));
+    }
+    let r = (|| -> CmdResult<Value> {
+        let bin = browser_binary(&st, s.unlocked.header.meta()?.browser);
+        let child = st
+            .store
+            .launch_guarded(&s.unlocked, bin.as_deref(), allow_new_version)?;
+        let pid = child.id();
+        s.browser_pid = (pid > 0).then_some(pid);
+        let generation = s.generation;
+        crate::applog::log(&format!("browser for {id} reopened as pid {pid}"));
+        if let Err(e) = vault_core::lock::spawn_crash_guard_with(
+            std::process::id(),
+            pid,
+            &st.store.mountpoint(id),
+            child.vm(),
+        ) {
+            crate::applog::log(&format!("crash guard not started: {e}"));
+        }
+        triggers::watch_browser(app.clone(), id.to_string(), generation, child);
+        Ok(json!(OK))
+    })();
+    Some(r)
+}
+
 fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
     let st = state::get(app);
-    // Already unlocked: bring its browser to the front, or start it again
-    // if it was closed while the vault stayed open.
-    {
-        let mut sessions = lock(&st.sessions);
-        if let Some(s) = sessions.get_mut(id) {
-            if let Some(pid) = s.browser_pid.filter(|p| browser::is_alive(*p as i32)) {
-                drop(sessions);
-                activate_pid(pid);
-                return Ok(json!(OK));
-            }
-            if st.store.focus_running_vm(id) {
-                return Ok(json!(OK));
-            }
-            let bin = browser_binary(&st, s.unlocked.header.meta()?.browser);
-            let child = st.store.launch(&s.unlocked, bin.as_deref())?;
-            let pid = child.id();
-            s.browser_pid = (pid > 0).then_some(pid);
-            let generation = s.generation;
-            drop(sessions);
-            crate::applog::log(&format!("browser for {id} reopened as pid {pid}"));
-            if let Err(e) = vault_core::lock::spawn_crash_guard_with(
-                std::process::id(),
-                pid,
-                &st.store.mountpoint(id),
-                child.vm(),
-            ) {
-                crate::applog::log(&format!("crash guard not started: {e}"));
-            }
-            triggers::watch_browser(app.clone(), id.to_string(), generation, child);
-            return Ok(json!(OK));
-        }
+    if let Some(r) = reopen(app, id, false) {
+        return r;
     }
     if lock(&st.locking).contains(id) {
         return Err(CmdError::new("io"));
@@ -545,8 +565,33 @@ fn do_unlock(app: &AppHandle, id: &str, secret: Secret) -> CmdResult<Value> {
         Ok(m) => browser_binary(&st, m.browser),
         Err(_) => None,
     };
-    let child = match st.store.launch(&unlocked, bin.as_deref()) {
+    let child = match st.store.launch_guarded(&unlocked, bin.as_deref(), false) {
         Ok(c) => c,
+        // The app was updated (new major version) since this vault last
+        // ran: keep the vault open without starting it; the unlock window
+        // asks whether to open it anyway (`open_vault_app`) or lock again.
+        Err(vault_core::Error::AppVersionChanged) => {
+            let generation = st.next_generation();
+            lock(&st.sessions).insert(
+                id.to_string(),
+                Session {
+                    unlocked,
+                    generation,
+                    browser_pid: None,
+                },
+            );
+            // Still detach if this app dies while the question is open.
+            let _ = vault_core::lock::spawn_crash_guard(
+                std::process::id(),
+                0,
+                &st.store.mountpoint(id),
+            );
+            lockctl::vaults_changed(app);
+            crate::applog::log(&format!(
+                "vault {id}: app version changed, waiting for the user"
+            ));
+            return Err(CmdError::new("app_version_changed"));
+        }
         Err(e) => {
             drop(unlocked);
             let _ = vault_core::lock::lock_vault(&st.store, id);
@@ -673,6 +718,39 @@ pub async fn unlock_group(app: AppHandle, password: String, pin: String) -> CmdR
             }
         }
         Ok(json!({ "results": results, "total": total }))
+    })
+    .await
+}
+
+/// For an open vault whose app was updated: `{ old, new }` versions, or
+/// `null` when nothing changed.
+#[tauri::command]
+pub fn app_version_status(app: AppHandle, id: String) -> CmdResult<Value> {
+    let st = state::get(&app);
+    let sessions = lock(&st.sessions);
+    let s = sessions.get(&id).ok_or(CmdError::new("vault_locked"))?;
+    let bin = browser_binary(&st, s.unlocked.header.meta()?.browser);
+    Ok(
+        match st.store.app_version_change(&s.unlocked, bin.as_deref()) {
+            Some((old, new)) => json!({ "old": old, "new": new }),
+            None => Value::Null,
+        },
+    )
+}
+
+/// Start an open vault's app (after the user accepted a version change).
+#[tauri::command]
+pub async fn open_vault_app(
+    app: AppHandle,
+    id: String,
+    allow_new_version: bool,
+) -> CmdResult<Value> {
+    blocking(move || {
+        let r = reopen(&app, &id, allow_new_version).unwrap_or(Err(CmdError::new("vault_locked")));
+        if r.is_ok() && allow_new_version {
+            crate::applog::log(&format!("vault {id}: opened with the new app version"));
+        }
+        r
     })
     .await
 }

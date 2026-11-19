@@ -79,6 +79,8 @@ const mock = {
   focus_browser: async () => {},
   install_update: async () => null,
   pick_vm: async () => null,
+  app_version_status: async () => ({ old: '157.1.99.57', new: '158.1.100.58' }),
+  open_vault_app: async () => ({ ok: true }),
   set_unlock_group: async ({ ids }) => { settings.unlockGroup = ids; return structuredClone(settings); },
   unlock_group: async () => ({ results: [], total: 0 }),
   move_app_into_vault: async () => ({ ok: true }),

@@ -24,6 +24,11 @@ pub enum Error {
     NotFound,
     #[error("browser is not installed")]
     BrowserMissing,
+    /// The app a vault opens with changed its major version since the vault
+    /// was last opened (e.g. Brave 157 → 158). Opening could rewrite or drop
+    /// data the new version no longer reads; the user decides.
+    #[error("the app was updated since this vault was last opened")]
+    AppVersionChanged,
     #[error("{0}")]
     Invalid(&'static str),
     #[error("unsupported: {0}")]
@@ -48,6 +53,7 @@ impl Error {
             Error::BrowserRunning => "browser_running",
             Error::NotFound => "not_found",
             Error::BrowserMissing => "browser_missing",
+            Error::AppVersionChanged => "app_version_changed",
             Error::Invalid(_) | Error::Unsupported(_) | Error::Format(_) => "invalid",
             Error::Command { .. } | Error::Io(_) => "io",
         }

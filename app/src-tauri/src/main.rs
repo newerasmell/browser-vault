@@ -14,6 +14,7 @@ mod state;
 mod texts;
 mod tray;
 mod triggers;
+mod updates;
 mod windows;
 
 use std::sync::Arc;
@@ -125,6 +126,8 @@ fn main() {
             commands::pick_vm,
             commands::set_unlock_group,
             commands::unlock_group,
+            commands::app_version_status,
+            commands::open_vault_app,
             commands::move_app_into_vault,
             commands::remove_app_outside,
             commands::detect_profiles,
@@ -179,6 +182,7 @@ fn main() {
             windows::create_tray_window(&handle)?;
             tray::create(&handle)?;
             triggers::start(&handle);
+            updates::start(&handle);
             triggers::register_hotkey(&handle);
 
             // Keep `disguise` in settings in step with the bundle we run as.
